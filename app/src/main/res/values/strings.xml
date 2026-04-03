@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">粥6y直播投屏助手</string>
+    <string name="title_mvp">粥6y直播投屏助手</string>
+    <string name="title_sender">安卓发送端</string>
+    <string name="description_mvp">把手机画面以低延迟方式推送到你的电脑接收端。当前版本聚焦单向投屏，不包含音频。</string>
+    <string name="hero_badge">1080p60 · 低延迟 · 无音频</string>
+    <string name="label_version">版本 %1$s</string>
+    <string name="section_target_title">连接目标</string>
+    <string name="section_target_desc">填写电脑接收端的局域网 IP 和控制端口，手机与电脑需要在同一局域网内。</string>
+    <string name="hint_receiver_ip">电脑接收端 IP 地址</string>
+    <string name="hint_control_port">控制端口</string>
+    <string name="target_tip">建议：电脑走网线，手机走 5GHz / Wi‑Fi 6，会更稳。</string>
+    <string name="action_start">开始投屏</string>
+    <string name="action_stop">停止投屏</string>
+    <string name="status_card_title">当前状态</string>
+    <string name="status_card_desc">开始投屏前，先确认电脑端已经打开接收程序。</string>
+    <string name="status_idle">空闲</string>
+    <string name="status_idle_with_version">空闲\n版本：%1$s</string>
+    <string name="status_requesting_permission">正在请求录屏权限…</string>
+    <string name="status_permission_denied">你取消了录屏授权。</string>
+    <string name="status_invalid_target">请先填写正确的电脑 IP 和控制端口。</string>
+    <string name="status_starting_stream">正在启动投屏…</string>
+    <string name="status_stopping_stream">正在停止投屏…</string>
+    <string name="status_extra_hint">开始投屏后，手机会把画面直接推到你的电脑接收端。</string>
+    <string name="notification_title">粥6y直播投屏助手正在运行</string>
+    <string name="notification_running">正在把手机画面发送到电脑</string>
+    <string name="notification_channel_name">投屏发送服务</string>
+    <string name="app_title_with_version">粥6y直播投屏助手 %1$s</string>
+</resources>

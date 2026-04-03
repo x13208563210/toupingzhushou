@@ -1,0 +1,35 @@
+# Android / Gradle
+.gradle/
+app/build/
+local.properties
+
+# IDE
+.idea/
+*.iml
+
+# Windows / Visual Studio / CMake build outputs
+build/
+cmake-build-*/
+*.obj
+*.pdb
+*.lib
+*.exp
+*.ilk
+*.tlog
+*.lastbuildstate
+*.VC.db
+*.VC.opendb
+*.suo
+*.user
+*.ipch
+
+# Logs and temporary files
+*.log
+*.tmp
+*.cache
+
+# Debug captures / local artifacts
+/build/*.png
+/build/*.jpg
+/build/*.jpeg
+/build/*.h264

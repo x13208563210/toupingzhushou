@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <linearGradient id="pinkGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" style="stop-color:#f093fb"/>
+            <stop offset="100%" style="stop-color:#f5576c"/>
+        </linearGradient>
+    </defs>
+    <rect width="512" height="512" rx="115" fill="url(#pinkGrad)"/>
+    <path d="M150 150 Q150 128 172 128 L340 128 Q384 128 384 172 L384 182 Q384 204 368 220 L188 336 Q172 352 172 374 L172 384 Q172 384 194 384 L362 384" 
+          fill="none" 
+          stroke="white" 
+          stroke-width="28" 
+          stroke-linecap="round"
+          stroke-linejoin="round"/>
+</svg>

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_launcher_background">#E7F0FF</color>
+    <color name="brand_navy">#0E1731</color>
+    <color name="brand_blue">#2C6BFF</color>
+    <color name="brand_blue_dark">#184BC7</color>
+    <color name="brand_teal">#0DA6C8</color>
+    <color name="brand_red">#FF5B63</color>
+    <color name="page_top">#EEF4FF</color>
+    <color name="page_bottom">#F8FBFF</color>
+    <color name="page_accent">#EAF1FF</color>
+    <color name="glass_card">#E8FFFFFF</color>
+    <color name="glass_card_strong">#F4FFFFFF</color>
+    <color name="glass_stroke">#CCFFFFFF</color>
+    <color name="input_fill">#F7FBFF</color>
+    <color name="text_primary">#1F2A3D</color>
+    <color name="text_secondary">#66758B</color>
+    <color name="text_muted">#8190A5</color>
+    <color name="pill_text">#F9FBFF</color>
+</resources>

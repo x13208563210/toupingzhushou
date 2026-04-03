@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Z Cast - Android 应用图标设计</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 40px 20px;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: white;
+            text-align: center;
+            margin-bottom: 10px;
+            font-size: 2.5rem;
+            font-weight: 300;
+        }
+        .subtitle {
+            color: rgba(255,255,255,0.8);
+            text-align: center;
+            margin-bottom: 50px;
+            font-size: 1.1rem;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 40px;
+            margin-bottom: 60px;
+        }
+        .card {
+            background: white;
+            border-radius: 20px;
+            padding: 30px;
+            text-align: center;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.2);
+            transition: transform 0.3s ease;
+        }
+        .card:hover {
+            transform: translateY(-10px);
+        }
+        .card h3 {
+            color: #333;
+            margin-bottom: 20px;
+            font-weight: 500;
+        }
+        .icon-container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        svg {
+            border-radius: 22.5%;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+        }
+        .description {
+            color: #666;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+        .section-title {
+            color: white;
+            font-size: 1.5rem;
+            margin: 40px 0 30px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid rgba(255,255,255,0.3);
+        }
+        .size-preview {
+            display: flex;
+            gap: 20px;
+            justify-content: center;
+            align-items: flex-end;
+            margin-top: 20px;
+        }
+        .size-label {
+            font-size: 12px;
+            color: #999;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Z Cast 应用图标设计</h1>
+        <p class="subtitle">以 "Z" 为核心设计元素 · 简约线条风格 · 大气现代</p>
+
+        <h2 class="section-title">推荐方案</h2>
+        <div class="grid">
+            <!-- 方案一：极简渐变 -->
+            <div class="card">
+                <h3>方案一：极简渐变</h3>
+                <div class="icon-container">
+                    <svg width="192" height="192" viewBox="0 0 192 192" xmlns="http://www.w3.org/2000/svg">
+                        <defs>
+                            <linearGradient id="grad1" x1="0%" y1="0%" x2="100%" y2="100%">
+                                <stop offset="0%" style="stop-color:#667eea"/>
+                                <stop offset="100%" style="stop-color:#764ba2"/>
+                            </linearGradient>
+                        </defs>
+                        <rect width="192" height="192" rx="43" fill="url(#grad1)"/>
+                        <path d="M48 48 L144 48 L48 144 L144 144" 
+                              fill="none" 
+                              stroke="white" 
+                              stroke-width="12" 
+                              stroke-linecap="round"
+                              stroke-linejoin="round"/>
+                    </svg>
+                </div>
+                <p class="description">
+                    紫蓝渐变背景<br>
+                    白色 Z 字线条<br>
+                    科技感强，适合投屏应用
+                </p>
+            </div>
+
+            <!-- 方案二：深色极简 -->
+            <div class="card">
+                <h3>方案二：深色极简</h3>
+                <div class="icon-container">
+                    <svg width="192" height="192" viewBox="0 0 192 192" xmlns="http://www.w3.org/2000/svg">
+                        <rect width="192" height="192" rx="43" fill="#1a1a2e"/>
+                        <path d="M48 48 L144 48 L48 144 L144 144" 
+                              fill="none" 
+                              stroke="#00d4ff" 
+                              stroke-width="12" 
+                              stroke-linecap="round"
+                              stroke-linejoin="round"/>
+                    </svg>
+                </div>
+                <p class="description">
+                    深蓝背景<br>
+                    青蓝色 Z 字<br>
+                    简约专业，低调大气
+                </p>
+            </div>
+
+            <!-- 方案三：白色极简 -->
+            <div class="card">
+                <h3>方案三：白色极简</h3>
+                <div class="icon-container">
+                    <svg width="192" height="192" viewBox="0 0 192 192" xmlns="http://www.w3.org/2000/svg">
+                        <defs>
+                            <linearGradient id="grad3" x1="0%" y1="0%" x2="100%" y2="100%">
+                                <stop offset="0%" style="stop-color:#667eea"/>
+                                <stop offset="100%" style="stop-color:#764ba2"/>
+                            </linearGradient>
+                        </defs>
+                        <rect width="192" height="192" rx="43" fill="#ffffff"/>
+                        <rect x="4" y="4" width="184" height="184" rx="41" 
+                              fill="none" stroke="#e0e0e0" stroke-width="1"/>
+                        <path d="M48 48 L144 48 L48 144 L144 144" 
+                              fill="none" 
+                              stroke="url(#grad3)" 
+                              stroke-width="12" 
+                              stroke-linecap="round"
+                              stroke-linejoin="round"/>
+                    </svg>
+                </div>
+                <p class="description">
+                    白色背景<br>
+                    渐变 Z 字线条<br>
+                    清新简洁，现代感强
+                </p>
+            </div>
+        </div>
+
+        <h2 class="section-title">更多方案</h2>
+        <div class="grid">
+            <!-- 方案四：圆角 Z -->
+            <div class="card">
+                <h3>方案四：圆角 Z</h3>
+                <div class="icon-container">
+                    <svg width="192" height="192" viewBox="0 0 192 192" xmlns="http://www.w3.org/2000/svg">
+                        <defs>
+                            <linearGradient id="grad4" x1="0%" y1="0%" x2="100%" y2="100%">
+                                <stop offset="0%" style="stop-color:#f093fb"/>
+                                <stop offset="100%" style="stop-color:#f5576c"/>
+                            </linearGradient>
+                        </defs>
+                        <rect width="192" height="192" rx="43" fill="url(#grad4)"/>
+                        <path d="M56 56 Q56 48 64 48 L128 48 Q144 48 144 64 L144 68 Q144 76 138 82 L70 126 Q64 132 64 140 L64 144 Q64 144 72 144 L136 144" 
+                              fill="none" 
+                              stroke="white" 
+                              stroke-width="10" 
+                              stroke-linecap="round"
+                              stroke-linejoin="round"/>
+                    </svg>
+                </div>
+                <p class="description">
+                    粉紫渐变背景<br>
+                    圆角 Z 字设计<br>
+                    柔和时尚，适合年轻用户
+                </p>
+            </div>
+
+            <!-- 方案五：双层线条 -->
+            <div class="card">
+                <h3>方案五：双层线条</h3>
+                <div class="icon-container">
+                    <svg width="192" height="192" viewBox="0 0 192 192" xmlns="http://www.w3.org/2000/svg">
+                        <rect width="192" height="192" rx="43" fill="#0f0f23"/>
+                        <path d="M56 56 L136 56 L56 136 L136 136" 
+                              fill="none" 
+                              stroke="#00d4ff" 
+                              stroke-width="8" 
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              opacity="0.3"/>
+                        <path d="M48 48 L144 48 L48 144 L144 144" 
+                              fill="none" 
+                              stroke="#00d4ff" 
+                              stroke-width="12" 
+                              stroke-linecap="round"
+                              stroke-linejoin="round"/>
+                    </svg>
+                </div>
+                <p class="description">
+                    深色背景<br>
+                    双层 Z 字叠加<br>
+                    立体感强，层次分明
+                </p>
+            </div>
+
+            <!-- 方案六：动态线条 -->
+            <div class="card">
+                <h3>方案六：动态线条</h3>
+                <div class="icon-container">
+                    <svg width="192" height="192" viewBox="0 0 192 192" xmlns="http://www.w3.org/2000/svg">
+                        <defs>
+                            <linearGradient id="grad6" x1="0%" y1="0%" x2="100%" y2="100%">
+                                <stop offset="0%" style="stop-color:#00c6ff"/>
+                                <stop offset="100%" style="stop-color:#0072ff"/>
+                            </linearGradient>
+                        </defs>
+                        <rect width="192" height="192" rx="43" fill="#0a0a0a"/>
+                        <path d="M48 48 L144 48" 
+                              fill="none" 
+                              stroke="url(#grad6)" 
+                              stroke-width="12" 
+                              stroke-linecap="round"/>
+                        <path d="M48 144 L144 144" 
+                              fill="none" 
+                              stroke="url(#grad6)" 
+                              stroke-width="12" 
+                              stroke-linecap="round"/>
+                        <path d="M144 48 L48 144" 
+                              fill="none" 
+                              stroke="url(#grad6)" 
+                              stroke-width="12" 
+                              stroke-linecap="round"/>
+                    </svg>
+                </div>
+                <p class="description">
+                    黑色背景<br>
+                    蓝色渐变线条<br>
+                    动感十足，科技感强
+                </p>
+            </div>
+        </div>
+
+        <h2 class="section-title">不同尺寸预览（以方案一为例）</h2>
+        <div class="card" style="max-width: 600px; margin: 0 auto;">
+            <h3>多尺寸适配</h3>
+            <div class="size-preview">
+                <div>
+                    <svg width="48" height="48" viewBox="0 0 192 192" xmlns="http://www.w3.org/2000/svg">
+                        <defs>
+                            <linearGradient id="gradS" x1="0%" y1="0%" x2="100%" y2="100%">
+                                <stop offset="0%" style="stop-color:#667eea"/>
+                                <stop offset="100%" style="stop-color:#764ba2"/>
+                            </linearGradient>
+                        </defs>
+                        <rect width="192" height="192" rx="43" fill="url(#gradS)"/>
+                        <path d="M48 48 L144 48 L48 144 L144 144" fill="none" stroke="white" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                    <div class="size-label">48dp</div>
+                </div>
+                <div>
+                    <svg width="72" height="72" viewBox="0 0 192 192" xmlns="http://www.w3.org/2000/svg">
+                        <defs>
+                            <linearGradient id="gradM" x1="0%" y1="0%" x2="100%" y2="100%">
+                                <stop offset="0%" style="stop-color:#667eea"/>
+                                <stop offset="100%" style="stop-color:#764ba2"/>
+                            </linearGradient>
+                        </defs>
+                        <rect width="192" height="192" rx="43" fill="url(#gradM)"/>
+                        <path d="M48 48 L144 48 L48 144 L144 144" fill="none" stroke="white" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                    <div class="size-label">72dp</div>
+                </div>
+                <div>
+                    <svg width="96" height="96" viewBox="0 0 192 192" xmlns="http://www.w3.org/2000/svg">
+                        <defs>
+                            <linearGradient id="gradL" x1="0%" y1="0%" x2="100%" y2="100%">
+                                <stop offset="0%" style="stop-color:#667eea"/>
+                                <stop offset="100%" style="stop-color:#764ba2"/>
+                            </linearGradient>
+                        </defs>
+                        <rect width="192" height="192" rx="43" fill="url(#gradL)"/>
+                        <path d="M48 48 L144 48 L48 144 L144 144" fill="none" stroke="white" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                    <div class="size-label">96dp</div>
+                </div>
+                <div>
+                    <svg width="144" height="144" viewBox="0 0 192 192" xmlns="http://www.w3.org/2000/svg">
+                        <defs>
+                            <linearGradient id="gradXL" x1="0%" y1="0%" x2="100%" y2="100%">
+                                <stop offset="0%" style="stop-color:#667eea"/>
+                                <stop offset="100%" style="stop-color:#764ba2"/>
+                            </linearGradient>
+                        </defs>
+                        <rect width="192" height="192" rx="43" fill="url(#gradXL)"/>
+                        <path d="M48 48 L144 48 L48 144 L144 144" fill="none" stroke="white" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                    <div class="size-label">144dp</div>
+                </div>
+                <div>
+                    <svg width="192" height="192" viewBox="0 0 192 192" xmlns="http://www.w3.org/2000/svg">
+                        <defs>
+                            <linearGradient id="gradXXL" x1="0%" y1="0%" x2="100%" y2="100%">
+                                <stop offset="0%" style="stop-color:#667eea"/>
+                                <stop offset="100%" style="stop-color:#764ba2"/>
+                            </linearGradient>
+                        </defs>
+                        <rect width="192" height="192" rx="43" fill="url(#gradXXL)"/>
+                        <path d="M48 48 L144 48 L48 144 L144 144" fill="none" stroke="white" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                    <div class="size-label">192dp</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

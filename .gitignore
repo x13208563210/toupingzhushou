@@ -27,6 +27,8 @@ cmake-build-*/
 *.log
 *.tmp
 *.cache
+__pycache__/
+*.pyc
 
 # Debug captures / local artifacts
 /build/*.png

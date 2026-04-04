@@ -30,8 +30,11 @@ struct DecodedFrame {
     size_t plane1_offset = 0;
     std::vector<uint8_t> bytes;
     ID3D11Texture2D* d3d_texture = nullptr;
+    ID3D11Texture2D* d3d_texture_plane1 = nullptr;
     UINT d3d_subresource = 0;
     bool gpu_backed = false;
+    bool direct_sample_safe = false;
+    bool separate_textures = false;
 
     DecodedFrame() = default;
 
@@ -60,6 +63,10 @@ struct DecodedFrame {
             d3d_texture->Release();
             d3d_texture = nullptr;
         }
+        if (d3d_texture_plane1 != nullptr) {
+            d3d_texture_plane1->Release();
+            d3d_texture_plane1 = nullptr;
+        }
         width = 0;
         height = 0;
         pts_us = 0;
@@ -69,6 +76,8 @@ struct DecodedFrame {
         plane1_offset = 0;
         d3d_subresource = 0;
         gpu_backed = false;
+        direct_sample_safe = false;
+        separate_textures = false;
     }
 
 private:
@@ -82,12 +91,18 @@ private:
         plane1_offset = other.plane1_offset;
         bytes = std::move(other.bytes);
         d3d_texture = other.d3d_texture;
+        d3d_texture_plane1 = other.d3d_texture_plane1;
         d3d_subresource = other.d3d_subresource;
         gpu_backed = other.gpu_backed;
+        direct_sample_safe = other.direct_sample_safe;
+        separate_textures = other.separate_textures;
 
         other.d3d_texture = nullptr;
+        other.d3d_texture_plane1 = nullptr;
         other.d3d_subresource = 0;
         other.gpu_backed = false;
+        other.direct_sample_safe = false;
+        other.separate_textures = false;
         other.width = 0;
         other.height = 0;
         other.pts_us = 0;
@@ -112,6 +127,7 @@ public:
     void Configure(const protocol::StreamProfile& profile);
     void SubmitAccessUnit(const AccessUnit& access_unit);
     void SetD3DDevice(ID3D11Device* device);
+    void SetSmoothMode(bool enabled);
     size_t GetPendingAccessUnitCount();
 
 private:
@@ -130,9 +146,12 @@ private:
     bool has_active_profile_ = false;
     bool has_latest_codec_config_ = false;
     bool waiting_for_keyframe_ = false;
+    bool queue_warning_active_ = false;
     bool backend_reset_requested_ = false;
     bool soft_resync_requested_ = false;
     bool discontinuity_pending_ = false;
+    bool smooth_mode_ = false;
+    size_t queue_resync_overload_hits_ = 0;
     std::thread thread_;
     ID3D11Device* d3d_device_ = nullptr;
     RequestKeyframeFn request_keyframe_fn_;

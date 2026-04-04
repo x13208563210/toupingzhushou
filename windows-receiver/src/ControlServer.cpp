@@ -202,6 +202,7 @@ bool ControlServer::RequestTimeSync() {
     pending_sync_requests_[sync_id] = receiver_send_us;
     if (!SendLine(static_cast<SOCKET>(client_socket_), BuildTimeSyncRequestJson(sync_id, receiver_send_us))) {
         pending_sync_requests_.erase(sync_id);
+        log_fn_(L"\u63A7\u5236\u670D\u52A1: \u53D1\u9001\u65F6\u949F\u540C\u6B65\u8BF7\u6C42\u5931\u8D25\u3002");
         return false;
     }
     return true;
@@ -317,6 +318,7 @@ void ControlServer::HandleClient(uintptr_t client_socket_value, uint16_t video_p
 
     log_fn_(L"控制服务: 已选择配置 " + ProfileToString(selected));
     profile_fn_(selected);
+    RequestTimeSync();
 
     while (running_) {
         const std::string line = ReadLine(client_socket);

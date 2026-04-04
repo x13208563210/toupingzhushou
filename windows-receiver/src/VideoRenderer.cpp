@@ -9,6 +9,7 @@
 #include <dxgi1_6.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <sstream>
 #include <utility>
@@ -17,8 +18,10 @@
 namespace {
 
 constexpr wchar_t kRendererClassName[] = L"AndroidCastVideoRenderer";
-constexpr UINT kRenderMessage = WM_APP + 41;
 constexpr UINT kNvidiaVendorId = 0x10DE;
+constexpr int64_t kSmoothPacingMinIntervalUs = 6'500;
+constexpr int64_t kSmoothPacingMaxIntervalUs = 12'500;
+constexpr int64_t kSmoothPacingResetGapUs = 20'000;
 
 const char kVertexShaderSource[] = R"(
 struct VSOut {
@@ -94,11 +97,86 @@ std::wstring AdapterNameFromDesc(const DXGI_ADAPTER_DESC1& desc) {
     return name;
 }
 
+void SetCurrentThreadPriorityBestEffort(int priority) {
+    SetThreadPriority(GetCurrentThread(), priority);
+}
+
+void WaitUntilSteadyDeadline(const std::chrono::steady_clock::time_point& deadline) {
+    constexpr auto kSpinThreshold = std::chrono::microseconds(500);
+
+    while (true) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return;
+        }
+
+        const auto remaining = deadline - now;
+        if (remaining > kSpinThreshold) {
+            std::this_thread::sleep_for(remaining - kSpinThreshold);
+        } else {
+            std::this_thread::yield();
+        }
+    }
+}
+
+int64_t SelectSmoothPacingIntervalUs(int64_t source_delta_us) {
+    if (source_delta_us <= 0) {
+        return 0;
+    }
+
+    const double source_fps = 1'000'000.0 / static_cast<double>(source_delta_us);
+    if (source_fps >= 100.0) {
+        return 1'000'000 / 120;
+    }
+    if (source_fps >= 82.0) {
+        return 1'000'000 / 90;
+    }
+    return 0;
+}
+
+const wchar_t* PresentationModeName(VideoRenderer::PresentationMode mode) {
+    switch (mode) {
+    case VideoRenderer::PresentationMode::kSmooth:
+        return L"\u987a\u6ed1\u89c2\u611f";
+    case VideoRenderer::PresentationMode::kLowLatency:
+    default:
+        return L"\u7ade\u6280\u4f4e\u5ef6\u8fdf";
+    }
+}
+
+void ConfigureLowLatencyPresent(
+    ID3D11Device* device,
+    IDXGISwapChain* swap_chain,
+    const VideoRenderer::LogFn& log_fn) {
+    bool configured = false;
+
+    IDXGIDevice1* dxgi_device1 = nullptr;
+    if (device != nullptr && SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dxgi_device1)))) {
+        if (SUCCEEDED(dxgi_device1->SetMaximumFrameLatency(1))) {
+            configured = true;
+        }
+        dxgi_device1->Release();
+    }
+
+    IDXGISwapChain2* swap_chain2 = nullptr;
+    if (swap_chain != nullptr && SUCCEEDED(swap_chain->QueryInterface(IID_PPV_ARGS(&swap_chain2)))) {
+        if (SUCCEEDED(swap_chain2->SetMaximumFrameLatency(1))) {
+            configured = true;
+        }
+        swap_chain2->Release();
+    }
+
+    if (configured && log_fn != nullptr) {
+        log_fn(L"\u89c6\u9891\u6e32\u67d3: \u5df2\u5c06 DXGI \u6700\u5927\u5e27\u5ef6\u8fdf\u538b\u5230 1\uff0c\u51cf\u5c11\u4ea4\u6362\u94fe\u79ef\u538b\u3002");
+    }
+}
+
 }  // namespace
 
 VideoRenderer::VideoRenderer() = default;
 
 VideoRenderer::~VideoRenderer() {
+    StopRenderThread();
     CleanupDeviceResources();
 }
 
@@ -108,6 +186,35 @@ void VideoRenderer::SetLogFn(LogFn log_fn) {
 
 void VideoRenderer::SetPresentFn(PresentFn present_fn) {
     present_fn_ = std::move(present_fn);
+}
+
+void VideoRenderer::SetPresentationMode(PresentationMode mode) {
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(render_mutex_);
+        if (presentation_mode_ == mode) {
+            return;
+        }
+
+        presentation_mode_ = mode;
+        smooth_pacing_enabled_ = false;
+        smooth_pacing_interval_us_ = 0;
+        last_submitted_pts_us_ = 0;
+        smooth_pacing_reset_hits_ = 0;
+        smooth_pacing_deadline_initialized_ = false;
+        render_requested_ = render_thread_running_;
+        changed = true;
+    }
+
+    if (changed) {
+        if (log_fn_ != nullptr) {
+            std::wstring line = L"\u89c6\u9891\u6e32\u67d3: \u5df2\u5207\u6362\u663e\u793a\u6a21\u5f0f\u4e3a";
+            line += PresentationModeName(mode);
+            line += L"\u3002";
+            log_fn_(line);
+        }
+        render_cv_.notify_all();
+    }
 }
 
 bool VideoRenderer::Create(HWND parent, HINSTANCE instance) {
@@ -134,7 +241,12 @@ bool VideoRenderer::Create(HWND parent, HINSTANCE instance) {
         instance,
         this);
 
-    return window_ != nullptr && InitializeDeviceResources();
+    if (window_ == nullptr || !InitializeDeviceResources()) {
+        return false;
+    }
+
+    StartRenderThread();
+    return true;
 }
 
 void VideoRenderer::Resize(int x, int y, int width, int height) {
@@ -144,20 +256,17 @@ void VideoRenderer::Resize(int x, int y, int width, int height) {
 }
 
 void VideoRenderer::Present(DecodedFrame frame) {
-    bool should_post = false;
+    const uint64_t frame_pts_us = frame.pts_us;
     {
         std::lock_guard<std::mutex> lock(frame_mutex_);
         latest_frame_ = std::move(frame);
         frame_dirty_ = true;
-        if (!render_posted_) {
-            render_posted_ = true;
-            should_post = true;
-        }
     }
-
-    if (should_post && window_ != nullptr) {
-        PostMessageW(window_, kRenderMessage, 0, 0);
+    {
+        std::lock_guard<std::mutex> lock(render_mutex_);
+        UpdateSmoothPacingLocked(frame_pts_us);
     }
+    RequestRender(false);
 }
 
 LRESULT CALLBACK VideoRenderer::WndProc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param) {
@@ -180,8 +289,7 @@ LRESULT CALLBACK VideoRenderer::WndProc(HWND hwnd, UINT message, WPARAM w_param,
 LRESULT VideoRenderer::HandleMessage(UINT message, WPARAM w_param, LPARAM l_param) {
     switch (message) {
     case WM_SIZE:
-        ResizeSwapChain();
-        Render();
+        RequestRender(true);
         return 0;
     case WM_ERASEBKGND:
         return 1;
@@ -189,17 +297,215 @@ LRESULT VideoRenderer::HandleMessage(UINT message, WPARAM w_param, LPARAM l_para
         PAINTSTRUCT ps{};
         BeginPaint(window_, &ps);
         EndPaint(window_, &ps);
-        Render();
+        RequestRender(false);
         return 0;
     }
-    case kRenderMessage:
-        Render();
+    case WM_DESTROY:
+        StopRenderThread();
         return 0;
     default:
         return DefWindowProcW(window_, message, w_param, l_param);
     }
 
     return DefWindowProcW(window_, message, w_param, l_param);
+}
+
+void VideoRenderer::StartRenderThread() {
+    std::lock_guard<std::mutex> lock(render_mutex_);
+    if (render_thread_running_) {
+        return;
+    }
+
+    render_thread_running_ = true;
+    render_requested_ = true;
+    resize_requested_ = true;
+    render_thread_ = std::thread([this] { RenderThreadMain(); });
+}
+
+void VideoRenderer::StopRenderThread() {
+    {
+        std::lock_guard<std::mutex> lock(render_mutex_);
+        if (!render_thread_running_) {
+            return;
+        }
+        render_thread_running_ = false;
+        render_requested_ = true;
+    }
+    render_cv_.notify_all();
+    if (render_thread_.joinable()) {
+        render_thread_.join();
+    }
+}
+
+void VideoRenderer::RequestRender(bool resize_requested) {
+    {
+        std::lock_guard<std::mutex> lock(render_mutex_);
+        if (!render_thread_running_) {
+            return;
+        }
+        render_requested_ = true;
+        resize_requested_ = resize_requested_ || resize_requested;
+    }
+    render_cv_.notify_one();
+}
+
+void VideoRenderer::UpdateSmoothPacingLocked(uint64_t frame_pts_us) {
+    if (presentation_mode_ != PresentationMode::kSmooth) {
+        return;
+    }
+
+    if (frame_pts_us == 0) {
+        return;
+    }
+
+    const bool was_enabled = smooth_pacing_enabled_;
+
+    if (last_submitted_pts_us_ != 0 && frame_pts_us > last_submitted_pts_us_) {
+        const int64_t delta_us = static_cast<int64_t>(frame_pts_us - last_submitted_pts_us_);
+
+        if (delta_us >= kSmoothPacingMinIntervalUs && delta_us <= kSmoothPacingMaxIntervalUs) {
+            if (!smooth_pacing_enabled_ || smooth_pacing_interval_us_ <= 0) {
+                smooth_pacing_interval_us_ = SelectSmoothPacingIntervalUs(delta_us);
+            }
+            smooth_pacing_enabled_ = smooth_pacing_interval_us_ > 0;
+            smooth_pacing_reset_hits_ = 0;
+        } else if (delta_us >= kSmoothPacingResetGapUs) {
+            smooth_pacing_reset_hits_ += 1;
+            if (smooth_pacing_reset_hits_ >= 3) {
+                smooth_pacing_enabled_ = false;
+                smooth_pacing_interval_us_ = 0;
+                smooth_pacing_reset_hits_ = 0;
+            }
+        }
+    } else if (last_submitted_pts_us_ != 0 && frame_pts_us <= last_submitted_pts_us_) {
+        smooth_pacing_reset_hits_ += 1;
+        if (smooth_pacing_reset_hits_ >= 3) {
+            smooth_pacing_enabled_ = false;
+            smooth_pacing_interval_us_ = 0;
+            smooth_pacing_reset_hits_ = 0;
+        }
+    }
+
+    if (smooth_pacing_enabled_ != was_enabled) {
+        smooth_pacing_deadline_initialized_ = false;
+        if (log_fn_ != nullptr) {
+            if (smooth_pacing_enabled_ && smooth_pacing_interval_us_ > 0) {
+                const double fps =
+                    1'000'000.0 / static_cast<double>(smooth_pacing_interval_us_);
+                std::wostringstream stream;
+                stream.setf(std::ios::fixed);
+                stream.precision(1);
+                stream << L"\u89c6\u9891\u6e32\u67d3: \u5df2\u542f\u7528\u9ad8\u5237\u987a\u6ed1\u5448\u73b0\u8282\u594f\uff0c\u76ee\u6807 "
+                       << fps
+                       << L" fps\uff0c\u4f18\u5148\u6309\u5185\u5bb9\u5e27\u95f4\u9694\u5300\u901f\u663e\u793a\u3002";
+                log_fn_(stream.str());
+            } else {
+                log_fn_(L"\u89c6\u9891\u6e32\u67d3: \u5df2\u9000\u51fa\u9ad8\u5237\u987a\u6ed1\u5448\u73b0\u8282\u594f\uff0c\u56de\u5230\u6700\u4f4e\u5ef6\u8fdf\u63d0\u4ea4\u3002");
+            }
+        }
+    }
+
+    last_submitted_pts_us_ = frame_pts_us;
+}
+
+void VideoRenderer::RenderThreadMain() {
+    SetCurrentThreadPriorityBestEffort(THREAD_PRIORITY_HIGHEST);
+
+    while (true) {
+        bool should_resize = false;
+        bool smooth_pacing = false;
+        int64_t smooth_interval_us = 0;
+        std::chrono::steady_clock::time_point smooth_deadline{};
+
+        {
+            std::unique_lock<std::mutex> lock(render_mutex_);
+            while (render_thread_running_) {
+                smooth_pacing =
+                    presentation_mode_ == PresentationMode::kSmooth &&
+                    smooth_pacing_enabled_ &&
+                    smooth_pacing_interval_us_ > 0;
+                if (!smooth_pacing) {
+                    smooth_pacing_deadline_initialized_ = false;
+                    if (render_requested_ || resize_requested_) {
+                        break;
+                    }
+                    render_cv_.wait(lock);
+                    continue;
+                }
+
+                if (!smooth_pacing_deadline_initialized_) {
+                    next_smooth_present_deadline_ = std::chrono::steady_clock::now();
+                    smooth_pacing_deadline_initialized_ = true;
+                }
+
+                if (resize_requested_) {
+                    smooth_deadline = next_smooth_present_deadline_;
+                    smooth_interval_us = smooth_pacing_interval_us_;
+                    break;
+                }
+
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= next_smooth_present_deadline_) {
+                    smooth_deadline = next_smooth_present_deadline_;
+                    smooth_interval_us = smooth_pacing_interval_us_;
+                    break;
+                }
+
+                render_cv_.wait_until(lock, next_smooth_present_deadline_);
+            }
+
+            if (!render_thread_running_) {
+                break;
+            }
+
+            should_resize = resize_requested_;
+            resize_requested_ = false;
+            render_requested_ = false;
+        }
+
+        if (smooth_pacing && smooth_interval_us > 0) {
+            WaitUntilSteadyDeadline(smooth_deadline);
+        }
+
+        if (should_resize) {
+            ResizeSwapChain();
+        }
+        Render();
+
+        if (smooth_pacing && smooth_interval_us > 0) {
+            std::lock_guard<std::mutex> lock(render_mutex_);
+            if (smooth_pacing_enabled_ && smooth_pacing_interval_us_ > 0) {
+                const auto interval = std::chrono::microseconds(smooth_pacing_interval_us_);
+                const auto now = std::chrono::steady_clock::now();
+                do {
+                    next_smooth_present_deadline_ += interval;
+                } while (next_smooth_present_deadline_ <= now);
+            } else {
+                smooth_pacing_deadline_initialized_ = false;
+            }
+            continue;
+        }
+
+        while (true) {
+            {
+                std::lock_guard<std::mutex> lock(render_mutex_);
+                if (!render_thread_running_) {
+                    return;
+                }
+                if (!render_requested_ && !resize_requested_) {
+                    break;
+                }
+                should_resize = resize_requested_;
+                resize_requested_ = false;
+                render_requested_ = false;
+            }
+
+            if (should_resize) {
+                ResizeSwapChain();
+            }
+            Render();
+        }
+    }
 }
 
 bool VideoRenderer::InitializeDeviceResources() {
@@ -365,6 +671,7 @@ bool VideoRenderer::InitializeDeviceResources() {
     SafeRelease(factory1);
 
     EnableMultithreadProtection();
+    ConfigureLowLatencyPresent(device_, swap_chain_, log_fn_);
 
     if (log_fn_ != nullptr) {
         std::wostringstream stream;
@@ -553,6 +860,8 @@ void VideoRenderer::ClearExternalVideoResources() {
     external_srv0_ = nullptr;
     SafeRelease(external_srv1_);
     external_srv1_ = nullptr;
+    SafeRelease(external_texture_plane1_);
+    external_texture_plane1_ = nullptr;
     SafeRelease(external_texture_);
     external_texture_ = nullptr;
     using_external_texture_ = false;
@@ -570,10 +879,12 @@ bool VideoRenderer::UseExternalTextureFrame(const DecodedFrame& frame) {
         return false;
     }
 
+    ID3D11Texture2D* expected_plane1 = frame.separate_textures ? frame.d3d_texture_plane1 : nullptr;
     const bool same_external_texture =
         using_external_texture_ &&
         !using_gpu_copy_texture_ &&
         external_texture_ == frame.d3d_texture &&
+        external_texture_plane1_ == expected_plane1 &&
         texture_format_ == frame.format &&
         texture_width_ == frame.width &&
         texture_height_ == frame.height &&
@@ -591,6 +902,10 @@ bool VideoRenderer::UseExternalTextureFrame(const DecodedFrame& frame) {
 
     external_texture_ = frame.d3d_texture;
     external_texture_->AddRef();
+    if (frame.separate_textures && frame.d3d_texture_plane1 != nullptr) {
+        external_texture_plane1_ = frame.d3d_texture_plane1;
+        external_texture_plane1_->AddRef();
+    }
 
     if (frame.format == DecodedFrameFormat::kBgra) {
         D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
@@ -615,7 +930,9 @@ bool VideoRenderer::UseExternalTextureFrame(const DecodedFrame& frame) {
         uv_srv_desc.Format = DXGI_FORMAT_R8G8_UNORM;
         uv_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         uv_srv_desc.Texture2D.MipLevels = 1;
-        if (FAILED(device_->CreateShaderResourceView(external_texture_, &uv_srv_desc, &external_srv1_))) {
+        ID3D11Texture2D* uv_texture =
+            frame.separate_textures && external_texture_plane1_ != nullptr ? external_texture_plane1_ : external_texture_;
+        if (FAILED(device_->CreateShaderResourceView(uv_texture, &uv_srv_desc, &external_srv1_))) {
             ClearExternalVideoResources();
             return false;
         }
@@ -730,12 +1047,100 @@ bool VideoRenderer::UseGpuCopiedTextureFrame(const DecodedFrame& frame) {
     return true;
 }
 
-void VideoRenderer::Render() {
-    {
-        std::lock_guard<std::mutex> lock(frame_mutex_);
-        render_posted_ = false;
+bool VideoRenderer::UseCpuUploadedTextureFrame(const DecodedFrame& frame) {
+    if (device_ == nullptr ||
+        context_ == nullptr ||
+        frame.bytes.empty() ||
+        frame.width <= 0 ||
+        frame.height <= 0 ||
+        frame.format == DecodedFrameFormat::kUnknown) {
+        return false;
     }
 
+    const bool can_reuse_texture =
+        using_external_texture_ &&
+        !using_gpu_copy_texture_ &&
+        external_texture_ != nullptr &&
+        texture_format_ == frame.format &&
+        texture_width_ == frame.width &&
+        texture_height_ == frame.height &&
+        external_srv0_ != nullptr &&
+        (frame.format != DecodedFrameFormat::kNv12 || external_srv1_ != nullptr);
+
+    if (!can_reuse_texture) {
+        ClearExternalVideoResources();
+
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = static_cast<UINT>(frame.width);
+        desc.Height = static_cast<UINT>(frame.height);
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        if (frame.format == DecodedFrameFormat::kBgra) {
+            desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        } else if (frame.format == DecodedFrameFormat::kNv12) {
+            desc.Format = DXGI_FORMAT_NV12;
+        } else {
+            return false;
+        }
+
+        if (FAILED(device_->CreateTexture2D(&desc, nullptr, &external_texture_))) {
+            ClearExternalVideoResources();
+            return false;
+        }
+
+        if (frame.format == DecodedFrameFormat::kBgra) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+            srv_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srv_desc.Texture2D.MipLevels = 1;
+            if (FAILED(device_->CreateShaderResourceView(external_texture_, &srv_desc, &external_srv0_))) {
+                ClearExternalVideoResources();
+                return false;
+            }
+        } else {
+            D3D11_SHADER_RESOURCE_VIEW_DESC y_srv_desc{};
+            y_srv_desc.Format = DXGI_FORMAT_R8_UNORM;
+            y_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            y_srv_desc.Texture2D.MipLevels = 1;
+            if (FAILED(device_->CreateShaderResourceView(external_texture_, &y_srv_desc, &external_srv0_))) {
+                ClearExternalVideoResources();
+                return false;
+            }
+
+            D3D11_SHADER_RESOURCE_VIEW_DESC uv_srv_desc{};
+            uv_srv_desc.Format = DXGI_FORMAT_R8G8_UNORM;
+            uv_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            uv_srv_desc.Texture2D.MipLevels = 1;
+            if (FAILED(device_->CreateShaderResourceView(external_texture_, &uv_srv_desc, &external_srv1_))) {
+                ClearExternalVideoResources();
+                return false;
+            }
+        }
+
+        using_external_texture_ = true;
+        using_gpu_copy_texture_ = false;
+        texture_format_ = frame.format;
+        texture_width_ = frame.width;
+        texture_height_ = frame.height;
+    }
+
+    const UINT row_pitch = static_cast<UINT>(std::max(frame.stride0, frame.format == DecodedFrameFormat::kBgra ? frame.width * 4 : frame.width));
+    UINT depth_pitch = static_cast<UINT>(row_pitch * std::max(frame.height, 1));
+    if (frame.format == DecodedFrameFormat::kNv12) {
+        const UINT uv_pitch = static_cast<UINT>(std::max(frame.stride1, frame.width));
+        depth_pitch = static_cast<UINT>(
+            frame.plane1_offset + static_cast<size_t>(uv_pitch) * static_cast<size_t>((frame.height + 1) / 2));
+    }
+
+    context_->UpdateSubresource(external_texture_, 0, nullptr, frame.bytes.data(), row_pitch, depth_pitch);
+    return true;
+}
+
+void VideoRenderer::Render() {
     if (context_ == nullptr || swap_chain_ == nullptr || render_target_view_ == nullptr) {
         return;
     }
@@ -749,6 +1154,22 @@ void VideoRenderer::Render() {
             latest_frame_ = DecodedFrame{};
             frame_dirty_ = false;
             has_new_frame = true;
+        }
+    }
+
+    if (has_new_frame &&
+        frame_to_upload.gpu_backed &&
+        frame_to_upload.direct_sample_safe &&
+        frame_to_upload.d3d_texture != nullptr) {
+        if (UseExternalTextureFrame(frame_to_upload)) {
+            if (!logged_direct_gpu_path_ && log_fn_ != nullptr) {
+                log_fn_(L"\u89C6\u9891\u6E32\u67D3: \u5DF2\u5207\u5230 CUDA -> D3D11 \u76F4\u63A5\u91C7\u6837\u663E\u793A\u8DEF\u5F84\uFF0C\u4E0D\u518D\u7ECF\u8FC7 CPU \u4E0A\u4F20\u3002");
+                logged_direct_gpu_path_ = true;
+            }
+            frame_to_upload.gpu_backed = false;
+        } else if (frame_to_upload.separate_textures && log_fn_ != nullptr) {
+            log_fn_(L"\u89C6\u9891\u6E32\u67D3: CUDA -> D3D11 \u76F4\u63A5\u91C7\u6837\u8DEF\u5F84\u4E0D\u53EF\u7528\uFF0C\u5F53\u524D\u5E27\u5C06\u5C1D\u8BD5\u5176\u4ED6\u663E\u793A\u65B9\u5F0F\u3002");
+            frame_to_upload.gpu_backed = false;
         }
     }
 
@@ -767,6 +1188,15 @@ void VideoRenderer::Render() {
                     log_fn_(L"\u89c6\u9891\u6e32\u67d3: GPU \u590d\u5236\u663e\u793a\u8def\u5f84\u4e0e\u76f4\u63a5\u7eb9\u7406\u91c7\u6837\u90fd\u4e0d\u53ef\u7528\uff0c\u5f53\u524d\u5e27\u65e0\u6cd5\u663e\u793a\u3002");
                     log_fn_(L"视频渲染: 当前帧纹理无法直接显示，也无法完成 GPU 复制。");
                 }
+            }
+        } else if (!frame_to_upload.bytes.empty()) {
+            if (UseCpuUploadedTextureFrame(frame_to_upload)) {
+                if (!logged_cpu_upload_path_ && log_fn_ != nullptr) {
+                    log_fn_(L"视频渲染: 已启用 CPU 上传纹理显示路径，用于承接 NVIDIA CUVID 输出的 NV12 帧。");
+                    logged_cpu_upload_path_ = true;
+                }
+            } else if (log_fn_ != nullptr) {
+                log_fn_(L"视频渲染: CPU 上传纹理显示路径不可用，当前帧无法显示。");
             }
         }
     }
@@ -832,7 +1262,33 @@ void VideoRenderer::Render() {
         }
     }
 
-    swap_chain_->Present(0, 0);
+    bool smooth_pacing_active = false;
+    {
+        std::lock_guard<std::mutex> lock(render_mutex_);
+        smooth_pacing_active =
+            presentation_mode_ == PresentationMode::kSmooth &&
+            smooth_pacing_enabled_ &&
+            smooth_pacing_interval_us_ > 0;
+    }
+
+    UINT present_flags = 0;
+    if (allow_tearing_ && !smooth_pacing_active) {
+        present_flags |= DXGI_PRESENT_ALLOW_TEARING;
+    }
+
+    HRESULT present_hr = swap_chain_->Present(0, present_flags);
+    if (FAILED(present_hr) && present_flags != 0) {
+        present_hr = swap_chain_->Present(0, 0);
+    }
+    if (FAILED(present_hr)) {
+        if (!logged_present_failure_ && log_fn_ != nullptr) {
+            log_fn_(L"\u89c6\u9891\u6e32\u67d3: Present \u63d0\u4ea4\u5931\u8d25\uff0c\u9519\u8bef\u7801 " + HrToString(present_hr));
+            logged_present_failure_ = true;
+        }
+        return;
+    }
+
+    logged_present_failure_ = false;
     if (has_new_frame && frame_to_upload.pts_us != 0 && present_fn_ != nullptr) {
         present_fn_(frame_to_upload.pts_us);
     }

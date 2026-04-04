@@ -1,4 +1,5 @@
 #include "ControlServer.h"
+#include "NvidiaCuvidProbe.h"
 #include "UdpVideoReceiver.h"
 #include "VideoDecoder.h"
 #include "VideoRenderer.h"
@@ -18,6 +19,7 @@
 #include <iomanip>
 #include <memory>
 #include <mutex>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -58,6 +60,8 @@ constexpr wchar_t kTextRuntimeInitial[] =
     L"\u65F6\u949F\u540C\u6B65\uFF1A\u7B49\u5F85\u624B\u673A\u6821\u65F6";
 constexpr wchar_t kTextFocusVideo[] = L"\u805A\u7126\u753B\u9762";
 constexpr wchar_t kTextOpenLog[] = L"\u6253\u5F00\u65E5\u5FD7";
+constexpr wchar_t kTextSwitchToLowLatency[] = L"\u5207\u6362\u5230\u4f4e\u5ef6\u8fdf";
+constexpr wchar_t kTextSwitchToSmooth[] = L"\u5207\u6362\u5230\u987a\u6ed1";
 constexpr wchar_t kTextControlPill[] = L"\u63A7\u5236 TCP/5500";
 constexpr wchar_t kTextVideoPill[] = L"\u89C6\u9891 UDP/55000";
 constexpr wchar_t kTextTrafficTitle[] = L"\u94FE\u8DEF\u7EDF\u8BA1";
@@ -78,6 +82,7 @@ constexpr int64_t kTimeSyncIntervalUs = 1'000'000;
 constexpr int64_t kMaxReasonableLatencyUs = 5'000'000;
 constexpr int kFocusVideoButtonId = 1001;
 constexpr int kOpenLogButtonId = 1002;
+constexpr int kPresentationModeButtonId = 1003;
 bool g_frontend_mode = false;
 
 constexpr int kStatusWindowWidth = 1080;
@@ -119,6 +124,7 @@ struct DashboardSnapshot {
 struct StatusWindowLayout {
     RECT hero{};
     RECT focus_button{};
+    RECT mode_button{};
     RECT open_log_button{};
     std::array<RECT, 4> summary_cards{};
     RECT traffic_card{};
@@ -131,6 +137,7 @@ struct AppState {
     HWND status_window = nullptr;
     HWND video_window = nullptr;
     HWND focus_video_button = nullptr;
+    HWND presentation_mode_button = nullptr;
     HWND open_log_button = nullptr;
     HWND log_view = nullptr;
     HFONT title_font = nullptr;
@@ -143,12 +150,22 @@ struct AppState {
     HBRUSH log_background_brush = nullptr;
     DashboardSnapshot dashboard{};
     VideoRenderer renderer;
+    VideoRenderer::PresentationMode presentation_mode = VideoRenderer::PresentationMode::kLowLatency;
     std::mutex log_mutex;
     std::deque<std::wstring> pending_logs;
     std::wstring log_file_path;
     std::wstring status_file_path;
+    std::wstring profile_cache_path;
+    std::wstring codec_config_cache_path;
+    NvidiaCuvidProbeResult nvdec_probe{};
     protocol::StreamProfile selected_profile;
     bool has_selected_profile = false;
+    protocol::StreamProfile cached_startup_profile;
+    bool has_cached_startup_profile = false;
+    std::vector<uint8_t> cached_codec_config;
+    bool has_cached_codec_config = false;
+    bool auto_resumed_profile = false;
+    bool auto_resume_notice_logged = false;
     std::unique_ptr<ControlServer> control_server;
     std::unique_ptr<UdpVideoReceiver> udp_receiver;
     std::unique_ptr<VideoDecoder> decoder;
@@ -182,6 +199,8 @@ struct AppState {
     bool suppress_video_window_auto_show = false;
     bool shutting_down = false;
 };
+
+void QueueLog(AppState* state, const std::wstring& message);
 
 int RectWidth(const RECT& rect) {
     return rect.right - rect.left;
@@ -387,6 +406,9 @@ void ApplyUiToControls(AppState* state) {
     if (state->focus_video_button != nullptr && state->button_font != nullptr) {
         SendMessageW(state->focus_video_button, WM_SETFONT, reinterpret_cast<WPARAM>(state->button_font), TRUE);
     }
+    if (state->presentation_mode_button != nullptr && state->button_font != nullptr) {
+        SendMessageW(state->presentation_mode_button, WM_SETFONT, reinterpret_cast<WPARAM>(state->button_font), TRUE);
+    }
     if (state->open_log_button != nullptr && state->button_font != nullptr) {
         SendMessageW(state->open_log_button, WM_SETFONT, reinterpret_cast<WPARAM>(state->button_font), TRUE);
     }
@@ -399,6 +421,90 @@ void ApplyUiToControls(AppState* state) {
             EC_LEFTMARGIN | EC_RIGHTMARGIN,
             MAKELPARAM(margin, margin));
     }
+}
+
+std::wstring PresentationModeLabel(VideoRenderer::PresentationMode mode) {
+    switch (mode) {
+    case VideoRenderer::PresentationMode::kSmooth:
+        return L"\u987a\u6ed1\u89c2\u611f";
+    case VideoRenderer::PresentationMode::kLowLatency:
+    default:
+        return L"\u7ade\u6280\u4f4e\u5ef6\u8fdf";
+    }
+}
+
+std::wstring PresentationModeButtonText(VideoRenderer::PresentationMode mode) {
+    return mode == VideoRenderer::PresentationMode::kSmooth
+        ? std::wstring(kTextSwitchToLowLatency)
+        : std::wstring(kTextSwitchToSmooth);
+}
+
+void UpdatePresentationModeButton(AppState* state) {
+    if (state == nullptr || state->presentation_mode_button == nullptr) {
+        return;
+    }
+
+    const std::wstring text = PresentationModeButtonText(state->presentation_mode);
+    SetWindowTextW(state->presentation_mode_button, text.c_str());
+}
+
+void ApplyPresentationMode(AppState* state, VideoRenderer::PresentationMode mode, bool log_change) {
+    if (state == nullptr) {
+        return;
+    }
+
+    if (state->presentation_mode == mode) {
+        UpdatePresentationModeButton(state);
+        return;
+    }
+
+    state->presentation_mode = mode;
+    state->renderer.SetPresentationMode(mode);
+    if (state->decoder != nullptr) {
+        state->decoder->SetSmoothMode(mode == VideoRenderer::PresentationMode::kSmooth);
+    }
+    UpdatePresentationModeButton(state);
+
+    if (log_change) {
+        QueueLog(state, std::wstring(L"\u663e\u793a\u6a21\u5f0f: \u5df2\u5207\u6362\u5230") + PresentationModeLabel(mode) + L"\u3002");
+    }
+
+    if (state->status_window != nullptr) {
+        PostMessageW(state->status_window, kStatsMessage, 0, 0);
+    }
+}
+
+bool IsProfileSupportedByNvdec(const NvidiaCuvidProbeResult& probe, const protocol::StreamProfile& profile) {
+    if (!probe.cuda_driver_ready || !probe.cuvid_library_ready || !probe.h264_8bit_420_supported) {
+        return false;
+    }
+    if (profile.codec != protocol::Codec::kAvc) {
+        return false;
+    }
+    if (profile.width <= 0 || profile.height <= 0) {
+        return false;
+    }
+    return profile.width <= probe.max_width && profile.height <= probe.max_height;
+}
+
+std::wstring BuildNvdecStatusText(const AppState* state) {
+    if (state == nullptr) {
+        return L"\u672A\u77E5";
+    }
+
+    if (!state->nvdec_probe.cuda_driver_ready || !state->nvdec_probe.cuvid_library_ready) {
+        return L"\u672A\u5C31\u7EEA";
+    }
+
+    if (state->has_selected_profile) {
+        return IsProfileSupportedByNvdec(state->nvdec_probe, state->selected_profile)
+            ? L"\u5DF2\u5C31\u7EEA\uFF08\u5F53\u524D\u914D\u7F6E\u53EF\u5207\u539F\u751F CUVID\uFF09"
+            : L"\u5DF2\u5C31\u7EEA\uFF08\u4F46\u5F53\u524D\u914D\u7F6E\u4E0D\u5728\u652F\u6301\u8303\u56F4\u5185\uFF09";
+    }
+
+    return state->nvdec_probe.h264_8bit_420_supported
+        ? L"\u5DF2\u5C31\u7EEA\uFF08\u7B49\u5F85\u6D41\u914D\u7F6E\uFF09"
+        : L"\u4E0D\u652F\u6301 H.264 8bit 4:2:0";
 }
 
 void ResetDashboardSnapshot(AppState* state) {
@@ -585,12 +691,12 @@ StatusWindowLayout CalculateStatusWindowLayout(AppState* state) {
     const int padding = ScaleByDpi(state->status_window, 20);
     const int gap = ScaleByDpi(state->status_window, 16);
     const int hero_height = ScaleByDpi(state->status_window, 148);
-    const int summary_height = ScaleByDpi(state->status_window, 136);
+    const int summary_height = ScaleByDpi(state->status_window, 176);
     const int detail_preferred_height = ScaleByDpi(state->status_window, 176);
     const int detail_min_height = ScaleByDpi(state->status_window, 136);
     const int log_min_height = ScaleByDpi(state->status_window, 250);
     const int hero_inner_padding = ScaleByDpi(state->status_window, 24);
-    const int button_width = ScaleByDpi(state->status_window, 132);
+    const int button_width = ScaleByDpi(state->status_window, 150);
     const int button_height = ScaleByDpi(state->status_window, 42);
     const int button_gap = ScaleByDpi(state->status_window, 12);
 
@@ -602,10 +708,15 @@ StatusWindowLayout CalculateStatusWindowLayout(AppState* state) {
         button_top,
         layout.hero.right - hero_inner_padding,
         button_top + button_height);
-    layout.focus_button = MakeRect(
+    layout.mode_button = MakeRect(
         layout.open_log_button.left - button_gap - button_width,
         button_top,
         layout.open_log_button.left - button_gap,
+        button_top + button_height);
+    layout.focus_button = MakeRect(
+        layout.mode_button.left - button_gap - button_width,
+        button_top,
+        layout.mode_button.left - button_gap,
         button_top + button_height);
 
     const int summary_top = layout.hero.bottom + gap;
@@ -926,6 +1037,14 @@ std::wstring BuildStatusFilePath() {
     return GetExecutableDirectory() + L"\\receiver-status.json";
 }
 
+std::wstring BuildProfileCachePath() {
+    return GetExecutableDirectory() + L"\\receiver-profile-cache.json";
+}
+
+std::wstring BuildCodecConfigCachePath() {
+    return GetExecutableDirectory() + L"\\receiver-codec-config.bin";
+}
+
 std::string WideToUtf8(const std::wstring& value) {
     if (value.empty()) {
         return {};
@@ -955,6 +1074,69 @@ std::string WideToUtf8(const std::wstring& value) {
         nullptr,
         nullptr);
     return result;
+}
+
+std::string ReadUtf8File(const std::wstring& path) {
+    if (path.empty()) {
+        return {};
+    }
+
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path.c_str(), L"rb") != 0 || file == nullptr) {
+        return {};
+    }
+
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return {};
+    }
+    const long file_size = ftell(file);
+    if (file_size <= 0) {
+        fclose(file);
+        return {};
+    }
+    rewind(file);
+
+    std::string text(static_cast<size_t>(file_size), '\0');
+    const size_t read_size = fread(text.data(), 1, text.size(), file);
+    fclose(file);
+    text.resize(read_size);
+
+    if (text.size() >= 3 &&
+        static_cast<unsigned char>(text[0]) == 0xEF &&
+        static_cast<unsigned char>(text[1]) == 0xBB &&
+        static_cast<unsigned char>(text[2]) == 0xBF) {
+        text.erase(0, 3);
+    }
+    return text;
+}
+
+std::vector<uint8_t> ReadBinaryFile(const std::wstring& path) {
+    if (path.empty()) {
+        return {};
+    }
+
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path.c_str(), L"rb") != 0 || file == nullptr) {
+        return {};
+    }
+
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return {};
+    }
+    const long file_size = ftell(file);
+    if (file_size <= 0) {
+        fclose(file);
+        return {};
+    }
+    rewind(file);
+
+    std::vector<uint8_t> data(static_cast<size_t>(file_size));
+    const size_t read_size = fread(data.data(), 1, data.size(), file);
+    fclose(file);
+    data.resize(read_size);
+    return data;
 }
 
 std::string EscapeJsonUtf8(const std::string& value) {
@@ -997,6 +1179,56 @@ std::string QuoteJsonWide(const std::wstring& value) {
     return "\"" + EscapeJsonUtf8(WideToUtf8(value)) + "\"";
 }
 
+bool LoadCachedSelectedProfile(const std::wstring& path, protocol::StreamProfile* out) {
+    if (out == nullptr) {
+        return false;
+    }
+
+    const std::string json_text = ReadUtf8File(path);
+    if (json_text.empty()) {
+        return false;
+    }
+
+    const std::regex profile_regex(
+        R"json((?:"selectedProfile"\s*:\s*)?\{\s*"codec"\s*:\s*"([^"]+)"\s*,\s*"width"\s*:\s*(\d+)\s*,\s*"height"\s*:\s*(\d+)\s*,\s*"fps"\s*:\s*(\d+)\s*,\s*"adaptiveFps"\s*:\s*(true|false)\s*,\s*"bitrate"\s*:\s*(\d+)\s*\})json");
+    std::smatch match;
+    if (!std::regex_search(json_text, match, profile_regex)) {
+        return false;
+    }
+
+    protocol::StreamProfile profile;
+    profile.codec = protocol::CodecFromWireName(match[1].str());
+    profile.width = std::stoi(match[2].str());
+    profile.height = std::stoi(match[3].str());
+    profile.fps = std::stoi(match[4].str());
+    profile.adaptive_fps = match[5].str() == "true";
+    profile.bitrate = std::stoi(match[6].str());
+    profile.video_port = kVideoPort;
+    if (profile.codec == protocol::Codec::kUnknown ||
+        profile.width <= 0 ||
+        profile.height <= 0 ||
+        profile.fps <= 0 ||
+        profile.bitrate <= 0) {
+        return false;
+    }
+
+    *out = profile;
+    return true;
+}
+
+std::string BuildProfileCacheJson(const protocol::StreamProfile& profile) {
+    std::ostringstream json;
+    json << "{"
+         << "\"codec\":\"" << protocol::CodecToWireName(profile.codec) << "\","
+         << "\"width\":" << profile.width << ","
+         << "\"height\":" << profile.height << ","
+         << "\"fps\":" << profile.fps << ","
+         << "\"adaptiveFps\":" << (profile.adaptive_fps ? "true" : "false") << ","
+         << "\"bitrate\":" << profile.bitrate
+         << "}\n";
+    return json.str();
+}
+
 void WriteUtf8File(const std::wstring& path, const std::string& utf8_text) {
     if (path.empty()) {
         return;
@@ -1012,6 +1244,20 @@ void WriteUtf8File(const std::wstring& path, const std::string& utf8_text) {
     if (!utf8_text.empty()) {
         fwrite(utf8_text.data(), 1, utf8_text.size(), file);
     }
+    fclose(file);
+}
+
+void WriteBinaryFile(const std::wstring& path, const std::vector<uint8_t>& data) {
+    if (path.empty() || data.empty()) {
+        return;
+    }
+
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path.c_str(), L"wb") != 0 || file == nullptr) {
+        return;
+    }
+
+    fwrite(data.data(), 1, data.size(), file);
     fclose(file);
 }
 
@@ -1086,25 +1332,21 @@ void UpdateLatencyEstimate(AppState* state, uint64_t sender_pts_us) {
     const int64_t receiver_present_us = NowSteadyUs();
     {
         std::lock_guard<std::mutex> lock(state->metrics_mutex);
-        if (!state->has_clock_sync) {
-            return;
-        }
-
-        const int64_t estimated_latency_us =
-            receiver_present_us + state->sender_clock_offset_us - static_cast<int64_t>(sender_pts_us);
-        if (!IsLatencySampleReasonable(estimated_latency_us)) {
-            return;
-        }
-
-        state->latest_latency_us = estimated_latency_us;
-        state->latency_sample_count += 1;
-        state->total_latency_us += static_cast<uint64_t>(estimated_latency_us);
-        if (state->latency_sample_count == 1) {
-            state->min_latency_us = estimated_latency_us;
-            state->max_latency_us = estimated_latency_us;
-        } else {
-            state->min_latency_us = std::min(state->min_latency_us, estimated_latency_us);
-            state->max_latency_us = std::max(state->max_latency_us, estimated_latency_us);
+        if (state->has_clock_sync) {
+            const int64_t estimated_latency_us =
+                receiver_present_us + state->sender_clock_offset_us - static_cast<int64_t>(sender_pts_us);
+            if (IsLatencySampleReasonable(estimated_latency_us)) {
+                state->latest_latency_us = estimated_latency_us;
+                state->latency_sample_count += 1;
+                state->total_latency_us += static_cast<uint64_t>(estimated_latency_us);
+                if (state->latency_sample_count == 1) {
+                    state->min_latency_us = estimated_latency_us;
+                    state->max_latency_us = estimated_latency_us;
+                } else {
+                    state->min_latency_us = std::min(state->min_latency_us, estimated_latency_us);
+                    state->max_latency_us = std::max(state->max_latency_us, estimated_latency_us);
+                }
+            }
         }
 
         if (state->fps_window_start_us == 0) {
@@ -1169,14 +1411,104 @@ void UpdateClockSync(AppState* state, int64_t offset_us, int64_t rtt_us) {
 
     if (first_sync) {
         std::wostringstream stream;
-        stream << L"\u65F6\u949F\u540C\u6B65\u5DF2\u5B8C\u6210\uFF0C\u504F\u79FB=" << FormatLatencyMs(offset_us)
-               << L"\uFF0C\u5F80\u8FD4=" << FormatLatencyMs(rtt_us);
+        stream << L"\u65F6\u949F\u540C\u6B65\u5DF2\u5B8C\u6210\uFF0C\u5F80\u8FD4="
+               << FormatLatencyMs(rtt_us)
+               << L"\uFF0C\u7AEF\u5230\u7AEF\u5EF6\u8FDF\u7EDF\u8BA1\u5DF2\u6062\u590D\u3002";
         QueueLog(state, stream.str());
     }
 
     if (state->status_window != nullptr) {
         PostMessageW(state->status_window, kStatsMessage, 0, 0);
     }
+}
+
+void ResetRuntimeMetricsForStream(AppState* state) {
+    if (state == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(state->metrics_mutex);
+    state->has_clock_sync = false;
+    state->sender_clock_offset_us = 0;
+    state->sender_clock_rtt_us = 0;
+    state->latest_latency_us = 0;
+    state->latency_sample_count = 0;
+    state->total_latency_us = 0;
+    state->min_latency_us = 0;
+    state->max_latency_us = 0;
+    state->decoded_frame_count = 0;
+    state->displayed_frame_count = 0;
+    state->present_frame_count = 0;
+    state->fps_window_start_us = 0;
+    state->display_fps = 0.0;
+    state->content_fps = 0.0;
+    state->receive_fps = 0.0;
+    state->decode_fps = 0.0;
+    state->content_frame_count = 0;
+    state->content_fps_window_start_pts_us = 0;
+    state->last_present_sender_pts_us = 0;
+    state->rate_window_start_us = 0;
+    state->rate_window_completed_frames = 0;
+    state->rate_window_decoded_frames = 0;
+    state->rate_window_displayed_frames = 0;
+    state->last_sync_request_us = 0;
+}
+
+std::wstring FormatProfileSummaryForLog(const protocol::StreamProfile& profile) {
+    std::wostringstream stream;
+    stream << (profile.codec == protocol::Codec::kAvc ? L"AVC" : L"HEVC")
+           << L" "
+           << profile.width
+           << L"x"
+           << profile.height
+           << L" / "
+           << FormatProfileFrameRate(profile)
+           << L" / "
+           << FormatBitrateValue(profile.bitrate);
+    return stream.str();
+}
+
+void ApplyStreamProfile(AppState* state, const protocol::StreamProfile& profile, bool auto_resumed) {
+    if (state == nullptr) {
+        return;
+    }
+
+    state->selected_profile = profile;
+    state->has_selected_profile = true;
+    state->auto_resumed_profile = auto_resumed;
+    state->suppress_video_window_auto_show = false;
+    ResetRuntimeMetricsForStream(state);
+
+    if (state->decoder != nullptr) {
+        state->decoder->Configure(profile);
+    }
+
+    if (state->control_server != nullptr) {
+        if (!auto_resumed) {
+            state->control_server->RequestIdr();
+        }
+        state->control_server->RequestTimeSync();
+    }
+
+    if (state->status_window != nullptr) {
+        PostMessageW(state->status_window, kStatsMessage, 0, 0);
+    }
+}
+
+void SubmitCachedCodecConfig(AppState* state, uint32_t frame_id) {
+    if (state == nullptr ||
+        state->decoder == nullptr ||
+        !state->has_cached_codec_config ||
+        state->cached_codec_config.empty()) {
+        return;
+    }
+
+    AccessUnit cached_unit;
+    cached_unit.bytes = state->cached_codec_config;
+    cached_unit.frame_id = frame_id;
+    cached_unit.pts_us = 0;
+    cached_unit.flags = static_cast<uint8_t>(protocol::kFlagCodecConfig | protocol::kFlagKeyframe);
+    state->decoder->SubmitAccessUnit(cached_unit);
 }
 
 void WriteStatusSnapshot(
@@ -1240,7 +1572,14 @@ void WriteStatusSnapshot(
     json << "  \"receiveFps\": " << format_number(receive_fps) << ",\n";
     json << "  \"decodeFps\": " << format_number(decode_fps) << ",\n";
     json << "  \"displayFps\": " << format_number(display_fps) << ",\n";
+    json << "  \"presentationMode\": " << QuoteJsonWide(PresentationModeLabel(state->presentation_mode)) << ",\n";
     json << "  \"gpuName\": " << QuoteJsonWide(state->renderer.gpu_name()) << ",\n";
+    json << "  \"nvdecCudaReady\": " << (state->nvdec_probe.cuda_driver_ready ? "true" : "false") << ",\n";
+    json << "  \"nvdecCuvidReady\": " << (state->nvdec_probe.cuvid_library_ready ? "true" : "false") << ",\n";
+    json << "  \"nvdecH264Supported\": " << (state->nvdec_probe.h264_8bit_420_supported ? "true" : "false") << ",\n";
+    json << "  \"nvdecMaxWidth\": " << state->nvdec_probe.max_width << ",\n";
+    json << "  \"nvdecMaxHeight\": " << state->nvdec_probe.max_height << ",\n";
+    json << "  \"nvdecStatus\": " << QuoteJsonWide(BuildNvdecStatusText(state)) << ",\n";
     json << "  \"videoWindowReady\": " << (state->video_window != nullptr ? "true" : "false") << ",\n";
     json << "  \"logFilePath\": " << QuoteJsonWide(state->log_file_path) << ",\n";
     json << "  \"statusFilePath\": " << QuoteJsonWide(state->status_file_path) << ",\n";
@@ -1341,14 +1680,25 @@ void UpdateStatusLabel(AppState* state) {
 
     if (state->has_selected_profile) {
         std::wostringstream subtitle_stream;
-        subtitle_stream << L"\u53D1\u9001\u7AEF\u5DF2\u8FDE\u63A5\uFF0C\u5F53\u524D\u914D\u7F6E "
-                        << state->selected_profile.width
-                        << L"x"
-                        << state->selected_profile.height
-                        << L" / "
-                        << CodecName(state->selected_profile.codec)
-                        << L" / "
-                        << FormatProfileFrameRate(state->selected_profile);
+        if (state->auto_resumed_profile) {
+            subtitle_stream << L"\u68C0\u6D4B\u5230\u624B\u673A\u7AEF\u4ECD\u5728\u6301\u7EED\u9001\u5E27\uFF0C\u5DF2\u4F7F\u7528\u4E0A\u6B21\u914D\u7F6E\u81EA\u52A8\u63A5\u7BA1\u89E3\u7801 "
+                            << state->selected_profile.width
+                            << L"x"
+                            << state->selected_profile.height
+                            << L" / "
+                            << CodecName(state->selected_profile.codec)
+                            << L" / "
+                            << FormatProfileFrameRate(state->selected_profile);
+        } else {
+            subtitle_stream << L"\u53D1\u9001\u7AEF\u5DF2\u8FDE\u63A5\uFF0C\u5F53\u524D\u914D\u7F6E "
+                            << state->selected_profile.width
+                            << L"x"
+                            << state->selected_profile.height
+                            << L" / "
+                            << CodecName(state->selected_profile.codec)
+                            << L" / "
+                            << FormatProfileFrameRate(state->selected_profile);
+        }
         state->dashboard.subtitle = subtitle_stream.str();
 
         std::wostringstream config_value;
@@ -1358,7 +1708,9 @@ void UpdateStatusLabel(AppState* state) {
                     << L" / "
                     << FormatProfileFrameRate(state->selected_profile)
                     << L" / "
-                    << FormatBitrateValue(state->selected_profile.bitrate);
+                    << FormatBitrateValue(state->selected_profile.bitrate)
+                    << L" / "
+                    << PresentationModeLabel(state->presentation_mode);
         state->dashboard.summary_cards[0] = {kTextCurrentConfig, config_value.str(), config_note.str()};
     } else {
         state->dashboard.subtitle = kTextDashboardWaiting;
@@ -1405,8 +1757,10 @@ void UpdateStatusLabel(AppState* state) {
     runtime_stream << L"\u7F51\u7EDC\u91CD\u7EC4\u901F\u7387\uFF1A" << FormatOptionalFps(receive_fps)
                    << L"\r\n\u89E3\u7801\u8F93\u51FA\u901F\u7387\uFF1A" << FormatOptionalFps(decode_fps)
                    << L"\r\n\u6700\u7EC8\u663E\u793A\u901F\u7387\uFF1A" << FormatOptionalFps(display_fps)
+                   << L"\r\n\u663E\u793A\u6A21\u5F0F\uFF1A" << PresentationModeLabel(state->presentation_mode)
                    << L"\r\n\u6E32\u67D3\u663E\u5361\uFF1A"
                    << (state->renderer.gpu_name().empty() ? L"\u672A\u8BC6\u522B" : ShortenMiddle(state->renderer.gpu_name(), 38))
+                   << L"\r\nNVIDIA NVDEC\uFF1A" << BuildNvdecStatusText(state)
                    << L"\r\n\u753B\u9762\u7A97\u53E3\uFF1A"
                    << (video_visible
                         ? L"\u5DF2\u5C31\u7EEA"
@@ -1488,6 +1842,15 @@ void LayoutStatusWindow(AppState* state) {
             layout.focus_button.top,
             RectWidth(layout.focus_button),
             RectHeight(layout.focus_button),
+            TRUE);
+    }
+    if (state->presentation_mode_button != nullptr) {
+        MoveWindow(
+            state->presentation_mode_button,
+            layout.mode_button.left,
+            layout.mode_button.top,
+            RectWidth(layout.mode_button),
+            RectHeight(layout.mode_button),
             TRUE);
     }
     if (state->open_log_button != nullptr) {
@@ -1604,9 +1967,20 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
         new_state->status_window = hwnd;
         new_state->log_file_path = BuildLogFilePath();
         new_state->status_file_path = BuildStatusFilePath();
+        new_state->profile_cache_path = BuildProfileCachePath();
+        new_state->codec_config_cache_path = BuildCodecConfigCachePath();
         ResetLogFile(new_state->log_file_path);
         ResetDashboardSnapshot(new_state);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(new_state));
+
+        protocol::StreamProfile cached_profile;
+        if (LoadCachedSelectedProfile(new_state->profile_cache_path, &cached_profile) ||
+            LoadCachedSelectedProfile(new_state->status_file_path, &cached_profile)) {
+            new_state->cached_startup_profile = cached_profile;
+            new_state->has_cached_startup_profile = true;
+        }
+        new_state->cached_codec_config = ReadBinaryFile(new_state->codec_config_cache_path);
+        new_state->has_cached_codec_config = !new_state->cached_codec_config.empty();
 
         new_state->window_background_brush = CreateSolidBrush(kColorWindowBackground);
         new_state->log_background_brush = CreateSolidBrush(kColorLogBackground);
@@ -1624,6 +1998,19 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
             40,
             hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kFocusVideoButtonId)),
+            create_struct->hInstance,
+            nullptr);
+        new_state->presentation_mode_button = CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            0,
+            0,
+            100,
+            40,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kPresentationModeButtonId)),
             create_struct->hInstance,
             nullptr);
         new_state->open_log_button = CreateWindowExW(
@@ -1653,9 +2040,12 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
             create_struct->hInstance,
             nullptr);
         ApplyUiToControls(new_state);
+        UpdatePresentationModeButton(new_state);
+        new_state->nvdec_probe = ProbeNvidiaCuvidSupport();
 
         new_state->renderer.SetLogFn(
             [new_state](const std::wstring& line) { QueueLog(new_state, line); });
+        new_state->renderer.SetPresentationMode(new_state->presentation_mode);
         new_state->renderer.SetPresentFn(
             [new_state](uint64_t sender_pts_us) {
                 if (new_state->status_window != nullptr &&
@@ -1709,47 +2099,18 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
                 }
             });
         new_state->decoder->SetD3DDevice(new_state->renderer.d3d_device());
+        new_state->decoder->SetSmoothMode(
+            new_state->presentation_mode == VideoRenderer::PresentationMode::kSmooth);
         new_state->decoder->Start();
 
         new_state->control_server = std::make_unique<ControlServer>(
             [new_state](const std::wstring& line) { QueueLog(new_state, line); },
             [new_state](const protocol::StreamProfile& profile) {
-                new_state->selected_profile = profile;
-                new_state->has_selected_profile = true;
-                new_state->suppress_video_window_auto_show = false;
-                {
-                    std::lock_guard<std::mutex> lock(new_state->metrics_mutex);
-                    new_state->has_clock_sync = false;
-                    new_state->sender_clock_offset_us = 0;
-                    new_state->sender_clock_rtt_us = 0;
-                    new_state->latest_latency_us = 0;
-                    new_state->latency_sample_count = 0;
-                    new_state->total_latency_us = 0;
-                    new_state->min_latency_us = 0;
-                    new_state->max_latency_us = 0;
-                    new_state->decoded_frame_count = 0;
-                    new_state->displayed_frame_count = 0;
-                    new_state->present_frame_count = 0;
-                    new_state->fps_window_start_us = 0;
-                    new_state->display_fps = 0.0;
-                    new_state->content_fps = 0.0;
-                    new_state->receive_fps = 0.0;
-                    new_state->decode_fps = 0.0;
-                    new_state->content_frame_count = 0;
-                    new_state->content_fps_window_start_pts_us = 0;
-                    new_state->last_present_sender_pts_us = 0;
-                    new_state->rate_window_start_us = 0;
-                    new_state->rate_window_completed_frames = 0;
-                    new_state->rate_window_decoded_frames = 0;
-                    new_state->rate_window_displayed_frames = 0;
-                }
-                if (new_state->decoder != nullptr) {
-                    new_state->decoder->Configure(profile);
-                }
-                if (new_state->control_server != nullptr) {
-                    new_state->control_server->RequestTimeSync();
-                }
-                PostMessageW(new_state->status_window, kStatsMessage, 0, 0);
+                new_state->cached_startup_profile = profile;
+                new_state->has_cached_startup_profile = true;
+                new_state->auto_resume_notice_logged = false;
+                WriteUtf8File(new_state->profile_cache_path, BuildProfileCacheJson(profile));
+                ApplyStreamProfile(new_state, profile, false);
             },
             [new_state](int64_t offset_us, int64_t rtt_us) {
                 UpdateClockSync(new_state, offset_us, rtt_us);
@@ -1758,6 +2119,27 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
         new_state->udp_receiver = std::make_unique<UdpVideoReceiver>(
             [new_state](const std::wstring& line) { QueueLog(new_state, line); },
             [new_state](const AccessUnit& unit) {
+                const bool is_codec_config = (unit.flags & protocol::kFlagCodecConfig) != 0;
+                if (is_codec_config && !unit.bytes.empty()) {
+                    new_state->cached_codec_config = unit.bytes;
+                    new_state->has_cached_codec_config = true;
+                    WriteBinaryFile(new_state->codec_config_cache_path, new_state->cached_codec_config);
+                }
+
+                if (!new_state->has_selected_profile &&
+                    new_state->has_cached_startup_profile &&
+                    (new_state->has_cached_codec_config || is_codec_config)) {
+                    ApplyStreamProfile(new_state, new_state->cached_startup_profile, true);
+                    if (!is_codec_config) {
+                        SubmitCachedCodecConfig(new_state, unit.frame_id);
+                    }
+                    if (!new_state->auto_resume_notice_logged) {
+                        QueueLog(
+                            new_state,
+                            L"\u81EA\u52A8\u63A5\u7BA1: \u68C0\u6D4B\u5230\u624B\u673A\u7AEF\u5DF2\u5728\u6301\u7EED\u9001\u5E27\uFF0C\u5DF2\u4F7F\u7528\u4E0A\u6B21\u914D\u7F6E\u4E0E\u7F13\u5B58\u7684\u7801\u6D41\u53C2\u6570\u76F4\u63A5\u6062\u590D\u89E3\u7801\u3002");
+                        new_state->auto_resume_notice_logged = true;
+                    }
+                }
                 if (new_state->decoder != nullptr) {
                     new_state->decoder->SubmitAccessUnit(unit);
                 }
@@ -1768,6 +2150,16 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
         SetTimer(hwnd, kStatsTimerId, kStatsIntervalMs, nullptr);
         LayoutStatusWindow(new_state);
         UpdateStatusLabel(new_state);
+        if (new_state->has_cached_startup_profile) {
+            QueueLog(
+                new_state,
+                std::wstring(L"\u542F\u52A8\u6062\u590D: \u5DF2\u8BFB\u53D6\u4E0A\u6B21\u914D\u7F6E\u7F13\u5B58 ")
+                    + FormatProfileSummaryForLog(new_state->cached_startup_profile)
+                    + (new_state->has_cached_codec_config
+                        ? L"\uFF0C\u82E5\u624B\u673A\u7AEF\u4ECD\u5728\u6301\u7EED\u9001\u5E27\u5C06\u81EA\u52A8\u63A5\u7BA1\u89E3\u7801\u3002"
+                        : L"\uFF0C\u4F46\u672C\u5730\u6682\u65E0\u53EF\u7528\u7684\u7801\u6D41\u53C2\u6570\u7F13\u5B58\u3002"));
+        }
+        QueueLog(new_state, new_state->nvdec_probe.summary);
         QueueLog(new_state, std::wstring(L"接收端版本：") + kAppBuildLabel);
         QueueLog(new_state, L"\u72B6\u6001\u7A97\u53E3\u5DF2\u5C31\u7EEA\u3002");
         QueueLog(new_state, L"\u753B\u9762\u7A97\u53E3\u5DF2\u521B\u5EFA\uFF0C\u6536\u5230\u753B\u9762\u540E\u518D\u663E\u793A\u3002");
@@ -1848,6 +2240,15 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
             switch (LOWORD(w_param)) {
             case kFocusVideoButtonId:
                 FocusVideoWindow(state);
+                return 0;
+            case kPresentationModeButtonId:
+                if (state != nullptr) {
+                    const auto next_mode =
+                        state->presentation_mode == VideoRenderer::PresentationMode::kLowLatency
+                        ? VideoRenderer::PresentationMode::kSmooth
+                        : VideoRenderer::PresentationMode::kLowLatency;
+                    ApplyPresentationMode(state, next_mode, true);
+                }
                 return 0;
             case kOpenLogButtonId:
                 OpenLogFile(state);

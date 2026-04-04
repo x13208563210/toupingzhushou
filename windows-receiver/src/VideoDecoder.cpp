@@ -1,4 +1,5 @@
 #include "VideoDecoder.h"
+#include "NvidiaCuvidDecoder.h"
 
 #include <Windows.h>
 #include <codecapi.h>
@@ -16,6 +17,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <deque>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -28,6 +30,7 @@ constexpr size_t kZeroCopySurfacePoolSize = 8;
 
 enum class DecoderBackend {
     kNone,
+    kNvidiaCuvid,
     kMediaFoundation,
 };
 
@@ -37,6 +40,7 @@ struct DecoderContext {
     ComPtr<IMFTransform> transform;
     ComPtr<IMFMediaType> output_type;
     ComPtr<IMFDXGIDeviceManager> device_manager;
+    std::unique_ptr<NvidiaCuvidDecoder> nvidia_cuvid_decoder;
     GUID output_subtype = GUID_NULL;
     UINT32 coded_width = 0;
     UINT32 coded_height = 0;
@@ -88,20 +92,41 @@ void SetCurrentThreadPriorityBestEffort(int priority) {
     SetThreadPriority(GetCurrentThread(), priority);
 }
 
-size_t QueueWarningThresholdForProfile(const protocol::StreamProfile& profile) {
+size_t QueueWarningThresholdForProfile(const protocol::StreamProfile& profile, bool smooth_mode) {
     const int fps = std::max(0, profile.fps);
     if (fps <= 0) {
-        return 60;
+        return smooth_mode ? 18 : 12;
     }
-    return static_cast<size_t>(std::max(60, fps * 2));
+    if (smooth_mode) {
+        return static_cast<size_t>(std::clamp(fps / 3, 18, 40));
+    }
+    return static_cast<size_t>(std::clamp(fps / 5, 12, 28));
 }
 
-size_t QueueResyncThresholdForProfile(const protocol::StreamProfile& profile) {
+size_t QueueResyncThresholdForProfile(const protocol::StreamProfile& profile, bool smooth_mode) {
     const int fps = std::max(0, profile.fps);
     if (fps <= 0) {
-        return 240;
+        return smooth_mode ? 48 : 24;
     }
-    return static_cast<size_t>(std::max(240, fps * 6));
+    if (smooth_mode) {
+        return static_cast<size_t>(std::clamp((fps * 2) / 3, 48, 84));
+    }
+    return static_cast<size_t>(std::clamp(fps / 2, 24, 56));
+}
+
+size_t QueueResyncHitThresholdForProfile(const protocol::StreamProfile& profile, bool smooth_mode) {
+    const int fps = std::max(0, profile.fps);
+    if (fps <= 0) {
+        return smooth_mode ? 6 : 4;
+    }
+    if (smooth_mode) {
+        return static_cast<size_t>(std::clamp(fps / 20, 6, 10));
+    }
+    return static_cast<size_t>(std::clamp(fps / 24, 4, 8));
+}
+
+size_t QueueWarningResetThreshold(size_t warning_threshold) {
+    return std::max<size_t>(2, warning_threshold / 2);
 }
 
 bool ConfigureMediaFoundationTransform(
@@ -275,6 +300,7 @@ void StopDecoderBackend(DecoderContext* context) {
         return;
     }
     ResetZeroCopyOutputSurfaces(context);
+    context->nvidia_cuvid_decoder.reset();
     context->output_type.Reset();
     context->transform.Reset();
     context->device_manager.Reset();
@@ -481,8 +507,23 @@ bool ConfigureDecoderBackend(
     DecoderContext* context,
     const VideoDecoder::LogFn& log_fn,
     const VideoDecoder::FrameFn& frame_fn) {
-    (void)frame_fn;
     StopDecoderBackend(context);
+
+    if (profile.codec == protocol::Codec::kAvc) {
+        auto nvidia_decoder = std::make_unique<NvidiaCuvidDecoder>(log_fn, frame_fn);
+        if (nvidia_decoder->Configure(profile, d3d_device)) {
+            context->active_profile = profile;
+            context->backend = DecoderBackend::kNvidiaCuvid;
+            context->nvidia_cuvid_decoder = std::move(nvidia_decoder);
+            context->decoded_frame_count = 0;
+            return true;
+        }
+
+        if (log_fn) {
+            log_fn(L"视频解码: NVIDIA CUVID 后端未能接管，回退到 Media Foundation。");
+        }
+    }
+
     return ConfigureMediaFoundationTransform(profile, d3d_device, context, log_fn);
 }
 
@@ -683,6 +724,8 @@ void VideoDecoder::Configure(const protocol::StreamProfile& profile) {
         latest_codec_config_ = AccessUnit{};
         has_latest_codec_config_ = false;
         waiting_for_keyframe_ = false;
+        queue_warning_active_ = false;
+        queue_resync_overload_hits_ = 0;
         backend_reset_requested_ = false;
         soft_resync_requested_ = false;
         discontinuity_pending_ = true;
@@ -701,6 +744,27 @@ void VideoDecoder::SetD3DDevice(ID3D11Device* device) {
     d3d_device_ = device;
     if (d3d_device_ != nullptr) {
         d3d_device_->AddRef();
+    }
+}
+
+void VideoDecoder::SetSmoothMode(bool enabled) {
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (smooth_mode_ == enabled) {
+            return;
+        }
+
+        smooth_mode_ = enabled;
+        queue_warning_active_ = false;
+        queue_resync_overload_hits_ = 0;
+        changed = true;
+    }
+
+    if (changed && log_fn_) {
+        log_fn_(enabled
+            ? L"视频解码: 已切换到顺滑观感策略，队列抖动时会优先保住连续性。"
+            : L"视频解码: 已切换到竞技低延迟策略，队列积压时会更快回到最新画面。");
     }
 }
 
@@ -723,8 +787,10 @@ void VideoDecoder::SubmitAccessUnit(const AccessUnit& access_unit) {
         const bool is_keyframe = (access_unit.flags & protocol::kFlagKeyframe) != 0;
         const protocol::StreamProfile threshold_profile =
             has_active_profile_ ? active_profile_ : pending_profile_;
-        const size_t warning_threshold = QueueWarningThresholdForProfile(threshold_profile);
-        const size_t resync_threshold = QueueResyncThresholdForProfile(threshold_profile);
+        const bool smooth_mode = smooth_mode_;
+        const size_t warning_threshold = QueueWarningThresholdForProfile(threshold_profile, smooth_mode);
+        const size_t resync_threshold = QueueResyncThresholdForProfile(threshold_profile, smooth_mode);
+        const size_t resync_hit_threshold = QueueResyncHitThresholdForProfile(threshold_profile, smooth_mode);
 
         if (is_codec_config) {
             latest_codec_config_ = access_unit;
@@ -741,6 +807,8 @@ void VideoDecoder::SubmitAccessUnit(const AccessUnit& access_unit) {
 
             waiting_for_keyframe_ = false;
             queue_.clear();
+            queue_warning_active_ = false;
+            queue_resync_overload_hits_ = 0;
             if (has_latest_codec_config_) {
                 queue_.push_back(latest_codec_config_);
             }
@@ -750,30 +818,49 @@ void VideoDecoder::SubmitAccessUnit(const AccessUnit& access_unit) {
             deferred_log = L"解码队列: 已收到新的关键帧，恢复低延迟解码。";
         } else {
             queue_.push_back(access_unit);
+            const size_t queue_depth = queue_.size();
 
-            if (queue_.size() == warning_threshold) {
+            if (queue_depth >= warning_threshold && !queue_warning_active_) {
                 std::wostringstream stream;
                 stream << L"解码队列: 待解码访问单元已积压到 "
-                       << queue_.size()
+                       << queue_depth
                        << L" 帧，如继续上升将主动重同步。";
                 deferred_log = stream.str();
+                queue_warning_active_ = true;
+            } else if (queue_depth <= QueueWarningResetThreshold(warning_threshold)) {
+                queue_warning_active_ = false;
             }
 
-            if (queue_.size() >= resync_threshold) {
-                queue_.clear();
-                soft_resync_requested_ = true;
-                discontinuity_pending_ = true;
-                if (is_keyframe) {
-                    if (has_latest_codec_config_) {
-                        queue_.push_back(latest_codec_config_);
+            if (queue_depth >= resync_threshold) {
+                ++queue_resync_overload_hits_;
+                if (queue_resync_overload_hits_ >= resync_hit_threshold) {
+                    queue_warning_active_ = false;
+                    queue_resync_overload_hits_ = 0;
+                    if (is_keyframe) {
+                        queue_.clear();
+                        soft_resync_requested_ = true;
+                        discontinuity_pending_ = true;
+                        if (has_latest_codec_config_) {
+                            queue_.push_back(latest_codec_config_);
+                        }
+                        queue_.push_back(access_unit);
+                        deferred_log = L"解码队列: 积压过多，已丢弃旧帧并从最新关键帧继续。";
+                    } else if (smooth_mode) {
+                        waiting_for_keyframe_ = true;
+                        should_request_keyframe = true;
+                        deferred_log =
+                            L"解码队列: 顺滑模式下检测到持续积压，已继续消化排队帧，并请求新的关键帧切回最新画面。";
+                    } else {
+                        queue_.clear();
+                        soft_resync_requested_ = true;
+                        discontinuity_pending_ = true;
+                        waiting_for_keyframe_ = true;
+                        should_request_keyframe = true;
+                        deferred_log = L"解码队列: 积压过多，已丢弃旧帧并等待新的关键帧重同步。";
                     }
-                    queue_.push_back(access_unit);
-                    deferred_log = L"解码队列: 积压过多，已丢弃旧帧并从最新关键帧继续。";
-                } else {
-                    waiting_for_keyframe_ = true;
-                    should_request_keyframe = true;
-                    deferred_log = L"解码队列: 积压过多，已丢弃旧帧并等待新的关键帧重同步。";
                 }
+            } else {
+                queue_resync_overload_hits_ = 0;
             }
         }
     }
@@ -836,6 +923,21 @@ void VideoDecoder::ThreadMain() {
             break;
         }
         if (!has_item || context.backend == DecoderBackend::kNone) {
+            continue;
+        }
+
+        if (context.backend == DecoderBackend::kNvidiaCuvid) {
+            const bool submitted =
+                context.nvidia_cuvid_decoder != nullptr &&
+                context.nvidia_cuvid_decoder->SubmitAccessUnit(access_unit, mark_discontinuity);
+            if (submitted) {
+                if (mark_discontinuity) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    discontinuity_pending_ = false;
+                }
+            } else if (log_fn_) {
+                log_fn_(L"视频解码: NVIDIA CUVID 提交访问单元失败，当前帧已丢弃。");
+            }
             continue;
         }
 

@@ -1,7 +1,10 @@
 package com.example.androidcast
 
 import android.app.Activity
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import android.view.MotionEvent
@@ -17,6 +20,7 @@ import androidx.core.widget.doAfterTextChanged
 import com.example.androidcast.codec.CapabilityProbe
 import com.example.androidcast.model.StreamProfile
 import com.example.androidcast.projection.ProjectionForegroundService
+import com.example.androidcast.projection.ProjectionStatusBridge
 import com.example.androidcast.settings.SenderStreamSettings
 import com.example.androidcast.settings.StreamSettingsStore
 
@@ -43,26 +47,46 @@ class MainActivity : AppCompatActivity() {
     private lateinit var versionText: TextView
     private lateinit var streamSettingsSummaryText: TextView
     private lateinit var settingsStore: StreamSettingsStore
+    private var statusReceiverRegistered = false
 
     private var supportedProfiles: List<StreamProfile> = emptyList()
     private var resolutionOptions: List<ResolutionOption> = emptyList()
 
+    private val idleStatusText: String
+        get() = ProjectionStatusBridge.idle(BuildConfig.VERSION_NAME)
+
+    private val projectionStatusReceiver =
+        object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                ProjectionStatusBridge.readStatus(intent)?.let { status ->
+                    statusText.text = status
+                }
+            }
+        }
+
+    private fun updateStatus(status: String, persist: Boolean = true) {
+        statusText.text = status
+        if (persist) {
+            ProjectionStatusBridge.publish(this, status)
+        }
+    }
+
     private val projectionLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             if (result.resultCode != Activity.RESULT_OK || result.data == null) {
-                statusText.text = getString(R.string.status_permission_denied)
+                updateStatus(ProjectionStatusBridge.permissionDenied())
                 return@registerForActivityResult
             }
 
             val receiverIp = receiverIpInput.text.toString().trim()
             val controlPort = controlPortInput.text.toString().trim().toIntOrNull()
             if (receiverIp.isEmpty() || controlPort == null) {
-                statusText.text = getString(R.string.status_invalid_target)
+                updateStatus(ProjectionStatusBridge.invalidTarget())
                 return@registerForActivityResult
             }
 
             if (persistStreamSettingsFromUi(showError = true) == null) {
-                statusText.text = getString(R.string.status_invalid_stream_settings)
+                updateStatus(ProjectionStatusBridge.invalidStreamSettings())
                 return@registerForActivityResult
             }
 
@@ -74,7 +98,7 @@ class MainActivity : AppCompatActivity() {
                 controlPort = controlPort,
             )
             ContextCompat.startForegroundService(this, serviceIntent)
-            statusText.text = getString(R.string.status_starting_stream)
+            updateStatus(ProjectionStatusBridge.starting())
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -95,7 +119,7 @@ class MainActivity : AppCompatActivity() {
 
         title = getString(R.string.app_title_with_version, BuildConfig.VERSION_NAME)
         versionText.text = getString(R.string.label_version, BuildConfig.VERSION_NAME)
-        statusText.text = getString(R.string.status_idle_with_version, BuildConfig.VERSION_NAME)
+        statusText.text = ProjectionStatusBridge.currentStatus(this) ?: idleStatusText
         supportedProfiles =
             CapabilityProbe()
                 .chooseProfiles()
@@ -109,15 +133,15 @@ class MainActivity : AppCompatActivity() {
         val startButton = findViewById<Button>(R.id.startButton)
         startButton.isEnabled = supportedProfiles.isNotEmpty()
         if (supportedProfiles.isEmpty()) {
-            statusText.text = getString(R.string.status_invalid_stream_settings)
+            updateStatus(ProjectionStatusBridge.invalidStreamSettings())
         }
 
         startButton.setOnClickListener {
             if (persistStreamSettingsFromUi(showError = true) == null) {
-                statusText.text = getString(R.string.status_invalid_stream_settings)
+                updateStatus(ProjectionStatusBridge.invalidStreamSettings())
                 return@setOnClickListener
             }
-            statusText.text = getString(R.string.status_requesting_permission)
+            updateStatus(ProjectionStatusBridge.requestingPermission())
             projectionLauncher.launch(projectionManager.createScreenCaptureIntent())
         }
 
@@ -126,8 +150,30 @@ class MainActivity : AppCompatActivity() {
                 this,
                 ProjectionForegroundService.createStopIntent(this),
             )
-            statusText.text = getString(R.string.status_stopping_stream)
+            updateStatus(ProjectionStatusBridge.stopping())
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        if (!statusReceiverRegistered) {
+            ContextCompat.registerReceiver(
+                this,
+                projectionStatusReceiver,
+                IntentFilter(ProjectionStatusBridge.ACTION_STATUS_CHANGED),
+                ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
+            statusReceiverRegistered = true
+        }
+        statusText.text = ProjectionStatusBridge.currentStatus(this) ?: idleStatusText
+    }
+
+    override fun onStop() {
+        if (statusReceiverRegistered) {
+            unregisterReceiver(projectionStatusReceiver)
+            statusReceiverRegistered = false
+        }
+        super.onStop()
     }
 
     override fun onPause() {
@@ -137,7 +183,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun setupStreamSettingsInputs() {
         if (supportedProfiles.isEmpty()) {
-            streamSettingsSummaryText.text = getString(R.string.status_invalid_stream_settings)
+            streamSettingsSummaryText.text = ProjectionStatusBridge.invalidStreamSettings()
             return
         }
 
@@ -202,7 +248,7 @@ class MainActivity : AppCompatActivity() {
     private fun updateStreamSettingsSummary() {
         val settings = readStreamSettingsFromUi()
         if (settings == null) {
-            streamSettingsSummaryText.text = getString(R.string.status_invalid_stream_settings)
+            streamSettingsSummaryText.text = ProjectionStatusBridge.invalidStreamSettings()
             return
         }
 
@@ -215,7 +261,7 @@ class MainActivity : AppCompatActivity() {
         val settings = readStreamSettingsFromUi()
         if (settings == null) {
             if (showError) {
-                streamSettingsSummaryText.text = getString(R.string.status_invalid_stream_settings)
+                streamSettingsSummaryText.text = ProjectionStatusBridge.invalidStreamSettings()
             }
             return null
         }

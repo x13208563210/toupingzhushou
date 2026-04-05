@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <deque>
@@ -31,7 +32,7 @@ constexpr wchar_t kVideoWindowClassName[] = L"AndroidCastReceiverVideoWindow";
 constexpr wchar_t kStatusWindowTitle[] = L"粥6y直播投屏助手";
 constexpr wchar_t kVideoWindowTitle[] = L"粥6y直播投屏助手 - 投屏画面";
 constexpr wchar_t kInstanceMutexName[] = L"Zhou6YLiveCastAssistantSingleton";
-constexpr wchar_t kAppBuildLabel[] = L"0.3.5-adaptive-vrr-2026-04-04";
+constexpr wchar_t kAppBuildLabel[] = L"0.3.9-motion-burst-recovery-2026-04-05";
 
 constexpr wchar_t kTextMeasurePending[] = L"\u6D4B\u91CF\u4E2D";
 constexpr wchar_t kTextDashboardWaiting[] = L"\u7B49\u5F85\u5B89\u5353\u53D1\u9001\u7AEF\u5EFA\u7ACB\u63A7\u5236\u8FDE\u63A5\u548C\u89C6\u9891\u6D41";
@@ -62,6 +63,7 @@ constexpr wchar_t kTextFocusVideo[] = L"\u805A\u7126\u753B\u9762";
 constexpr wchar_t kTextOpenLog[] = L"\u6253\u5F00\u65E5\u5FD7";
 constexpr wchar_t kTextSwitchToLowLatency[] = L"\u5207\u6362\u5230\u4f4e\u5ef6\u8fdf";
 constexpr wchar_t kTextSwitchToSmooth[] = L"\u5207\u6362\u5230\u987a\u6ed1";
+constexpr wchar_t kTextFixedLowLatency[] = L"\u56fa\u5b9a\u7ade\u6280\u4f4e\u5ef6\u8fdf";
 constexpr wchar_t kTextControlPill[] = L"\u63A7\u5236 TCP/5500";
 constexpr wchar_t kTextVideoPill[] = L"\u89C6\u9891 UDP/55000";
 constexpr wchar_t kTextTrafficTitle[] = L"\u94FE\u8DEF\u7EDF\u8BA1";
@@ -85,7 +87,7 @@ constexpr int kOpenLogButtonId = 1002;
 constexpr int kPresentationModeButtonId = 1003;
 bool g_frontend_mode = false;
 
-constexpr int kStatusWindowWidth = 1080;
+constexpr int kStatusWindowWidth = 1660;
 constexpr int kStatusWindowHeight = 920;
 constexpr int kStatusWindowMinWidth = 900;
 constexpr int kStatusWindowMinHeight = 760;
@@ -197,6 +199,8 @@ struct AppState {
     uint64_t rate_window_displayed_frames = 0;
     bool video_window_visible = false;
     bool suppress_video_window_auto_show = false;
+    int last_auto_video_client_width = 0;
+    int last_auto_video_client_height = 0;
     bool shutting_down = false;
 };
 
@@ -434,9 +438,8 @@ std::wstring PresentationModeLabel(VideoRenderer::PresentationMode mode) {
 }
 
 std::wstring PresentationModeButtonText(VideoRenderer::PresentationMode mode) {
-    return mode == VideoRenderer::PresentationMode::kSmooth
-        ? std::wstring(kTextSwitchToLowLatency)
-        : std::wstring(kTextSwitchToSmooth);
+    (void)mode;
+    return std::wstring(kTextFixedLowLatency);
 }
 
 void UpdatePresentationModeButton(AppState* state) {
@@ -446,12 +449,15 @@ void UpdatePresentationModeButton(AppState* state) {
 
     const std::wstring text = PresentationModeButtonText(state->presentation_mode);
     SetWindowTextW(state->presentation_mode_button, text.c_str());
+    EnableWindow(state->presentation_mode_button, FALSE);
 }
 
 void ApplyPresentationMode(AppState* state, VideoRenderer::PresentationMode mode, bool log_change) {
     if (state == nullptr) {
         return;
     }
+
+    mode = VideoRenderer::PresentationMode::kLowLatency;
 
     if (state->presentation_mode == mode) {
         UpdatePresentationModeButton(state);
@@ -461,7 +467,7 @@ void ApplyPresentationMode(AppState* state, VideoRenderer::PresentationMode mode
     state->presentation_mode = mode;
     state->renderer.SetPresentationMode(mode);
     if (state->decoder != nullptr) {
-        state->decoder->SetSmoothMode(mode == VideoRenderer::PresentationMode::kSmooth);
+        state->decoder->SetSmoothMode(false);
     }
     UpdatePresentationModeButton(state);
 
@@ -538,6 +544,139 @@ void FocusVideoWindow(AppState* state) {
     }
     BringWindowToTop(state->video_window);
     SetForegroundWindow(state->video_window);
+}
+
+bool AdjustWindowRectForDpiCompat(RECT* rect, DWORD style, BOOL has_menu, DWORD ex_style, UINT dpi) {
+    if (rect == nullptr) {
+        return false;
+    }
+
+    const HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32 != nullptr) {
+        using AdjustWindowRectExForDpiFn = BOOL(WINAPI*)(LPRECT, DWORD, BOOL, DWORD, UINT);
+        const auto adjust_window_rect_for_dpi =
+            reinterpret_cast<AdjustWindowRectExForDpiFn>(GetProcAddress(user32, "AdjustWindowRectExForDpi"));
+        if (adjust_window_rect_for_dpi != nullptr) {
+            return adjust_window_rect_for_dpi(rect, style, has_menu, ex_style, dpi) != FALSE;
+        }
+    }
+
+    return AdjustWindowRectEx(rect, style, has_menu, ex_style) != FALSE;
+}
+
+RECT GetMonitorWorkAreaForWindow(HWND hwnd) {
+    RECT work_area{};
+    if (hwnd != nullptr) {
+        const HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if (monitor != nullptr) {
+            MONITORINFO monitor_info{};
+            monitor_info.cbSize = sizeof(monitor_info);
+            if (GetMonitorInfoW(monitor, &monitor_info) != FALSE) {
+                return monitor_info.rcWork;
+            }
+        }
+    }
+
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work_area, 0);
+    return work_area;
+}
+
+void ResizeVideoWindowToSelectedProfile(AppState* state) {
+    if (state == nullptr || state->video_window == nullptr || !state->has_selected_profile) {
+        return;
+    }
+
+    const int source_width = state->selected_profile.width;
+    const int source_height = state->selected_profile.height;
+    if (source_width <= 0 || source_height <= 0) {
+        return;
+    }
+
+    if (state->last_auto_video_client_width == source_width &&
+        state->last_auto_video_client_height == source_height) {
+        return;
+    }
+
+    const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(state->video_window, GWL_STYLE));
+    const DWORD ex_style = static_cast<DWORD>(GetWindowLongPtrW(state->video_window, GWL_EXSTYLE));
+    const UINT dpi = GetWindowDpiValue(state->video_window);
+
+    RECT source_window_rect{0, 0, source_width, source_height};
+    if (!AdjustWindowRectForDpiCompat(&source_window_rect, style, FALSE, ex_style, dpi)) {
+        return;
+    }
+
+    const int source_outer_width = RectWidth(source_window_rect);
+    const int source_outer_height = RectHeight(source_window_rect);
+    const int non_client_width = source_outer_width - source_width;
+    const int non_client_height = source_outer_height - source_height;
+
+    RECT work_area = GetMonitorWorkAreaForWindow(state->video_window);
+    const int safety_margin = ScaleByDpi(state->video_window, 16);
+    work_area.left += safety_margin;
+    work_area.top += safety_margin;
+    work_area.right -= safety_margin;
+    work_area.bottom -= safety_margin;
+
+    const int max_outer_width = std::max(1, RectWidth(work_area));
+    const int max_outer_height = std::max(1, RectHeight(work_area));
+    const int max_client_width = std::max(1, max_outer_width - non_client_width);
+    const int max_client_height = std::max(1, max_outer_height - non_client_height);
+
+    const double scale = std::min(
+        1.0,
+        std::min(
+            static_cast<double>(max_client_width) / static_cast<double>(source_width),
+            static_cast<double>(max_client_height) / static_cast<double>(source_height)));
+
+    const int target_client_width = std::max(1, static_cast<int>(std::floor(source_width * scale)));
+    const int target_client_height = std::max(1, static_cast<int>(std::floor(source_height * scale)));
+
+    RECT target_window_rect{0, 0, target_client_width, target_client_height};
+    if (!AdjustWindowRectForDpiCompat(&target_window_rect, style, FALSE, ex_style, dpi)) {
+        return;
+    }
+
+    const int target_outer_width = RectWidth(target_window_rect);
+    const int target_outer_height = RectHeight(target_window_rect);
+    const int clamped_left = std::max(
+        work_area.left,
+        work_area.left + (RectWidth(work_area) - target_outer_width) / 2);
+    const int clamped_top = std::max(
+        work_area.top,
+        work_area.top + (RectHeight(work_area) - target_outer_height) / 2);
+
+    SetWindowPos(
+        state->video_window,
+        nullptr,
+        clamped_left,
+        clamped_top,
+        target_outer_width,
+        target_outer_height,
+        SWP_NOZORDER | SWP_NOACTIVATE);
+
+    state->last_auto_video_client_width = source_width;
+    state->last_auto_video_client_height = source_height;
+
+    std::wostringstream stream;
+    stream << L"\u6295\u5C4F\u7A97\u53E3\u5DF2\u6309\u6E90\u753B\u8D28\u91CD\u8BBE client area\uFF1A"
+           << target_client_width
+           << L"x"
+           << target_client_height;
+    if (scale < 0.999) {
+        stream << L"\uFF08\u539F\u59CB "
+               << source_width
+               << L"x"
+               << source_height
+               << L"\uFF0C\u56E0\u663E\u793A\u5668\u5DE5\u4F5C\u533A\u4E0D\u8DB3\u5DF2\u7B49\u6BD4\u7F29\u5C0F\uFF09";
+    } else {
+        stream << L"\uFF08\u539F\u59CB "
+               << source_width
+               << L"x"
+               << source_height
+               << L"\uFF0C1:1 \u50CF\u7D20\u663E\u793A\uFF09";
+    }
+    QueueLog(state, stream.str());
 }
 
 void OpenLogFile(AppState* state) {
@@ -1483,6 +1622,8 @@ void ApplyStreamProfile(AppState* state, const protocol::StreamProfile& profile,
         state->decoder->Configure(profile);
     }
 
+    ResizeVideoWindowToSelectedProfile(state);
+
     if (state->control_server != nullptr) {
         if (!auto_resumed) {
             state->control_server->RequestIdr();
@@ -2099,8 +2240,7 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
                 }
             });
         new_state->decoder->SetD3DDevice(new_state->renderer.d3d_device());
-        new_state->decoder->SetSmoothMode(
-            new_state->presentation_mode == VideoRenderer::PresentationMode::kSmooth);
+        new_state->decoder->SetSmoothMode(false);
         new_state->decoder->Start();
 
         new_state->control_server = std::make_unique<ControlServer>(
@@ -2243,11 +2383,7 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
                 return 0;
             case kPresentationModeButtonId:
                 if (state != nullptr) {
-                    const auto next_mode =
-                        state->presentation_mode == VideoRenderer::PresentationMode::kLowLatency
-                        ? VideoRenderer::PresentationMode::kSmooth
-                        : VideoRenderer::PresentationMode::kLowLatency;
-                    ApplyPresentationMode(state, next_mode, true);
+                    ApplyPresentationMode(state, VideoRenderer::PresentationMode::kLowLatency, false);
                 }
                 return 0;
             case kOpenLogButtonId:

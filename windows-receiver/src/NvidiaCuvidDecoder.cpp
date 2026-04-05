@@ -9,6 +9,7 @@
 #include <memory>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 #include <cuda.h>
 #include <cudaD3D11.h>
@@ -195,6 +196,8 @@ struct GraphicsMapGuard {
     }
 };
 
+constexpr size_t kDirectTexturePoolSize = 24;
+
 }  // namespace
 
 struct NvidiaCuvidDecoder::Impl {
@@ -235,7 +238,8 @@ struct NvidiaCuvidDecoder::Impl {
     unsigned int display_height = 0;
     unsigned int surface_height = 0;
     uint64_t decoded_frame_count = 0;
-    OutputTextures output_textures;
+    std::vector<OutputTextures> output_textures_pool;
+    size_t next_output_texture_index = 0;
     bool direct_gpu_path_ready = false;
 
     ~Impl() {
@@ -243,21 +247,26 @@ struct NvidiaCuvidDecoder::Impl {
     }
 
     void ResetOutputTextures(bool has_context) {
-        if (has_context) {
-            if (output_textures.luma_resource != nullptr) {
-                cuGraphicsUnregisterResource(output_textures.luma_resource);
+        for (auto& output_textures : output_textures_pool) {
+            if (has_context) {
+                if (output_textures.luma_resource != nullptr) {
+                    cuGraphicsUnregisterResource(output_textures.luma_resource);
+                    output_textures.luma_resource = nullptr;
+                }
+                if (output_textures.chroma_resource != nullptr) {
+                    cuGraphicsUnregisterResource(output_textures.chroma_resource);
+                    output_textures.chroma_resource = nullptr;
+                }
+            } else {
                 output_textures.luma_resource = nullptr;
-            }
-            if (output_textures.chroma_resource != nullptr) {
-                cuGraphicsUnregisterResource(output_textures.chroma_resource);
                 output_textures.chroma_resource = nullptr;
             }
-        } else {
-            output_textures.luma_resource = nullptr;
-            output_textures.chroma_resource = nullptr;
+
+            output_textures.ReleaseTexturesOnly();
         }
 
-        output_textures.ReleaseTexturesOnly();
+        output_textures_pool.clear();
+        next_output_texture_index = 0;
         direct_gpu_path_ready = false;
     }
 
@@ -302,7 +311,12 @@ struct NvidiaCuvidDecoder::Impl {
         decoded_frame_count = 0;
     }
 
-    bool CreateOutputTextures(unsigned int width, unsigned int height, std::wstring* error) {
+    bool CreateOutputTextures(OutputTextures* output_textures, unsigned int width, unsigned int height, std::wstring* error) {
+        if (output_textures == nullptr) {
+                ResetOutputTextures(true);
+                return false;
+        }
+
         if (d3d_device == nullptr) {
             if (error != nullptr) {
                 *error = L"D3D11 设备不可用。";
@@ -310,7 +324,9 @@ struct NvidiaCuvidDecoder::Impl {
             return false;
         }
 
-        ResetOutputTextures(true);
+        output_textures->ReleaseTexturesOnly();
+        output_textures->luma_resource = nullptr;
+        output_textures->chroma_resource = nullptr;
 
         D3D11_TEXTURE2D_DESC luma_desc{};
         luma_desc.Width = std::max(1u, width);
@@ -322,11 +338,11 @@ struct NvidiaCuvidDecoder::Impl {
         luma_desc.Usage = D3D11_USAGE_DEFAULT;
         luma_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
-        if (FAILED(d3d_device->CreateTexture2D(&luma_desc, nullptr, &output_textures.luma))) {
+        if (FAILED(d3d_device->CreateTexture2D(&luma_desc, nullptr, &output_textures->luma))) {
             if (error != nullptr) {
                 *error = L"创建 CUDA-D3D11 亮度纹理失败。";
             }
-            ResetOutputTextures(false);
+            output_textures->ReleaseTexturesOnly();
             return false;
         }
 
@@ -340,41 +356,44 @@ struct NvidiaCuvidDecoder::Impl {
         chroma_desc.Usage = D3D11_USAGE_DEFAULT;
         chroma_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
-        if (FAILED(d3d_device->CreateTexture2D(&chroma_desc, nullptr, &output_textures.chroma))) {
+        if (FAILED(d3d_device->CreateTexture2D(&chroma_desc, nullptr, &output_textures->chroma))) {
             if (error != nullptr) {
                 *error = L"创建 CUDA-D3D11 色度纹理失败。";
             }
-            ResetOutputTextures(false);
+            output_textures->ReleaseTexturesOnly();
             return false;
         }
 
         const CUresult register_luma_result = cuGraphicsD3D11RegisterResource(
-            &output_textures.luma_resource,
-            output_textures.luma,
+            &output_textures->luma_resource,
+            output_textures->luma,
             CU_GRAPHICS_REGISTER_FLAGS_NONE);
         if (register_luma_result != CUDA_SUCCESS) {
             if (error != nullptr) {
                 *error = L"注册亮度纹理到 CUDA 失败，" + CudaErrorText(register_luma_result);
             }
-            ResetOutputTextures(false);
+            output_textures->ReleaseTexturesOnly();
             return false;
         }
 
         const CUresult register_chroma_result = cuGraphicsD3D11RegisterResource(
-            &output_textures.chroma_resource,
-            output_textures.chroma,
+            &output_textures->chroma_resource,
+            output_textures->chroma,
             CU_GRAPHICS_REGISTER_FLAGS_NONE);
         if (register_chroma_result != CUDA_SUCCESS) {
             if (error != nullptr) {
                 *error = L"注册色度纹理到 CUDA 失败，" + CudaErrorText(register_chroma_result);
             }
-            ResetOutputTextures(true);
+            if (output_textures->luma_resource != nullptr) {
+                cuGraphicsUnregisterResource(output_textures->luma_resource);
+                output_textures->luma_resource = nullptr;
+            }
+            output_textures->ReleaseTexturesOnly();
             return false;
         }
 
-        output_textures.width = width;
-        output_textures.height = height;
-        direct_gpu_path_ready = true;
+        output_textures->width = width;
+        output_textures->height = height;
         return true;
     }
 
@@ -384,20 +403,30 @@ struct NvidiaCuvidDecoder::Impl {
         }
 
         if (direct_gpu_path_ready &&
-            output_textures.luma != nullptr &&
-            output_textures.chroma != nullptr &&
-            output_textures.width == display_width &&
-            output_textures.height == display_height) {
+            !output_textures_pool.empty() &&
+            output_textures_pool.front().luma != nullptr &&
+            output_textures_pool.front().chroma != nullptr &&
+            output_textures_pool.front().width == display_width &&
+            output_textures_pool.front().height == display_height) {
             return true;
         }
 
+        ResetOutputTextures(true);
+        output_textures_pool.resize(kDirectTexturePoolSize);
+
         std::wstring error;
-        if (!CreateOutputTextures(display_width, display_height, &error)) {
-            if (log_fn != nullptr) {
+        for (auto& output_textures : output_textures_pool) {
+            if (!CreateOutputTextures(&output_textures, display_width, display_height, &error)) {
+                if (log_fn != nullptr) {
                 log_fn(L"视频解码: CUDA -> D3D11 双纹理输出未能建立，回退 CPU 上传，" + error);
             }
-            return false;
+                ResetOutputTextures(true);
+                return false;
+            }
         }
+
+        direct_gpu_path_ready = true;
+        next_output_texture_index = 0;
 
         if (log_fn != nullptr) {
             std::wostringstream stream;
@@ -580,7 +609,7 @@ struct NvidiaCuvidDecoder::Impl {
         create_info.OutputFormat = cudaVideoSurfaceFormat_NV12;
         create_info.bitDepthMinus8 = format->bit_depth_luma_minus8;
         create_info.DeinterlaceMode = cudaVideoDeinterlaceMode_Weave;
-        create_info.ulNumOutputSurfaces = 2;
+        create_info.ulNumOutputSurfaces = 4;
         create_info.ulCreationFlags = cudaVideoCreate_PreferCUVID;
         create_info.ulNumDecodeSurfaces = std::max<unsigned int>(format->min_num_decode_surfaces + 2, 4u);
         create_info.ulWidth = format->coded_width;
@@ -639,11 +668,29 @@ struct NvidiaCuvidDecoder::Impl {
 
     bool BuildGpuFrame(unsigned long long mapped_ptr, unsigned int mapped_pitch, uint64_t pts_us, DecodedFrame* frame) {
         if (!direct_gpu_path_ready ||
-            output_textures.luma_resource == nullptr ||
-            output_textures.chroma_resource == nullptr ||
+            output_textures_pool.empty() ||
             frame == nullptr) {
             return false;
         }
+
+        OutputTextures* selected_output_textures = nullptr;
+        for (size_t attempt = 0; attempt < output_textures_pool.size(); ++attempt) {
+            OutputTextures& candidate =
+                output_textures_pool[(next_output_texture_index + attempt) % output_textures_pool.size()];
+            if (candidate.luma_resource == nullptr || candidate.chroma_resource == nullptr) {
+                continue;
+            }
+
+            selected_output_textures = &candidate;
+            next_output_texture_index = (next_output_texture_index + attempt + 1) % output_textures_pool.size();
+            break;
+        }
+
+        if (selected_output_textures == nullptr) {
+            return false;
+        }
+
+        OutputTextures& output_textures = *selected_output_textures;
 
         GraphicsMapGuard map_guard;
         map_guard.resources[0] = output_textures.luma_resource;

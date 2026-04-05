@@ -62,11 +62,12 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 const char kNv12PixelShaderSource[] = R"(
 Texture2D yTexture : register(t0);
 Texture2D uvTexture : register(t1);
-SamplerState videoSampler : register(s0);
+SamplerState lumaSampler : register(s0);
+SamplerState chromaSampler : register(s1);
 
 float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
-    float y = yTexture.Sample(videoSampler, uv).r;
-    float2 uvSample = uvTexture.Sample(videoSampler, uv).rg - float2(0.5, 0.5);
+    float y = yTexture.Sample(lumaSampler, uv).r;
+    float2 uvSample = uvTexture.Sample(chromaSampler, uv).rg - float2(0.5, 0.5);
 
     float yLinear = saturate((y - 16.0 / 255.0) * 1.16438356);
     float r = saturate(yLinear + 1.79274107 * uvSample.y);
@@ -189,6 +190,7 @@ void VideoRenderer::SetPresentFn(PresentFn present_fn) {
 }
 
 void VideoRenderer::SetPresentationMode(PresentationMode mode) {
+    mode = PresentationMode::kLowLatency;
     bool changed = false;
     {
         std::lock_guard<std::mutex> lock(render_mutex_);
@@ -788,6 +790,9 @@ bool VideoRenderer::InitializeDeviceResources() {
     if (FAILED(device_->CreateSamplerState(&sampler_desc, &sampler_state_))) {
         return false;
     }
+    if (log_fn_ != nullptr) {
+        log_fn_(L"\u89c6\u9891\u6e32\u67d3: \u5DF2\u5173\u95ED NV12 \u4EAE\u5EA6\u9510\u5316\u91C7\u6837\uFF0C\u4EAE\u5EA6/\u8272\u5EA6\u5747\u6539\u4E3A\u7EBF\u6027\u91C7\u6837\u3002");
+    }
 
     return CreateSwapChainResources();
 }
@@ -964,42 +969,53 @@ bool VideoRenderer::UseGpuCopiedTextureFrame(const DecodedFrame& frame) {
         return false;
     }
 
+    const bool use_split_nv12_copy =
+        frame.format == DecodedFrameFormat::kNv12 &&
+        frame.separate_textures &&
+        frame.d3d_texture_plane1 != nullptr;
+
+    D3D11_TEXTURE2D_DESC chroma_source_desc{};
+    if (use_split_nv12_copy) {
+        frame.d3d_texture_plane1->GetDesc(&chroma_source_desc);
+        if (chroma_source_desc.Width == 0 || chroma_source_desc.Height == 0) {
+            return false;
+        }
+    }
+
     const bool can_reuse_texture =
         using_external_texture_ &&
         using_gpu_copy_texture_ &&
         external_texture_ != nullptr &&
+        (!use_split_nv12_copy || external_texture_plane1_ != nullptr) &&
         texture_format_ == frame.format &&
         texture_width_ == frame.width &&
         texture_height_ == frame.height &&
         external_srv0_ != nullptr &&
-        (frame.format != DecodedFrameFormat::kNv12 || external_srv1_ != nullptr);
+        (frame.format != DecodedFrameFormat::kNv12 || external_srv1_ != nullptr) &&
+        ((frame.format != DecodedFrameFormat::kNv12 && external_texture_plane1_ == nullptr) ||
+         (frame.format == DecodedFrameFormat::kNv12 &&
+          ((use_split_nv12_copy && external_texture_plane1_ != nullptr) ||
+           (!use_split_nv12_copy && external_texture_plane1_ == nullptr))));
 
     if (!can_reuse_texture) {
         ClearExternalVideoResources();
 
-        D3D11_TEXTURE2D_DESC desc{};
-        desc.Width = source_desc.Width;
-        desc.Height = source_desc.Height;
-        desc.MipLevels = 1;
-        desc.ArraySize = 1;
-        desc.SampleDesc.Count = 1;
-        desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
         if (frame.format == DecodedFrameFormat::kBgra) {
+            D3D11_TEXTURE2D_DESC desc{};
+            desc.Width = source_desc.Width;
+            desc.Height = source_desc.Height;
+            desc.MipLevels = 1;
+            desc.ArraySize = 1;
+            desc.SampleDesc.Count = 1;
+            desc.Usage = D3D11_USAGE_DEFAULT;
+            desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
             desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        } else if (frame.format == DecodedFrameFormat::kNv12) {
-            desc.Format = DXGI_FORMAT_NV12;
-        } else {
-            return false;
-        }
 
-        if (FAILED(device_->CreateTexture2D(&desc, nullptr, &external_texture_))) {
-            ClearExternalVideoResources();
-            return false;
-        }
+            if (FAILED(device_->CreateTexture2D(&desc, nullptr, &external_texture_))) {
+                ClearExternalVideoResources();
+                return false;
+            }
 
-        if (frame.format == DecodedFrameFormat::kBgra) {
             D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
             srv_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
             srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
@@ -1008,7 +1024,70 @@ bool VideoRenderer::UseGpuCopiedTextureFrame(const DecodedFrame& frame) {
                 ClearExternalVideoResources();
                 return false;
             }
-        } else {
+        } else if (frame.format == DecodedFrameFormat::kNv12 && use_split_nv12_copy) {
+            D3D11_TEXTURE2D_DESC luma_desc{};
+            luma_desc.Width = source_desc.Width;
+            luma_desc.Height = source_desc.Height;
+            luma_desc.MipLevels = 1;
+            luma_desc.ArraySize = 1;
+            luma_desc.SampleDesc.Count = 1;
+            luma_desc.Usage = D3D11_USAGE_DEFAULT;
+            luma_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            luma_desc.Format = source_desc.Format;
+
+            if (FAILED(device_->CreateTexture2D(&luma_desc, nullptr, &external_texture_))) {
+                ClearExternalVideoResources();
+                return false;
+            }
+
+            D3D11_TEXTURE2D_DESC chroma_desc{};
+            chroma_desc.Width = chroma_source_desc.Width;
+            chroma_desc.Height = chroma_source_desc.Height;
+            chroma_desc.MipLevels = 1;
+            chroma_desc.ArraySize = 1;
+            chroma_desc.SampleDesc.Count = 1;
+            chroma_desc.Usage = D3D11_USAGE_DEFAULT;
+            chroma_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            chroma_desc.Format = chroma_source_desc.Format;
+
+            if (FAILED(device_->CreateTexture2D(&chroma_desc, nullptr, &external_texture_plane1_))) {
+                ClearExternalVideoResources();
+                return false;
+            }
+
+            D3D11_SHADER_RESOURCE_VIEW_DESC y_srv_desc{};
+            y_srv_desc.Format = DXGI_FORMAT_R8_UNORM;
+            y_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            y_srv_desc.Texture2D.MipLevels = 1;
+            if (FAILED(device_->CreateShaderResourceView(external_texture_, &y_srv_desc, &external_srv0_))) {
+                ClearExternalVideoResources();
+                return false;
+            }
+
+            D3D11_SHADER_RESOURCE_VIEW_DESC uv_srv_desc{};
+            uv_srv_desc.Format = DXGI_FORMAT_R8G8_UNORM;
+            uv_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            uv_srv_desc.Texture2D.MipLevels = 1;
+            if (FAILED(device_->CreateShaderResourceView(external_texture_plane1_, &uv_srv_desc, &external_srv1_))) {
+                ClearExternalVideoResources();
+                return false;
+            }
+        } else if (frame.format == DecodedFrameFormat::kNv12) {
+            D3D11_TEXTURE2D_DESC desc{};
+            desc.Width = source_desc.Width;
+            desc.Height = source_desc.Height;
+            desc.MipLevels = 1;
+            desc.ArraySize = 1;
+            desc.SampleDesc.Count = 1;
+            desc.Usage = D3D11_USAGE_DEFAULT;
+            desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            desc.Format = DXGI_FORMAT_NV12;
+
+            if (FAILED(device_->CreateTexture2D(&desc, nullptr, &external_texture_))) {
+                ClearExternalVideoResources();
+                return false;
+            }
+
             D3D11_SHADER_RESOURCE_VIEW_DESC y_srv_desc{};
             y_srv_desc.Format = DXGI_FORMAT_R8_UNORM;
             y_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
@@ -1026,6 +1105,8 @@ bool VideoRenderer::UseGpuCopiedTextureFrame(const DecodedFrame& frame) {
                 ClearExternalVideoResources();
                 return false;
             }
+        } else {
+            return false;
         }
 
         using_external_texture_ = true;
@@ -1044,6 +1125,17 @@ bool VideoRenderer::UseGpuCopiedTextureFrame(const DecodedFrame& frame) {
         frame.d3d_texture,
         frame.d3d_subresource,
         nullptr);
+    if (use_split_nv12_copy) {
+        context_->CopySubresourceRegion(
+            external_texture_plane1_,
+            0,
+            0,
+            0,
+            0,
+            frame.d3d_texture_plane1,
+            0,
+            nullptr);
+    }
     return true;
 }
 
@@ -1160,6 +1252,7 @@ void VideoRenderer::Render() {
     if (has_new_frame &&
         frame_to_upload.gpu_backed &&
         frame_to_upload.direct_sample_safe &&
+        !frame_to_upload.separate_textures &&
         frame_to_upload.d3d_texture != nullptr) {
         if (UseExternalTextureFrame(frame_to_upload)) {
             if (!logged_direct_gpu_path_ && log_fn_ != nullptr) {
@@ -1243,9 +1336,9 @@ void VideoRenderer::Render() {
         context_->RSSetViewports(1, &viewport);
         context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
         context_->VSSetShader(vertex_shader_, nullptr, 0);
-        context_->PSSetSamplers(0, 1, &sampler_state_);
 
         if (can_draw_bgra) {
+            context_->PSSetSamplers(0, 1, &sampler_state_);
             context_->PSSetShader(bgra_pixel_shader_, nullptr, 0);
             ID3D11ShaderResourceView* srvs[1] = {active_srv0};
             context_->PSSetShaderResources(0, 1, srvs);
@@ -1253,6 +1346,11 @@ void VideoRenderer::Render() {
             ID3D11ShaderResourceView* null_srvs[1] = {nullptr};
             context_->PSSetShaderResources(0, 1, null_srvs);
         } else {
+            ID3D11SamplerState* nv12_samplers[2] = {
+                sampler_state_,
+                sampler_state_,
+            };
+            context_->PSSetSamplers(0, 2, nv12_samplers);
             context_->PSSetShader(nv12_pixel_shader_, nullptr, 0);
             ID3D11ShaderResourceView* srvs[2] = {active_srv0, active_srv1};
             context_->PSSetShaderResources(0, 2, srvs);

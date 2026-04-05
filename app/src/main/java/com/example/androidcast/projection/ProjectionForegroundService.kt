@@ -13,6 +13,7 @@ import android.os.Parcelable
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.example.androidcast.R
+import com.example.androidcast.diagnostics.SenderDiagnostics
 import kotlin.concurrent.thread
 
 class ProjectionForegroundService : Service() {
@@ -38,19 +39,24 @@ class ProjectionForegroundService : Service() {
 
         when (intent?.action) {
             ACTION_START -> handleStart(intent)
-            ACTION_STOP -> stopActiveSession("用户停止投屏")
+            ACTION_STOP -> stopActiveSession("\u7528\u6237\u505C\u6B62\u6295\u5C4F")
         }
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
-        stopActiveSession("服务销毁")
+        if (session != null) {
+            stopActiveSession(
+                reason = "\u524D\u53F0\u670D\u52A1\u9500\u6BC1",
+                stopSelfService = false,
+            )
+        }
         super.onDestroy()
     }
 
     private fun handleStart(intent: Intent) {
         if (session != null) {
-            stopActiveSession("重新开始投屏")
+            stopActiveSession("\u91CD\u65B0\u5F00\u59CB\u6295\u5C4F")
         }
         val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
         val resultData = intent.getParcelableExtraCompat(EXTRA_RESULT_DATA, Intent::class.java)
@@ -58,9 +64,18 @@ class ProjectionForegroundService : Service() {
         val receiverHost = intent.getStringExtra(EXTRA_RECEIVER_HOST).orEmpty()
         val controlPort = intent.getIntExtra(EXTRA_CONTROL_PORT, -1)
         if (resultCode == 0 || receiverHost.isBlank() || controlPort <= 0) {
+            ProjectionStatusBridge.publish(
+                applicationContext,
+                ProjectionStatusBridge.invalidTarget(),
+            )
             stopSelf()
             return
         }
+
+        ProjectionStatusBridge.publish(
+            applicationContext,
+            ProjectionStatusBridge.connecting(receiverHost, controlPort),
+        )
 
         thread(name = "projection-session-start") {
             val newSession = ProjectionSession(
@@ -73,19 +88,44 @@ class ProjectionForegroundService : Service() {
             runCatching {
                 newSession.start()
                 session = newSession
+                ProjectionStatusBridge.publish(
+                    applicationContext,
+                    ProjectionStatusBridge.streaming(receiverHost, newSession.videoPort),
+                )
             }.onFailure {
                 Log.e(TAG, "启动投屏会话失败", it)
-                stopActiveSession("启动失败")
+                SenderDiagnostics.e(TAG, "启动投屏会话失败", it)
+                ProjectionStatusBridge.publish(
+                    applicationContext,
+                    ProjectionStatusBridge.error(it.message),
+                )
+                runCatching { newSession.stop("\u542F\u52A8\u5931\u8D25", publishStoppedStatus = false) }
+                session = null
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
             }
         }
     }
 
-    private fun stopActiveSession(reason: String) {
+    private fun stopActiveSession(
+        reason: String,
+        stopSelfService: Boolean = true,
+        publishStoppedStatus: Boolean = true,
+    ) {
         val currentSession = session
         session = null
-        runCatching { currentSession?.stop(reason) }
+        if (currentSession != null) {
+            runCatching { currentSession.stop(reason, publishStoppedStatus) }
+        } else if (publishStoppedStatus) {
+            ProjectionStatusBridge.publish(
+                applicationContext,
+                ProjectionStatusBridge.stopped(reason),
+            )
+        }
         stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        if (stopSelfService) {
+            stopSelf()
+        }
     }
 
     private fun buildNotification(contentText: String): Notification =

@@ -6,8 +6,8 @@ import android.media.MediaFormat
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
-import android.util.Log
 import android.view.Surface
+import com.example.androidcast.diagnostics.SenderDiagnostics
 import com.example.androidcast.model.StreamProfile
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
@@ -19,8 +19,9 @@ class VideoEncoder(
 ) {
     companion object {
         private const val DEFAULT_I_FRAME_INTERVAL_SECONDS = 1
+        private const val LOW_LATENCY_I_FRAME_INTERVAL_SECONDS = 0.35f
         private const val TAG = "VideoEncoder"
-        private const val STATS_LOG_INTERVAL_FRAMES = 120L
+        private const val STATS_LOG_INTERVAL_FRAMES = 30L
     }
 
     interface Listener {
@@ -42,17 +43,37 @@ class VideoEncoder(
     private var statsWindowStartNs = 0L
     private var ptsEpochOffsetUs: Long? = null
     private var lastCodecPtsUs = Long.MIN_VALUE
+    private var lastCodecOutputPtsUs = Long.MIN_VALUE
+    private var lastSenderOutputPtsUs = Long.MIN_VALUE
+    private var codecPtsDeltaSumUs = 0L
+    private var codecPtsDeltaCount = 0L
+    private var codecPtsDeltaMinUs = Long.MAX_VALUE
+    private var codecPtsDeltaMaxUs = 0L
+    private var senderPtsDeltaSumUs = 0L
+    private var senderPtsDeltaCount = 0L
+    private var senderPtsDeltaMinUs = Long.MAX_VALUE
+    private var senderPtsDeltaMaxUs = 0L
+    private var repeatedCodecPtsCount = 0L
+    private var repeatedSenderPtsCount = 0L
+    private var firstFrameLogged = false
 
     fun start() {
         val mediaCodec = MediaCodec.createEncoderByType(profile.codec.mimeType)
+        var appliedIFrameIntervalSeconds = DEFAULT_I_FRAME_INTERVAL_SECONDS.toDouble()
         val format = MediaFormat.createVideoFormat(profile.codec.mimeType, profile.width, profile.height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, profile.bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, profile.fps)
-            if (!profile.adaptiveFps) {
-                runCatching { setFloat(MediaFormat.KEY_CAPTURE_RATE, profile.fps.toFloat()) }
+            runCatching { setFloat(MediaFormat.KEY_CAPTURE_RATE, profile.fps.toFloat()) }
+            val preciseIFrameApplied =
+                runCatching {
+                    setFloat(MediaFormat.KEY_I_FRAME_INTERVAL, LOW_LATENCY_I_FRAME_INTERVAL_SECONDS)
+                }.isSuccess
+            if (preciseIFrameApplied) {
+                appliedIFrameIntervalSeconds = LOW_LATENCY_I_FRAME_INTERVAL_SECONDS.toDouble()
+            } else {
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, DEFAULT_I_FRAME_INTERVAL_SECONDS)
             }
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, DEFAULT_I_FRAME_INTERVAL_SECONDS)
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
             setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
             applyLowLatencyHints(this)
@@ -65,11 +86,21 @@ class VideoEncoder(
         codec = mediaCodec
         inputSurface = surface
         running.set(true)
+        firstFrameLogged = false
         encodedFrameCount = 0L
         encodedBytesInWindow = 0L
         statsWindowStartNs = System.nanoTime()
         ptsEpochOffsetUs = null
         lastCodecPtsUs = Long.MIN_VALUE
+        resetTimingWindow()
+        SenderDiagnostics.i(
+            TAG,
+            "编码器启动: mime=${profile.codec.mimeType}, profile=${profile.width}x${profile.height}@${profile.fps}, bitrate=${profile.bitrate}, adaptive=${profile.adaptiveFps}",
+        )
+        SenderDiagnostics.d(
+            TAG,
+            "低延迟关键帧间隔=${appliedIFrameIntervalSeconds}s",
+        )
         startDrainLoop(mediaCodec)
     }
 
@@ -81,6 +112,7 @@ class VideoEncoder(
             putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
         }
         runCatching { codec?.setParameters(params) }
+        SenderDiagnostics.d(TAG, "已请求关键帧")
     }
 
     fun stop() {
@@ -94,6 +126,9 @@ class VideoEncoder(
         latestCodecConfig = null
         ptsEpochOffsetUs = null
         lastCodecPtsUs = Long.MIN_VALUE
+        resetTimingWindow()
+        firstFrameLogged = false
+        SenderDiagnostics.i(TAG, "编码器已停止")
     }
 
     private fun startDrainLoop(mediaCodec: MediaCodec) {
@@ -105,7 +140,10 @@ class VideoEncoder(
             while (running.get()) {
                 when (val index = mediaCodec.dequeueOutputBuffer(bufferInfo, 2_000)) {
                     MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
-                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> emitCodecConfig(mediaCodec.outputFormat)
+                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        SenderDiagnostics.i(TAG, "编码输出格式变化: ${mediaCodec.outputFormat}")
+                        emitCodecConfig(mediaCodec.outputFormat)
+                    }
                     else -> if (index >= 0) {
                         mediaCodec.getOutputBuffer(index)?.let { buffer ->
                             emitOutputBuffer(buffer, bufferInfo)
@@ -136,6 +174,7 @@ class VideoEncoder(
             offset += payload.size
         }
         latestCodecConfig = merged
+        SenderDiagnostics.i(TAG, "编码器参数集已输出: bytes=$totalSize")
         listener.onEncodedAccessUnit(
             data = merged,
             ptsUs = 0L,
@@ -161,10 +200,18 @@ class VideoEncoder(
             }
         val isKeyFrame = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
         val isCodecConfig = isCodecConfigFrame(info)
+        val senderPtsUs = if (isCodecConfig) 0L else normalizeSenderPtsUs(info.presentationTimeUs)
         if (!isCodecConfig) {
+            if (!firstFrameLogged) {
+                firstFrameLogged = true
+                SenderDiagnostics.i(
+                    TAG,
+                    "首帧输出: size=${payload.size}, keyFrame=$isKeyFrame, codecPtsUs=${info.presentationTimeUs}, senderPtsUs=$senderPtsUs",
+                )
+            }
+            recordOutputTiming(info.presentationTimeUs, senderPtsUs)
             recordEncodedFrame(payload.size, isKeyFrame)
         }
-        val senderPtsUs = if (isCodecConfig) 0L else normalizeSenderPtsUs(info.presentationTimeUs)
         listener.onEncodedAccessUnit(
             data = payload,
             ptsUs = senderPtsUs,
@@ -196,6 +243,65 @@ class VideoEncoder(
         val finalOffsetUs = requireNotNull(offsetUs)
         val normalizedPtsUs = codecPtsUs + finalOffsetUs
         return if (normalizedPtsUs > 0L) normalizedPtsUs else nowUs
+    }
+
+    private fun resetTimingWindow() {
+        lastCodecOutputPtsUs = Long.MIN_VALUE
+        lastSenderOutputPtsUs = Long.MIN_VALUE
+        codecPtsDeltaSumUs = 0L
+        codecPtsDeltaCount = 0L
+        codecPtsDeltaMinUs = Long.MAX_VALUE
+        codecPtsDeltaMaxUs = 0L
+        senderPtsDeltaSumUs = 0L
+        senderPtsDeltaCount = 0L
+        senderPtsDeltaMinUs = Long.MAX_VALUE
+        senderPtsDeltaMaxUs = 0L
+        repeatedCodecPtsCount = 0L
+        repeatedSenderPtsCount = 0L
+    }
+
+    private fun recordOutputTiming(codecPtsUs: Long, senderPtsUs: Long) {
+        if (lastCodecOutputPtsUs != Long.MIN_VALUE) {
+            val codecDeltaUs = codecPtsUs - lastCodecOutputPtsUs
+            if (codecDeltaUs > 0L) {
+                codecPtsDeltaSumUs += codecDeltaUs
+                codecPtsDeltaCount += 1
+                codecPtsDeltaMinUs = minOf(codecPtsDeltaMinUs, codecDeltaUs)
+                codecPtsDeltaMaxUs = maxOf(codecPtsDeltaMaxUs, codecDeltaUs)
+            } else {
+                repeatedCodecPtsCount += 1
+            }
+        }
+
+        if (lastSenderOutputPtsUs != Long.MIN_VALUE) {
+            val senderDeltaUs = senderPtsUs - lastSenderOutputPtsUs
+            if (senderDeltaUs > 0L) {
+                senderPtsDeltaSumUs += senderDeltaUs
+                senderPtsDeltaCount += 1
+                senderPtsDeltaMinUs = minOf(senderPtsDeltaMinUs, senderDeltaUs)
+                senderPtsDeltaMaxUs = maxOf(senderPtsDeltaMaxUs, senderDeltaUs)
+            } else {
+                repeatedSenderPtsCount += 1
+            }
+        }
+
+        lastCodecOutputPtsUs = codecPtsUs
+        lastSenderOutputPtsUs = senderPtsUs
+    }
+
+    private fun formatDeltaStats(
+        sampleCount: Long,
+        minUs: Long,
+        maxUs: Long,
+        sumUs: Long,
+        repeatedCount: Long,
+    ): String {
+        if (sampleCount <= 0L) {
+            return "无有效样本，重复/回退=$repeatedCount"
+        }
+
+        val avgUs = sumUs.toDouble() / sampleCount.toDouble()
+        return "avg=${"%.2f".format(avgUs / 1000.0)}ms, min=${"%.2f".format(minUs / 1000.0)}ms, max=${"%.2f".format(maxUs / 1000.0)}ms, 重复/回退=$repeatedCount"
     }
 
     private fun toAnnexB(buffer: ByteBuffer): ByteArray {
@@ -266,17 +372,44 @@ class VideoEncoder(
 
         val fps = STATS_LOG_INTERVAL_FRAMES * 1_000_000_000.0 / elapsedNs.toDouble()
         val mbps = encodedBytesInWindow * 8.0 * 1_000_000_000.0 / elapsedNs.toDouble() / 1_000_000.0
-        Log.i(
+        val codecPtsStats =
+            formatDeltaStats(
+                sampleCount = codecPtsDeltaCount,
+                minUs = codecPtsDeltaMinUs,
+                maxUs = codecPtsDeltaMaxUs,
+                sumUs = codecPtsDeltaSumUs,
+                repeatedCount = repeatedCodecPtsCount,
+            )
+        val senderPtsStats =
+            formatDeltaStats(
+                sampleCount = senderPtsDeltaCount,
+                minUs = senderPtsDeltaMinUs,
+                maxUs = senderPtsDeltaMaxUs,
+                sumUs = senderPtsDeltaSumUs,
+                repeatedCount = repeatedSenderPtsCount,
+            )
+        SenderDiagnostics.i(
             TAG,
             "编码输出统计: fps=${"%.1f".format(fps)}, bitrate=${"%.1f".format(mbps)}Mbps, keyFrame=$isKeyFrame, profile=${profile.width}x${profile.height}@${profile.fps}",
         )
+        SenderDiagnostics.i(
+            TAG,
+            "编码时间戳统计: codecPts=[$codecPtsStats], senderPts=[$senderPtsStats]",
+        )
         statsWindowStartNs = nowNs
         encodedBytesInWindow = 0L
+        resetTimingWindow()
     }
 
     private fun applyLowLatencyHints(format: MediaFormat) {
         runCatching { format.setInteger(MediaFormat.KEY_PRIORITY, 0) }
-        runCatching { format.setFloat(MediaFormat.KEY_OPERATING_RATE, profile.fps.toFloat()) }
+        val operatingRate =
+            when {
+                profile.fps >= 120 -> 240f
+                profile.fps >= 90 -> 180f
+                else -> profile.fps.toFloat()
+            }
+        runCatching { format.setFloat(MediaFormat.KEY_OPERATING_RATE, operatingRate) }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             runCatching { format.setInteger("vendor.qti-ext-enc-low-latency.enable", 1) }
             runCatching { format.setInteger("vendor.qti-ext-enc-low-latency-mode.value", 1) }

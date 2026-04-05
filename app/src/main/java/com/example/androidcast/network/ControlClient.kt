@@ -1,7 +1,7 @@
 package com.example.androidcast.network
 
-import android.util.Log
 import android.os.SystemClock
+import com.example.androidcast.diagnostics.SenderDiagnostics
 import com.example.androidcast.model.ControlMessage
 import com.example.androidcast.model.StreamProfile
 import org.json.JSONObject
@@ -47,6 +47,10 @@ class ControlClient(
         val matched = supportedProfiles.firstOrNull { it.isSameCoreFormat(selected) }
             ?: error("Receiver selected an unsupported stream profile: $selected")
 
+        SenderDiagnostics.i(
+            TAG,
+            "控制通道已连接: host=$receiverHost:$controlPort, selected=${matched.width}x${matched.height}@${matched.fps}, bitrate=${selected.bitrate}, videoPort=${selected.videoPort}",
+        )
         startListener(onRequestIdr)
         return matched.copy(videoPort = selected.videoPort, bitrate = selected.bitrate)
     }
@@ -80,7 +84,10 @@ class ControlClient(
                 val line = runCatching { reader?.readLine() }.getOrNull() ?: break
                 val json = runCatching { JSONObject(line) }.getOrNull() ?: continue
                 when (json.optString("type")) {
-                    ControlMessage.TYPE_REQUEST_IDR -> onRequestIdr()
+                    ControlMessage.TYPE_REQUEST_IDR -> {
+                        SenderDiagnostics.d(TAG, "收到关键帧请求")
+                        onRequestIdr()
+                    }
                     ControlMessage.TYPE_TIME_SYNC_REQUEST -> handleTimeSyncRequest(json)
                 }
             }
@@ -97,7 +104,7 @@ class ControlClient(
         currentWriter.write(jsonObject.toString())
         currentWriter.newLine()
         currentWriter.flush()
-        Log.d(TAG, "Sent control message: $jsonObject")
+        SenderDiagnostics.d(TAG, "发送控制消息: $jsonObject")
     }
 
     private fun handleTimeSyncRequest(json: JSONObject) {

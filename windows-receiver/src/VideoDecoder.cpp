@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <deque>
 #include <memory>
@@ -92,41 +93,127 @@ void SetCurrentThreadPriorityBestEffort(int priority) {
     SetThreadPriority(GetCurrentThread(), priority);
 }
 
+int64_t NowSteadyUs() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 size_t QueueWarningThresholdForProfile(const protocol::StreamProfile& profile, bool smooth_mode) {
     const int fps = std::max(0, profile.fps);
     if (fps <= 0) {
-        return smooth_mode ? 18 : 12;
+        return smooth_mode ? 18 : 16;
     }
     if (smooth_mode) {
         return static_cast<size_t>(std::clamp(fps / 3, 18, 40));
     }
-    return static_cast<size_t>(std::clamp(fps / 5, 12, 28));
+    return static_cast<size_t>(std::clamp(fps / 5, 18, 28));
 }
 
 size_t QueueResyncThresholdForProfile(const protocol::StreamProfile& profile, bool smooth_mode) {
     const int fps = std::max(0, profile.fps);
     if (fps <= 0) {
-        return smooth_mode ? 48 : 24;
+        return smooth_mode ? 36 : 24;
     }
     if (smooth_mode) {
-        return static_cast<size_t>(std::clamp((fps * 2) / 3, 48, 84));
+        return static_cast<size_t>(std::clamp(fps / 3, 30, 72));
     }
-    return static_cast<size_t>(std::clamp(fps / 2, 24, 56));
+    return static_cast<size_t>(std::clamp(fps / 3, 30, 48));
+}
+
+size_t QueueHardWaitThresholdForProfile(const protocol::StreamProfile& profile, bool smooth_mode) {
+    const int fps = std::max(0, profile.fps);
+    if (fps <= 0) {
+        return smooth_mode ? 60 : 36;
+    }
+    if (smooth_mode) {
+        return static_cast<size_t>(std::clamp((fps * 2) / 3, 48, 96));
+    }
+    return static_cast<size_t>(std::clamp((fps * 2) / 3, 48, 84));
 }
 
 size_t QueueResyncHitThresholdForProfile(const protocol::StreamProfile& profile, bool smooth_mode) {
     const int fps = std::max(0, profile.fps);
     if (fps <= 0) {
-        return smooth_mode ? 6 : 4;
+        return smooth_mode ? 6 : 5;
     }
     if (smooth_mode) {
         return static_cast<size_t>(std::clamp(fps / 20, 6, 10));
     }
-    return static_cast<size_t>(std::clamp(fps / 24, 4, 8));
+    return static_cast<size_t>(std::clamp(fps / 24, 5, 8));
 }
 
 size_t QueueWarningResetThreshold(size_t warning_threshold) {
     return std::max<size_t>(2, warning_threshold / 2);
+}
+
+int64_t QueueResyncGracePeriodUsForProfile(const protocol::StreamProfile& profile, bool smooth_mode) {
+    const int fps = std::max(0, profile.fps);
+    if (fps <= 0) {
+        return smooth_mode ? 320'000 : 220'000;
+    }
+    if (smooth_mode) {
+        return std::clamp<int64_t>((36ll * 1'000'000ll) / fps, 280'000ll, 500'000ll);
+    }
+    return std::clamp<int64_t>((24ll * 1'000'000ll) / fps, 180'000ll, 320'000ll);
+}
+
+int64_t QueueHardWaitGracePeriodUsForProfile(const protocol::StreamProfile& profile, bool smooth_mode) {
+    const int fps = std::max(0, profile.fps);
+    if (fps <= 0) {
+        return smooth_mode ? 800'000 : 520'000;
+    }
+    if (smooth_mode) {
+        return std::clamp<int64_t>((72ll * 1'000'000ll) / fps, 650'000ll, 1'000'000ll);
+    }
+    return std::clamp<int64_t>((48ll * 1'000'000ll) / fps, 420'000ll, 800'000ll);
+}
+
+bool IsCodecConfigAccessUnit(const AccessUnit& access_unit) {
+    return (access_unit.flags & protocol::kFlagCodecConfig) != 0;
+}
+
+bool IsKeyframeAccessUnit(const AccessUnit& access_unit) {
+    return (access_unit.flags & protocol::kFlagKeyframe) != 0;
+}
+
+bool KeepLatestDecodableQueueSpan(
+    std::deque<AccessUnit>* queue,
+    const AccessUnit& latest_codec_config,
+    bool has_latest_codec_config) {
+    if (queue == nullptr || queue->empty()) {
+        return false;
+    }
+
+    auto latest_keyframe = queue->end();
+    for (auto it = queue->end(); it != queue->begin();) {
+        --it;
+        if (IsCodecConfigAccessUnit(*it)) {
+            continue;
+        }
+        if (IsKeyframeAccessUnit(*it)) {
+            latest_keyframe = it;
+            break;
+        }
+    }
+
+    if (latest_keyframe == queue->end()) {
+        return false;
+    }
+
+    std::deque<AccessUnit> trimmed_queue;
+    if (has_latest_codec_config) {
+        trimmed_queue.push_back(latest_codec_config);
+    }
+
+    for (auto it = latest_keyframe; it != queue->end(); ++it) {
+        if (IsCodecConfigAccessUnit(*it)) {
+            continue;
+        }
+        trimmed_queue.push_back(std::move(*it));
+    }
+
+    queue->swap(trimmed_queue);
+    return true;
 }
 
 bool ConfigureMediaFoundationTransform(
@@ -315,6 +402,10 @@ void SoftResyncDecoder(
     const VideoDecoder::LogFn& log_fn,
     const VideoDecoder::FrameFn& frame_fn) {
     if (context == nullptr) {
+        return;
+    }
+
+    if (context->backend == DecoderBackend::kNvidiaCuvid) {
         return;
     }
 
@@ -724,8 +815,12 @@ void VideoDecoder::Configure(const protocol::StreamProfile& profile) {
         latest_codec_config_ = AccessUnit{};
         has_latest_codec_config_ = false;
         waiting_for_keyframe_ = false;
+        pending_keyframe_resync_ = false;
         queue_warning_active_ = false;
+        proactive_keyframe_requested_ = false;
         queue_resync_overload_hits_ = 0;
+        queue_overload_started_us_ = 0;
+        queue_hard_wait_started_us_ = 0;
         backend_reset_requested_ = false;
         soft_resync_requested_ = false;
         discontinuity_pending_ = true;
@@ -748,6 +843,7 @@ void VideoDecoder::SetD3DDevice(ID3D11Device* device) {
 }
 
 void VideoDecoder::SetSmoothMode(bool enabled) {
+    enabled = false;
     bool changed = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -756,8 +852,13 @@ void VideoDecoder::SetSmoothMode(bool enabled) {
         }
 
         smooth_mode_ = enabled;
+        waiting_for_keyframe_ = false;
+        pending_keyframe_resync_ = false;
         queue_warning_active_ = false;
+        proactive_keyframe_requested_ = false;
         queue_resync_overload_hits_ = 0;
+        queue_overload_started_us_ = 0;
+        queue_hard_wait_started_us_ = 0;
         changed = true;
     }
 
@@ -790,11 +891,19 @@ void VideoDecoder::SubmitAccessUnit(const AccessUnit& access_unit) {
         const bool smooth_mode = smooth_mode_;
         const size_t warning_threshold = QueueWarningThresholdForProfile(threshold_profile, smooth_mode);
         const size_t resync_threshold = QueueResyncThresholdForProfile(threshold_profile, smooth_mode);
+        const size_t hard_wait_threshold = QueueHardWaitThresholdForProfile(threshold_profile, smooth_mode);
         const size_t resync_hit_threshold = QueueResyncHitThresholdForProfile(threshold_profile, smooth_mode);
+        const size_t warning_reset_threshold = QueueWarningResetThreshold(warning_threshold);
+        const int64_t resync_grace_period_us = QueueResyncGracePeriodUsForProfile(threshold_profile, smooth_mode);
+        const int64_t hard_wait_grace_period_us = QueueHardWaitGracePeriodUsForProfile(threshold_profile, smooth_mode);
+        const int64_t now_us = NowSteadyUs();
 
         if (is_codec_config) {
             latest_codec_config_ = access_unit;
             has_latest_codec_config_ = true;
+        }
+        if (is_keyframe) {
+            proactive_keyframe_requested_ = false;
         }
 
         if (waiting_for_keyframe_) {
@@ -806,9 +915,13 @@ void VideoDecoder::SubmitAccessUnit(const AccessUnit& access_unit) {
             }
 
             waiting_for_keyframe_ = false;
+            pending_keyframe_resync_ = false;
+            proactive_keyframe_requested_ = false;
             queue_.clear();
             queue_warning_active_ = false;
             queue_resync_overload_hits_ = 0;
+            queue_overload_started_us_ = 0;
+            queue_hard_wait_started_us_ = 0;
             if (has_latest_codec_config_) {
                 queue_.push_back(latest_codec_config_);
             }
@@ -816,6 +929,23 @@ void VideoDecoder::SubmitAccessUnit(const AccessUnit& access_unit) {
             soft_resync_requested_ = true;
             discontinuity_pending_ = true;
             deferred_log = L"解码队列: 已收到新的关键帧，恢复低延迟解码。";
+        } else if (pending_keyframe_resync_ && is_keyframe) {
+            waiting_for_keyframe_ = false;
+            pending_keyframe_resync_ = false;
+            proactive_keyframe_requested_ = false;
+            queue_.clear();
+            queue_warning_active_ = false;
+            queue_resync_overload_hits_ = 0;
+            queue_overload_started_us_ = 0;
+            queue_hard_wait_started_us_ = 0;
+            if (has_latest_codec_config_) {
+                queue_.push_back(latest_codec_config_);
+            }
+            queue_.push_back(access_unit);
+            soft_resync_requested_ = true;
+            discontinuity_pending_ = true;
+            deferred_log =
+                L"\u89e3\u7801\u961f\u5217: \u5df2\u6536\u5230\u8865\u6551\u5173\u952e\u5e27\uff0c\u76f4\u63a5\u5207\u56de\u6700\u65b0\u753b\u9762\u3002";
         } else {
             queue_.push_back(access_unit);
             const size_t queue_depth = queue_.size();
@@ -827,16 +957,21 @@ void VideoDecoder::SubmitAccessUnit(const AccessUnit& access_unit) {
                        << L" 帧，如继续上升将主动重同步。";
                 deferred_log = stream.str();
                 queue_warning_active_ = true;
-            } else if (queue_depth <= QueueWarningResetThreshold(warning_threshold)) {
+            } else if (queue_depth <= warning_reset_threshold) {
                 queue_warning_active_ = false;
+                proactive_keyframe_requested_ = false;
+                pending_keyframe_resync_ = false;
             }
 
-            if (queue_depth >= resync_threshold) {
+            if (queue_depth >= resync_threshold && false) {
                 ++queue_resync_overload_hits_;
                 if (queue_resync_overload_hits_ >= resync_hit_threshold) {
                     queue_warning_active_ = false;
                     queue_resync_overload_hits_ = 0;
                     if (is_keyframe) {
+                        waiting_for_keyframe_ = false;
+                        pending_keyframe_resync_ = false;
+                        proactive_keyframe_requested_ = false;
                         queue_.clear();
                         soft_resync_requested_ = true;
                         discontinuity_pending_ = true;
@@ -845,22 +980,164 @@ void VideoDecoder::SubmitAccessUnit(const AccessUnit& access_unit) {
                         }
                         queue_.push_back(access_unit);
                         deferred_log = L"解码队列: 积压过多，已丢弃旧帧并从最新关键帧继续。";
-                    } else if (smooth_mode) {
-                        waiting_for_keyframe_ = true;
+                    } else if (!smooth_mode) {
+                        const bool kept_latest_span =
+                            KeepLatestDecodableQueueSpan(&queue_, latest_codec_config_, has_latest_codec_config_);
+                        const size_t trimmed_depth = queue_.size();
+
+                        soft_resync_requested_ = true;
+                        discontinuity_pending_ = true;
+                        pending_keyframe_resync_ = false;
+                        proactive_keyframe_requested_ = false;
+                        waiting_for_keyframe_ = false;
+
+                        if (kept_latest_span && trimmed_depth <= hard_wait_threshold) {
+                            deferred_log =
+                                L"\u89e3\u7801\u961f\u5217: \u4f4e\u5ef6\u8fdf\u6a21\u5f0f\u5df2\u81ea\u52a8\u91ca\u653e\u79ef\u538b\u65e7\u5e27\uff0c\u53ea\u4fdd\u7559\u6700\u65b0\u5173\u952e\u5e27\u540e\u7684\u753b\u9762\u3002";
+                        } else {
+                            queue_.clear();
+                            waiting_for_keyframe_ = true;
+                            should_request_keyframe = true;
+                            deferred_log =
+                                L"\u89e3\u7801\u961f\u5217: \u4f4e\u5ef6\u8fdf\u6a21\u5f0f\u5df2\u81ea\u52a8\u91ca\u653e\u79ef\u538b\u65e7\u5e27\uff0c\u7b49\u5f85\u4e0b\u4e00\u5f20\u5173\u952e\u5e27\u76f4\u63a5\u8ffd\u4e0a\u6700\u65b0\u753b\u9762\u3002";
+                        }
+                    } else if (!pending_keyframe_resync_) {
+                        pending_keyframe_resync_ = true;
                         should_request_keyframe = true;
                         deferred_log =
                             L"解码队列: 顺滑模式下检测到持续积压，已继续消化排队帧，并请求新的关键帧切回最新画面。";
-                    } else {
+                    } else if (queue_depth >= hard_wait_threshold) {
                         queue_.clear();
                         soft_resync_requested_ = true;
                         discontinuity_pending_ = true;
                         waiting_for_keyframe_ = true;
+                        pending_keyframe_resync_ = false;
+                        proactive_keyframe_requested_ = true;
                         should_request_keyframe = true;
                         deferred_log = L"解码队列: 积压过多，已丢弃旧帧并等待新的关键帧重同步。";
                     }
                 }
             } else {
                 queue_resync_overload_hits_ = 0;
+            }
+
+            if (queue_depth >= resync_threshold) {
+                if (queue_overload_started_us_ == 0) {
+                    queue_overload_started_us_ = now_us;
+                }
+            } else {
+                queue_overload_started_us_ = 0;
+                queue_hard_wait_started_us_ = 0;
+                if (queue_depth <= warning_threshold) {
+                    pending_keyframe_resync_ = false;
+                }
+            }
+
+            if (queue_depth >= hard_wait_threshold) {
+                if (queue_hard_wait_started_us_ == 0) {
+                    queue_hard_wait_started_us_ = now_us;
+                }
+            } else {
+                queue_hard_wait_started_us_ = 0;
+            }
+
+            const bool overload_sustained =
+                queue_overload_started_us_ != 0 &&
+                (now_us - queue_overload_started_us_) >= resync_grace_period_us;
+            const bool hard_wait_sustained =
+                queue_hard_wait_started_us_ != 0 &&
+                (now_us - queue_hard_wait_started_us_) >= hard_wait_grace_period_us;
+
+            if (queue_depth >= resync_threshold && overload_sustained) {
+                const int64_t overload_duration_ms =
+                    queue_overload_started_us_ != 0 ? (now_us - queue_overload_started_us_) / 1000 : 0;
+
+                if (is_keyframe) {
+                    waiting_for_keyframe_ = false;
+                    pending_keyframe_resync_ = false;
+                    proactive_keyframe_requested_ = false;
+                    queue_.clear();
+                    soft_resync_requested_ = true;
+                    discontinuity_pending_ = true;
+                    queue_overload_started_us_ = 0;
+                    queue_hard_wait_started_us_ = 0;
+                    if (has_latest_codec_config_) {
+                        queue_.push_back(latest_codec_config_);
+                    }
+                    queue_.push_back(access_unit);
+                    deferred_log =
+                        L"\u89e3\u7801\u961f\u5217: \u6301\u7eed\u79ef\u538b\u65f6\u76f4\u63a5\u6536\u5230\u65b0\u5173\u952e\u5e27\uff0c\u5df2\u4ece\u6700\u65b0\u753b\u9762\u7ee7\u7eed\u89e3\u7801\u3002";
+                } else if (!smooth_mode) {
+                    const bool kept_latest_span =
+                        KeepLatestDecodableQueueSpan(&queue_, latest_codec_config_, has_latest_codec_config_);
+                    const size_t trimmed_depth = queue_.size();
+
+                    if (kept_latest_span && trimmed_depth <= hard_wait_threshold) {
+                        soft_resync_requested_ = true;
+                        discontinuity_pending_ = true;
+                        pending_keyframe_resync_ = false;
+                        proactive_keyframe_requested_ = false;
+                        waiting_for_keyframe_ = false;
+                        queue_overload_started_us_ = 0;
+                        queue_hard_wait_started_us_ = 0;
+
+                        std::wostringstream stream;
+                        stream << L"\u89e3\u7801\u961f\u5217: \u4f4e\u5ef6\u8fdf\u6a21\u5f0f\u68c0\u6d4b\u5230\u6301\u7eed "
+                               << overload_duration_ms
+                               << L" ms \u79ef\u538b\uff0c\u5df2\u53ea\u4fdd\u7559\u6700\u65b0\u53ef\u89e3\u7801 span\uff0c\u4f46\u4e0d\u518d\u76f4\u63a5\u6e05\u7a7a\u4e2d\u95f4\u753b\u9762\u3002";
+                        deferred_log = stream.str();
+                    } else if (!pending_keyframe_resync_) {
+                        pending_keyframe_resync_ = true;
+                        if (!proactive_keyframe_requested_) {
+                            proactive_keyframe_requested_ = true;
+                            should_request_keyframe = true;
+                        }
+
+                        std::wostringstream stream;
+                        stream << L"\u89e3\u7801\u961f\u5217: \u4f4e\u5ef6\u8fdf\u6a21\u5f0f\u68c0\u6d4b\u5230\u6301\u7eed "
+                               << overload_duration_ms
+                               << L" ms \u79ef\u538b\uff0c\u5df2\u7ee7\u7eed\u6d88\u5316\u5f53\u524d\u961f\u5217\u5e76\u8bf7\u6c42\u8865\u6551\u5173\u952e\u5e27\uff0c\u6682\u4e0d\u4e22\u6389\u4e2d\u95f4\u753b\u9762\u3002";
+                        deferred_log = stream.str();
+                    } else if (hard_wait_sustained) {
+                        const int64_t hard_wait_duration_ms =
+                            queue_hard_wait_started_us_ != 0 ? (now_us - queue_hard_wait_started_us_) / 1000 : 0;
+                        queue_.clear();
+                        soft_resync_requested_ = true;
+                        discontinuity_pending_ = true;
+                        waiting_for_keyframe_ = true;
+                        pending_keyframe_resync_ = false;
+                        proactive_keyframe_requested_ = true;
+                        should_request_keyframe = true;
+                        queue_overload_started_us_ = 0;
+                        queue_hard_wait_started_us_ = 0;
+
+                        std::wostringstream stream;
+                        stream << L"\u89e3\u7801\u961f\u5217: \u79ef\u538b\u5df2\u8fde\u7eed "
+                               << hard_wait_duration_ms
+                               << L" ms \u4ecd\u65e0\u6cd5\u56de\u843d\uff0c\u624d\u88ab\u8feb\u6e05\u7406\u65e7\u5e27\u5e76\u7b49\u5f85\u65b0\u5173\u952e\u5e27\u3002";
+                        deferred_log = stream.str();
+                    }
+                } else if (!pending_keyframe_resync_) {
+                    pending_keyframe_resync_ = true;
+                    if (!proactive_keyframe_requested_) {
+                        proactive_keyframe_requested_ = true;
+                        should_request_keyframe = true;
+                    }
+                    deferred_log =
+                        L"\u89e3\u7801\u961f\u5217: \u68c0\u6d4b\u5230\u6301\u7eed\u79ef\u538b\uff0c\u5df2\u7ee7\u7eed\u6d88\u5316\u961f\u5217\u5e76\u8bf7\u6c42\u65b0\u5173\u952e\u5e27\u3002";
+                } else if (hard_wait_sustained) {
+                    queue_.clear();
+                    soft_resync_requested_ = true;
+                    discontinuity_pending_ = true;
+                    waiting_for_keyframe_ = true;
+                    pending_keyframe_resync_ = false;
+                    proactive_keyframe_requested_ = true;
+                    should_request_keyframe = true;
+                    queue_overload_started_us_ = 0;
+                    queue_hard_wait_started_us_ = 0;
+                    deferred_log =
+                        L"\u89e3\u7801\u961f\u5217: \u6301\u7eed\u79ef\u538b\u8d85\u8fc7\u5bbd\u9650\u65f6\u95f4\uff0c\u5df2\u6e05\u7406\u65e7\u5e27\u5e76\u7b49\u5f85\u65b0\u5173\u952e\u5e27\u91cd\u540c\u6b65\u3002";
+                }
             }
         }
     }

@@ -146,12 +146,16 @@ private:
     bool has_active_profile_ = false;
     bool has_latest_codec_config_ = false;
     bool waiting_for_keyframe_ = false;
+    bool pending_keyframe_resync_ = false;
     bool queue_warning_active_ = false;
+    bool proactive_keyframe_requested_ = false;
     bool backend_reset_requested_ = false;
     bool soft_resync_requested_ = false;
     bool discontinuity_pending_ = false;
     bool smooth_mode_ = false;
     size_t queue_resync_overload_hits_ = 0;
+    int64_t queue_overload_started_us_ = 0;
+    int64_t queue_hard_wait_started_us_ = 0;
     std::thread thread_;
     ID3D11Device* d3d_device_ = nullptr;
     RequestKeyframeFn request_keyframe_fn_;

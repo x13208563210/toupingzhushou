@@ -7,7 +7,7 @@ import com.example.androidcast.model.StreamProfile
 
 class CapabilityProbe {
     companion object {
-        const val BUILD_LABEL = "0.3.10-fixed-adaptive-2026-04-04"
+        const val BUILD_LABEL = "0.3.16-end-to-end-recovery-2026-04-05"
         private const val FORCE_2K_TEST_MODE = true
     }
 

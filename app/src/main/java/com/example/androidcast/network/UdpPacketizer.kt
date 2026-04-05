@@ -1,6 +1,7 @@
 package com.example.androidcast.network
 
 import android.os.Process
+import com.example.androidcast.diagnostics.SenderDiagnostics
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -23,7 +24,7 @@ class UdpPacketizer(
     private val address = InetAddress.getByName(host)
     private val socket = DatagramSocket().apply {
         connect(address, port)
-        sendBufferSize = 4 shl 20
+        sendBufferSize = 8 shl 20
         runCatching { trafficClass = 0x10 }
     }
     private val running = AtomicBoolean(true)
@@ -32,6 +33,8 @@ class UdpPacketizer(
     private var latestCodecConfig: PendingAccessUnit? = null
     private var pendingCodecConfig: PendingAccessUnit? = null
     private var waitingForKeyFrame = false
+    private var proactiveKeyFrameRequested = false
+    private var overflowCount = 0L
     private val senderThread =
         Thread {
             runCatching {
@@ -72,6 +75,10 @@ class UdpPacketizer(
                 latestCodecConfig = pendingAccessUnit
                 pendingCodecConfig = pendingAccessUnit
             } else {
+                if (isKeyFrame) {
+                    proactiveKeyFrameRequested = false
+                }
+
                 if (waitingForKeyFrame) {
                     if (!isKeyFrame) {
                         return
@@ -79,15 +86,41 @@ class UdpPacketizer(
                     pendingVideoQueue.clear()
                     latestCodecConfig?.let { pendingCodecConfig = it }
                     waitingForKeyFrame = false
+                    proactiveKeyFrameRequested = false
+                    SenderDiagnostics.i(TAG, "重新收到关键帧，发送队列恢复")
                 }
 
                 pendingVideoQueue.addLast(pendingAccessUnit)
-                if (pendingVideoQueue.size > MAX_PENDING_ACCESS_UNITS) {
-                    pendingVideoQueue.clear()
-                    waitingForKeyFrame = true
+
+                if (pendingVideoQueue.size >= WARNING_PENDING_ACCESS_UNITS && !proactiveKeyFrameRequested) {
+                    proactiveKeyFrameRequested = true
                     shouldRequestKeyFrame = true
                 }
+
+                if (pendingVideoQueue.size > MAX_PENDING_ACCESS_UNITS) {
+                    overflowCount += 1
+                    val keptLatestSpan = trimToLatestKeyFrameLocked()
+                    if (keptLatestSpan && pendingVideoQueue.size <= TRIMMED_PENDING_ACCESS_UNITS) {
+                        proactiveKeyFrameRequested = false
+                        SenderDiagnostics.w(
+                            TAG,
+                            "发送队列积压，已只保留最新关键帧后的画面: overflowCount=$overflowCount, queueSize=${pendingVideoQueue.size}, payload=${payload.size}, ptsUs=$ptsUs",
+                        )
+                    } else {
+                        pendingVideoQueue.clear()
+                        waitingForKeyFrame = true
+                        proactiveKeyFrameRequested = true
+                        shouldRequestKeyFrame = true
+                        SenderDiagnostics.w(
+                            TAG,
+                            "发送队列溢出，已清空积压并请求关键帧: overflowCount=$overflowCount, payload=${payload.size}, ptsUs=$ptsUs",
+                        )
+                    }
+                } else if (pendingVideoQueue.size <= WARNING_RESET_PENDING_ACCESS_UNITS) {
+                    proactiveKeyFrameRequested = false
+                }
             }
+
             queueLock.notifyAll()
         }
         if (shouldRequestKeyFrame) {
@@ -104,10 +137,29 @@ class UdpPacketizer(
             latestCodecConfig = null
             pendingCodecConfig = null
             waitingForKeyFrame = false
+            proactiveKeyFrameRequested = false
             queueLock.notifyAll()
         }
         runCatching { senderThread.join(500) }
         socket.close()
+    }
+
+    private fun trimToLatestKeyFrameLocked(): Boolean {
+        val snapshot = pendingVideoQueue.toList()
+        val latestKeyFrameIndex =
+            snapshot.indexOfLast { accessUnit ->
+                (accessUnit.flags and PacketHeader.FLAG_KEYFRAME) != 0
+            }
+        if (latestKeyFrameIndex < 0) {
+            return false
+        }
+
+        pendingVideoQueue.clear()
+        latestCodecConfig?.let { pendingCodecConfig = it }
+        for (index in latestKeyFrameIndex until snapshot.size) {
+            pendingVideoQueue.addLast(snapshot[index])
+        }
+        return true
     }
 
     private fun sendLoop() {
@@ -176,6 +228,10 @@ class UdpPacketizer(
 
     companion object {
         const val MAX_PAYLOAD_SIZE = 1400
-        private const val MAX_PENDING_ACCESS_UNITS = 24
+        private const val WARNING_PENDING_ACCESS_UNITS = 16
+        private const val WARNING_RESET_PENDING_ACCESS_UNITS = 8
+        private const val TRIMMED_PENDING_ACCESS_UNITS = 20
+        private const val MAX_PENDING_ACCESS_UNITS = 48
+        private const val TAG = "UdpPacketizer"
     }
 }

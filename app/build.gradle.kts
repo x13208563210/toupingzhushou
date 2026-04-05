@@ -3,8 +3,8 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-val appVersionCode = 24
-val appVersionName = "0.3.10-fixed-adaptive-2026-04-04"
+val appVersionCode = 30
+val appVersionName = "0.3.16-end-to-end-recovery-2026-04-05"
 
 android {
     namespace = "com.example.androidcast"

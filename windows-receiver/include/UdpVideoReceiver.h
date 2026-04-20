@@ -8,6 +8,7 @@
 #include <functional>
 #include <string>
 #include <thread>
+#include <vector>
 
 struct VideoStats {
     uint64_t total_packets = 0;
@@ -35,14 +36,14 @@ public:
 
 private:
     void ThreadMain(uint16_t video_port);
-    void OnPacket(const protocol::PacketHeader& header, const uint8_t* payload, size_t datagram_size);
+    void OnAccessUnit(const protocol::PacketHeader& header, std::vector<uint8_t> payload);
 
     LogFn log_fn_;
     AccessUnitFn access_unit_fn_;
     std::atomic<bool> running_{false};
     uintptr_t socket_ = static_cast<uintptr_t>(-1);
+    uintptr_t client_socket_ = static_cast<uintptr_t>(-1);
     std::thread thread_;
-    mutable FrameReassembler reassembler_;
 
     std::atomic<uint64_t> total_packets_{0};
     std::atomic<uint64_t> total_bytes_{0};
@@ -53,4 +54,6 @@ private:
     std::atomic<uint64_t> dropped_frames_{0};
     std::atomic<uint32_t> last_frame_id_{0};
     std::atomic<uint64_t> last_pts_us_{0};
+    uint32_t last_completed_frame_id_ = 0;
+    uint64_t last_observed_dropped_frames_ = 0;
 };

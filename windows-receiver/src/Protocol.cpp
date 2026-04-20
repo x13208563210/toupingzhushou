@@ -9,6 +9,8 @@
 namespace protocol {
 namespace {
 
+constexpr int kMaxStreamFps = 60;
+
 std::wstring Utf8ToWide(const std::string& value) {
     if (value.empty()) {
         return {};
@@ -42,6 +44,13 @@ uint64_t ReadU64(const uint8_t* data) {
            static_cast<uint64_t>(data[7]);
 }
 
+int ClampProfileFps(int fps) {
+    if (fps <= 0) {
+        return fps;
+    }
+    return fps > kMaxStreamFps ? kMaxStreamFps : fps;
+}
+
 }  // namespace
 
 Codec CodecFromWireName(const std::string& value) {
@@ -70,10 +79,21 @@ bool ParseHelloMessage(const std::string& json_line, HelloMessage* out, std::str
         return false;
     }
 
+    *out = HelloMessage{};
+
     const std::regex device_regex(R"json("deviceName"\s*:\s*"([^"]*)")json");
     std::smatch device_match;
     if (std::regex_search(json_line, device_match, device_regex)) {
         out->device_name = Utf8ToWide(device_match[1].str());
+    }
+
+    const std::regex audio_regex(
+        R"json("audio"\s*:\s*\{\s*"enabled"\s*:\s*(true|false)\s*,\s*"sampleRate"\s*:\s*(\d+)\s*,\s*"channels"\s*:\s*(\d+)\s*,\s*"format"\s*:\s*"([^"]+)")json");
+    std::smatch audio_match;
+    if (std::regex_search(json_line, audio_match, audio_regex)) {
+        out->audio_enabled = audio_match[1].str() == "true";
+        out->audio_sample_rate = std::stoi(audio_match[2].str());
+        out->audio_channels = std::stoi(audio_match[3].str());
     }
 
     const std::regex profile_regex(
@@ -85,7 +105,7 @@ bool ParseHelloMessage(const std::string& json_line, HelloMessage* out, std::str
         profile.codec = CodecFromWireName((*it)[1].str());
         profile.width = std::stoi((*it)[2].str());
         profile.height = std::stoi((*it)[3].str());
-        profile.fps = std::stoi((*it)[4].str());
+        profile.fps = ClampProfileFps(std::stoi((*it)[4].str()));
         profile.adaptive_fps = (*it)[5].matched && (*it)[5].str() == "true";
         profile.bitrate = std::stoi((*it)[6].str());
         out->profiles.push_back(profile);
@@ -101,15 +121,20 @@ bool ParseHelloMessage(const std::string& json_line, HelloMessage* out, std::str
 }
 
 std::string BuildSelectProfileJson(const StreamProfile& profile) {
+    const int fps = ClampProfileFps(profile.fps);
     std::ostringstream stream;
     stream << "{\"type\":\"SELECT_PROFILE\""
            << ",\"codec\":\"" << CodecToWireName(profile.codec) << "\""
            << ",\"width\":" << profile.width
            << ",\"height\":" << profile.height
-           << ",\"fps\":" << profile.fps
+           << ",\"fps\":" << fps
            << ",\"adaptiveFps\":" << (profile.adaptive_fps ? "true" : "false")
            << ",\"bitrate\":" << profile.bitrate
            << ",\"videoPort\":" << profile.video_port
+           << ",\"audioEnabled\":" << (profile.audio_enabled ? "true" : "false")
+           << ",\"audioPort\":" << profile.audio_port
+           << ",\"audioSampleRate\":" << profile.audio_sample_rate
+           << ",\"audioChannels\":" << profile.audio_channels
            << "}";
     return stream.str();
 }

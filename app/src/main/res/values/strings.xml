@@ -1,11 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">粥6y直播投屏助手</string>
-    <string name="title_mvp">粥6y直播投屏助手</string>
+    <string name="app_name">直播投屏助手</string>
+    <string name="title_mvp">直播投屏助手</string>
     <string name="title_sender">安卓发送端</string>
-    <string name="description_mvp">把手机画面以低延迟方式推送到你的电脑接收端。当前版本聚焦单向投屏，不包含音频。</string>
-    <string name="hero_badge">1080p60 · 低延迟 · 无音频</string>
+    <string name="description_mvp">把手机画面以低延迟方式推送到电脑接收端。现在支持可选的安卓声音独立投送，不影响原有画面链路。</string>
+    <string name="hero_badge">低延迟 · 单向投屏 · 安卓声音可选</string>
     <string name="label_version">版本 %1$s</string>
+    <string name="label_author">作者：粥6y</string>
+    <string name="section_intro_title">功能说明</string>
+    <string name="section_intro_desc">手机端负责采集屏幕、编码并推流到电脑；电脑端负责接收、显示、播放可选音频并诊断当前投屏会话。</string>
+    <string name="section_intro_groups">功能分组：连接目标 / 推流参数 / 投屏控制 / 当前状态</string>
     <string name="section_target_title">连接目标</string>
     <string name="section_target_desc">填写电脑接收端的局域网 IP 和控制端口，手机与电脑需要在同一局域网内。</string>
     <string name="hint_receiver_ip">电脑接收端 IP 地址</string>
@@ -22,9 +26,13 @@
     <string name="status_invalid_target">请先填写正确的电脑 IP 和控制端口。</string>
     <string name="status_starting_stream">正在启动投屏…</string>
     <string name="status_stopping_stream">正在停止投屏…</string>
-    <string name="status_extra_hint">开始投屏后，手机会把画面直接推到你的电脑接收端。</string>
-    <string name="notification_title">粥6y直播投屏助手正在运行</string>
+    <string name="status_extra_hint">开始投屏后，手机会把画面直接推送到你的电脑接收端。</string>
+    <string name="notification_title">直播投屏助手正在运行</string>
     <string name="notification_running">正在把手机画面发送到电脑</string>
     <string name="notification_channel_name">投屏发送服务</string>
-    <string name="app_title_with_version">粥6y直播投屏助手 %1$s</string>
+    <string name="app_title_with_version">直播投屏助手 %1$s</string>
+    <string name="status_requesting_audio_permission">正在请求声音捕获权限…</string>
+    <string name="status_audio_permission_denied">已开启安卓声音投送，但没有授予录音权限。</string>
+    <string name="audio_enabled_short">声音：开</string>
+    <string name="audio_disabled_short">声音：关</string>
 </resources>

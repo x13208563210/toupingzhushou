@@ -1,54 +1,120 @@
-#include "ControlServer.h"
-#include "NvidiaCuvidProbe.h"
-#include "UdpVideoReceiver.h"
-#include "VideoDecoder.h"
-#include "VideoRenderer.h"
+// ============================================================================
+// 头文件包含区域
+// ============================================================================
 
-#include <Windows.h>
-#include <WinSock2.h>
-#include <Shellapi.h>
-#include <mfapi.h>
+// 项目内部头文件 - 包含各个功能模块的控制器和接收器
+#include "AirPlayReceiverController.h"      // AirPlay 接收器控制器 (苹果投屏)
+#include "AudioPlayer.h"                     // 音频播放器 - 处理 PCM 音频输出
+#include "ControlServer.h"                   // 控制服务器 - TCP 控制通道
+#include "DanmakuController.h"
+#include "VoiceIntentResolver.h"
+#include "EmbeddedWebUiBridge.h"             // 嵌入式 Web UI 桥接
+#include "LocalMusicPlayer.h"                // 本地音乐播放器 - 语音点歌功能
+#include "NvidiaCuvidProbe.h"                // NVIDIA CUDA/CUVID 探测 - 硬件解码检测
+#include "UdpAudioReceiver.h"                // UDP 音频接收器 - 接收手机端音频流
+#include "UdpVideoReceiver.h"                // UDP 视频接收器 - 接收手机端视频流
+#include "VideoDecoder.h"                    // 视频解码器 - H.264/HEVC 解码
+#include "VideoRenderer.h"                   // 视频渲染器 - Direct3D 11 渲染
+#include "VoiceCommandController.h"          // 语音命令控制器 - 离线语音识别
+#include "VoiceMusicLibrary.h"               // 语音音乐库 - 语音点歌曲库管理
+#include "VirtualCameraController.h"         // 虚拟摄像头控制器 - OBS 等软件使用
+#include "VirtualCameraFrameBridge.h"        // 虚拟摄像头帧桥接 - GPU 纹理拷贝
+#include "VirtualCameraShared.h"             // 虚拟摄像头共享定义 - 常量配置
 
-#include <algorithm>
-#include <array>
-#include <chrono>
-#include <cmath>
-#include <cstdio>
-#include <cstdint>
-#include <deque>
-#include <fstream>
-#include <iomanip>
-#include <memory>
-#include <mutex>
-#include <regex>
-#include <sstream>
-#include <string>
-#include <utility>
+// Windows 系统 API 头文件
+#include <Windows.h>                         // Windows 核心 API
+#include <windowsx.h>                        // Windows 控件宏
+#include <WinSock2.h>                        // Winsock 网络库
+#include <Shellapi.h>                        // Shell API - 文件操作、打开文件等
+#include <mfapi.h>                           // Media Foundation API - 多媒体框架
+#include <winrt/Windows.Foundation.h>        // WinRT 基础组件
+#include <winrt/Windows.Foundation.Collections.h>  // WinRT 集合
+#include <winrt/Windows.Media.Control.h>   // WinRT 媒体控制 - 系统媒体会话控制
 
+// C++ 标准库头文件
+#include <algorithm>                         // 算法库 - std::clamp, std::min, std::max 等
+#include <atomic>                            // 原子操作 - 线程安全的原子变量
+#include <array>                             // 数组容器 - 固定大小数组
+#include <chrono>                            // 时间库 - 高精度时间戳
+#include <cmath>                             // 数学库 - 数学函数
+#include <cstdio>                            // C 标准输入输出 - printf, fopen 等
+#include <cstdint>                           // 固定宽度整数类型 - uint8_t, int64_t 等
+#include <cwctype>
+#include <deque>                             // 双端队列 - 日志队列
+#include <filesystem>                        // 文件系统 - 路径操作、文件拷贝
+#include <fstream>                           // 文件流 - 文件读写
+#include <iomanip>                           // IO 流格式化 - std::setw, std::setfill
+#include <memory>                            // 智能指针 - std::unique_ptr
+#include <mutex>                             // 互斥锁 - 线程同步
+#include <regex>                             // 正则表达式 - JSON 解析
+#include <sstream>                           // 字符串流 - 字符串格式化
+#include <string>                            // 字符串 - std::wstring
+#include <unordered_set>
+#include <utility>                           // 工具库 - std::move 等
+
+// ============================================================================
+// 匿名命名空间 - 内部常量和数据结构定义
+// ============================================================================
 namespace {
 
-constexpr wchar_t kStatusWindowClassName[] = L"AndroidCastReceiverStatusWindow";
-constexpr wchar_t kVideoWindowClassName[] = L"AndroidCastReceiverVideoWindow";
-constexpr wchar_t kStatusWindowTitle[] = L"粥6y直播投屏助手";
-constexpr wchar_t kVideoWindowTitle[] = L"粥6y直播投屏助手 - 投屏画面";
-constexpr wchar_t kInstanceMutexName[] = L"Zhou6YLiveCastAssistantSingleton";
-constexpr wchar_t kAppBuildLabel[] = L"0.3.9-motion-burst-recovery-2026-04-05";
+// ============================================================================
+// 窗口类名和标题定义
+// ============================================================================
 
+// 状态窗口类名 - 主窗口 (控制面板)
+constexpr wchar_t kStatusWindowClassName[] = L"AndroidCastReceiverStatusWindow";
+// 视频窗口类名 - 投屏画面窗口
+constexpr wchar_t kVideoWindowClassName[] = L"AndroidCastReceiverVideoWindow";
+// 状态窗口标题 - 显示"直播投屏助手"
+constexpr wchar_t kStatusWindowTitle[] = L"\u76F4\u64AD\u6295\u5C4F\u52A9\u624B";
+// 视频窗口标题 - 显示"直播投屏助手 - 投屏画面"
+constexpr wchar_t kVideoWindowTitle[] = L"\u76F4\u64AD\u6295\u5C4F\u52A9\u624B - \u6295\u5C4F\u753B\u9762";
+
+// ============================================================================
+// 应用程序唯一性和版本标识
+// ============================================================================
+
+// 实例互斥体名称 - 防止程序多开 (周 6Y LiveCastAssistant 单例)
+constexpr wchar_t kInstanceMutexName[] = L"Zhou6YLiveCastAssistantSingleton";
+// 应用构建标签 - 版本号 + 功能标识 + 日期
+constexpr wchar_t kAppBuildLabel[] = L"0.3.86-voice-phase1-2026-04-18";
+constexpr wchar_t kVoiceRuntimePackageFolder[] = L"sherpa-onnx-v1.12.36-win-x64-shared-MD-Release-no-tts";
+constexpr wchar_t kVoiceModelFolderName[] = L"sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30";
+// AirPlay 服务器名称 - 显示给 iPhone/iPad 的设备名
+constexpr wchar_t kAirPlayServerName[] = L"\u76F4\u64AD\u6295\u5C4F\u52A9\u624B";
+
+// ============================================================================
+// UI 文本常量 - 状态显示文字
+// ============================================================================
+
+// 测量中 - 表示正在等待数据
 constexpr wchar_t kTextMeasurePending[] = L"\u6D4B\u91CF\u4E2D";
+// 等待安卓发送端建立控制连接和视频流
 constexpr wchar_t kTextDashboardWaiting[] = L"\u7B49\u5F85\u5B89\u5353\u53D1\u9001\u7AEF\u5EFA\u7ACB\u63A7\u5236\u8FDE\u63A5\u548C\u89C6\u9891\u6D41";
+// 当前配置 - 显示当前使用的流配置
 constexpr wchar_t kTextCurrentConfig[] = L"\u5F53\u524D\u914D\u7F6E";
+// 等待连接 - 尚未建立连接
 constexpr wchar_t kTextWaitingConnect[] = L"\u7B49\u5F85\u8FDE\u63A5";
+// 发送端尚未协商分辨率
 constexpr wchar_t kTextProfilePending[] = L"\u53D1\u9001\u7AEF\u5C1A\u672A\u534F\u5546\u5206\u8FA8\u7387";
+// 内容源帧率 - 显示视频源帧率
 constexpr wchar_t kTextRealtimeFps[] = L"\u5185\u5BB9\u6E90\u5E27\u7387";
+// 等待首帧呈现
 constexpr wchar_t kTextFirstFramePending[] = L"\u7B49\u5F85\u9996\u5E27\u5448\u73B0";
+// 估算端到端延迟
 constexpr wchar_t kTextLatency[] = L"\u4F30\u7B97\u7AEF\u5230\u7AEF\u5EF6\u8FDF";
+// 等待同步 - 等待时钟同步
 constexpr wchar_t kTextWaitingSync[] = L"\u7B49\u5F85\u540C\u6B65";
+// 需要先完成时钟同步
 constexpr wchar_t kTextNeedSync[] = L"\u9700\u8981\u5148\u5B8C\u6210\u65F6\u949F\u540C\u6B65";
+// 显示丢帧 - 解码器队列深度
 constexpr wchar_t kTextDecoderQueue[] = L"\u663E\u793A\u4E22\u5E27";
+// 等待访问单元 - 等待解码数据
 constexpr wchar_t kTextWaitingAccessUnit[] = L"\u7B49\u5F85\u8BBF\u95EE\u5355\u5143";
 constexpr wchar_t kTextTrafficInitial[] =
     L"\u63A7\u5236\u901A\u9053\uFF1ATCP/5500\r\n"
-    L"\u89C6\u9891\u901A\u9053\uFF1AUDP/55000\r\n"
+    L"\u89C6\u9891\u901A\u9053\uFF1ATCP/55000\r\n"
+    L"\u97F3\u9891\u901A\u9053\uFF1AUDP/55001\r\n"
     L"\u6570\u636E\u5305\uFF1A0    \u5B57\u8282\uFF1A0 B\r\n"
     L"\u5B8C\u6574\u5E27\uFF1A0    \u5173\u952E\u5E27\uFF1A0\r\n"
     L"\u4E22\u5E27\uFF1A0    \u6700\u540E\u5E27 ID\uFF1A0";
@@ -56,6 +122,9 @@ constexpr wchar_t kTextRuntimeInitial[] =
     L"\u7F51\u7EDC\u91CD\u7EC4\u901F\u7387\uFF1A\u6D4B\u91CF\u4E2D\r\n"
     L"\u89E3\u7801\u8F93\u51FA\u901F\u7387\uFF1A\u6D4B\u91CF\u4E2D\r\n"
     L"\u6700\u7EC8\u663E\u793A\u901F\u7387\uFF1A\u6D4B\u91CF\u4E2D\r\n"
+    L"\u97F3\u9891\u72B6\u6001\uFF1A\u7B49\u5F85\u534F\u5546\r\n"
+    L"\u82F9\u679C\u6295\u5C4F\uFF1A\u7B49\u5F85\u542F\u52A8\r\n"
+    L"\u8BED\u97F3\u63A7\u5236\uFF1A\u672A\u5F00\u542F\r\n"
     L"\u6E32\u67D3\u663E\u5361\uFF1A\u7B49\u5F85\u521D\u59CB\u5316\r\n"
     L"\u753B\u9762\u7A97\u53E3\uFF1A\u6536\u5230\u9996\u5E27\u540E\u5F39\u51FA\r\n"
     L"\u65F6\u949F\u540C\u6B65\uFF1A\u7B49\u5F85\u624B\u673A\u6821\u65F6";
@@ -65,50 +134,98 @@ constexpr wchar_t kTextSwitchToLowLatency[] = L"\u5207\u6362\u5230\u4f4e\u5ef6\u
 constexpr wchar_t kTextSwitchToSmooth[] = L"\u5207\u6362\u5230\u987a\u6ed1";
 constexpr wchar_t kTextFixedLowLatency[] = L"\u56fa\u5b9a\u7ade\u6280\u4f4e\u5ef6\u8fdf";
 constexpr wchar_t kTextControlPill[] = L"\u63A7\u5236 TCP/5500";
-constexpr wchar_t kTextVideoPill[] = L"\u89C6\u9891 UDP/55000";
+constexpr wchar_t kTextVideoPill[] = L"\u89C6\u9891 TCP/55000";
 constexpr wchar_t kTextTrafficTitle[] = L"\u94FE\u8DEF\u7EDF\u8BA1";
 constexpr wchar_t kTextRuntimeTitle[] = L"\u8FD0\u884C\u72B6\u6001";
 constexpr wchar_t kTextLogTitle[] = L"\u8FD0\u884C\u65E5\u5FD7";
 constexpr wchar_t kTextFilePrefix[] = L"\u6587\u4EF6\uFF1A";
 constexpr wchar_t kTextVersionPrefix[] = L"\u7248\u672C ";
+constexpr wchar_t kTextAppDisplayTitle[] = L"\u76F4\u64AD\u6295\u5C4F\u52A9\u624B";
+constexpr wchar_t kTextVideoDisplayTitle[] = L"\u76F4\u64AD\u6295\u5C4F\u52A9\u624B - \u6295\u5C4F\u753B\u9762";
+constexpr wchar_t kTextOverviewPage[] = L"\u603B\u89C8";
+constexpr wchar_t kTextConnectPage[] = L"\u8BBE\u5907\u8FDE\u63A5";
+constexpr wchar_t kTextDisplayPage[] = L"\u753B\u9762\u663E\u793A";
+constexpr wchar_t kTextDiagnosticsPage[] = L"\u8BCA\u65AD\u6062\u590D";
+constexpr wchar_t kTextVoicePage[] = L"\u8BED\u97F3\u63A7\u5236";
+constexpr wchar_t kTextLogsPage[] = L"\u65E5\u5FD7\u5BFC\u51FA";
+constexpr wchar_t kTextFeatureDescription[] = L"\u529F\u80FD\u8BF4\u660E\uFF1A\u540C\u4E00\u4E2A PC \u7A0B\u5E8F\u91CC\u5B8C\u6210\u63A5\u6536\u3001\u663E\u793A\u3001\u8BED\u97F3\u548C\u6392\u969C";
+constexpr wchar_t kTextFeatureGroups[] = L"\u529F\u80FD\u5206\u7EC4\uFF1A\u8FDE\u63A5 / \u663E\u793A / \u8BED\u97F3 / \u8BCA\u65AD / \u65E5\u5FD7";
+constexpr wchar_t kTextAuthor[] = L"\u4F5C\u8005\uFF1A\u7CA56y";
+constexpr wchar_t kTextVoiceControlDisabled[] = L"\u672A\u5F00\u542F";
+constexpr wchar_t kTextVoiceControlListening[] = L"\u79BB\u7EBF\u76D1\u542C\u4E2D\uFF1A\u53EF\u63A7\u5236\u5A92\u4F53\u4E5F\u53EF\u8BED\u97F3\u70B9\u6B4C";
+constexpr wchar_t kTextVoiceControlUnavailable[] = L"\u79BB\u7EBF\u8BED\u97F3\u7EC4\u4EF6\u4E0D\u53EF\u7528";
 
 constexpr UINT kControlPort = 5500;
 constexpr UINT kVideoPort = 55000;
+constexpr UINT kAudioPort = 55001;
 constexpr UINT_PTR kStatsTimerId = 1;
 constexpr UINT kLogMessage = WM_APP + 1;
 constexpr UINT kStatsMessage = WM_APP + 2;
 constexpr UINT kShowVideoWindowMessage = WM_APP + 3;
+constexpr UINT kVoiceCommandMessage = WM_APP + 4;
+constexpr UINT kVirtualCameraStateMessage = WM_APP + 5;
+constexpr UINT kApplyStreamProfileMessage = WM_APP + 6;
+constexpr UINT kSessionUpdateMessage = WM_APP + 7;
+constexpr int kMaxStreamFps = 60;
 constexpr int kAppIconResourceId = 101;
 constexpr UINT kStatsIntervalMs = 250;
 constexpr int64_t kTimeSyncIntervalUs = 1'000'000;
 constexpr int64_t kMaxReasonableLatencyUs = 5'000'000;
+constexpr int64_t kAudioVideoLateDropUs = 25'000;
+constexpr int64_t kVideoLateDropUs = 250'000;
+constexpr ULONGLONG kVoiceMediaCommandDebounceMs = 1500;
+constexpr ULONGLONG kVoiceMusicCommandDebounceMs = 1500;
+constexpr DWORD kVoiceCommandRecoverySuppressMs = 1800;
 constexpr int kFocusVideoButtonId = 1001;
 constexpr int kOpenLogButtonId = 1002;
 constexpr int kPresentationModeButtonId = 1003;
-bool g_frontend_mode = false;
-
-constexpr int kStatusWindowWidth = 1660;
-constexpr int kStatusWindowHeight = 920;
-constexpr int kStatusWindowMinWidth = 900;
-constexpr int kStatusWindowMinHeight = 760;
+constexpr int kNavOverviewButtonId = 1101;
+constexpr int kNavConnectButtonId = 1102;
+constexpr int kNavDisplayButtonId = 1103;
+constexpr int kNavDiagnosticsButtonId = 1104;
+constexpr int kNavLogsButtonId = 1105;
+constexpr int kNavVoiceButtonId = 1106;
+constexpr int kStatusWindowWidth = 1120;
+constexpr int kStatusWindowHeight = 580;
+constexpr int kStatusWindowMinWidth = 760;
+constexpr int kStatusWindowMinHeight = 430;
+constexpr int kStatusWindowResizeBorder = 6;
 constexpr int kVideoWindowWidth = 1440;
 constexpr int kVideoWindowHeight = 900;
 
-constexpr COLORREF kColorWindowBackground = RGB(236, 240, 247);
-constexpr COLORREF kColorCardBackground = RGB(250, 252, 255);
-constexpr COLORREF kColorHeroBackground = RGB(244, 248, 255);
-constexpr COLORREF kColorLogBackground = RGB(246, 249, 253);
-constexpr COLORREF kColorBorder = RGB(255, 255, 255);
-constexpr COLORREF kColorAccent = RGB(10, 132, 255);
-constexpr COLORREF kColorAccentDark = RGB(0, 113, 227);
-constexpr COLORREF kColorShadowFar = RGB(223, 229, 239);
-constexpr COLORREF kColorShadowNear = RGB(235, 240, 247);
-constexpr COLORREF kColorGlassGlowBlue = RGB(222, 234, 255);
-constexpr COLORREF kColorGlassGlowPink = RGB(245, 229, 255);
-constexpr COLORREF kColorGlassGlowMint = RGB(222, 244, 236);
-constexpr COLORREF kColorTextPrimary = RGB(28, 33, 42);
-constexpr COLORREF kColorTextSecondary = RGB(108, 117, 132);
+constexpr COLORREF kColorWindowBackground = RGB(245, 245, 247);
+constexpr COLORREF kColorEmbeddedWindowBackground = RGB(0, 0, 0);
+constexpr COLORREF kColorCardBackground = RGB(255, 255, 255);
+constexpr COLORREF kColorHeroBackground = RGB(251, 251, 253);
+constexpr COLORREF kColorLogBackground = RGB(251, 251, 253);
+constexpr COLORREF kColorBorder = RGB(228, 228, 232);
+constexpr COLORREF kColorAccent = RGB(0, 113, 227);
+constexpr COLORREF kColorAccentDark = RGB(0, 102, 204);
+constexpr COLORREF kColorShadowFar = RGB(232, 232, 237);
+constexpr COLORREF kColorShadowNear = RGB(239, 239, 243);
+constexpr COLORREF kColorGlassGlowBlue = RGB(252, 252, 255);
+constexpr COLORREF kColorGlassGlowPink = RGB(248, 248, 251);
+constexpr COLORREF kColorGlassGlowMint = RGB(241, 241, 245);
+constexpr COLORREF kColorEmbeddedGlassGlowLeft = RGB(76, 84, 98);
+constexpr COLORREF kColorEmbeddedGlassGlowEdge = RGB(100, 111, 128);
+constexpr COLORREF kColorEmbeddedGlassGlowGround = RGB(40, 45, 54);
+constexpr COLORREF kColorTextPrimary = RGB(29, 29, 31);
+constexpr COLORREF kColorTextSecondary = RGB(110, 110, 115);
 constexpr COLORREF kColorWhite = RGB(255, 255, 255);
+constexpr COLORREF kColorSidebarBackground = RGB(249, 249, 251);
+constexpr COLORREF kColorSidebarSurface = RGB(249, 249, 251);
+constexpr COLORREF kColorSidebarBorder = RGB(229, 229, 234);
+constexpr COLORREF kColorSidebarText = RGB(66, 66, 69);
+constexpr COLORREF kColorSidebarMuted = RGB(134, 134, 139);
+constexpr COLORREF kColorSidebarActive = RGB(255, 255, 255);
+constexpr COLORREF kColorSidebarActiveBorder = RGB(236, 236, 240);
+constexpr COLORREF kColorSidebarTextActive = RGB(0, 102, 204);
+constexpr COLORREF kColorSidebarIndicator = RGB(0, 113, 227);
+constexpr COLORREF kColorTopbarBackground = RGB(255, 255, 255);
+constexpr COLORREF kColorTopbarBorder = RGB(236, 236, 240);
+constexpr COLORREF kColorFocusRing = RGB(0, 113, 227);
+constexpr wchar_t kUiDisplayFontFamily[] = L"Segoe UI Variable Display";
+constexpr wchar_t kUiTextFontFamily[] = L"Segoe UI Variable Text";
 
 struct DashboardCard {
     std::wstring title;
@@ -123,21 +240,52 @@ struct DashboardSnapshot {
     std::wstring runtime_body;
 };
 
+enum class StatusPage {
+    kOverview,
+    kConnect,
+    kDisplay,
+    kVoiceControl,
+    kDiagnostics,
+    kLogs,
+};
+
+struct SessionSnapshot {
+    std::wstring device_name;
+    std::wstring host;
+    bool control_connected = false;
+    int64_t session_started_us = 0;
+    int64_t last_session_change_us = 0;
+    int64_t last_present_us = 0;
+};
+
+struct SenderIdentity {
+    std::wstring display_name;
+    std::wstring version_label;
+};
+
 struct StatusWindowLayout {
-    RECT hero{};
+    RECT shell{};
+    RECT topbar{};
+    RECT sidebar{};
+    std::array<RECT, 6> nav_buttons{};
+    RECT content{};
+    RECT hero_main{};
+    RECT hero_side{};
     RECT focus_button{};
     RECT mode_button{};
     RECT open_log_button{};
     std::array<RECT, 4> summary_cards{};
-    RECT traffic_card{};
-    RECT runtime_card{};
-    RECT log_card{};
+    RECT detail_left{};
+    RECT detail_right{};
+    RECT detail_full{};
     RECT log_view{};
 };
 
 struct AppState {
     HWND status_window = nullptr;
     HWND video_window = nullptr;
+    bool web_ui_ready = false;
+    std::array<HWND, 6> nav_buttons{};
     HWND focus_video_button = nullptr;
     HWND presentation_mode_button = nullptr;
     HWND open_log_button = nullptr;
@@ -146,19 +294,46 @@ struct AppState {
     HFONT subtitle_font = nullptr;
     HFONT section_font = nullptr;
     HFONT value_font = nullptr;
+    HFONT spotlight_value_font = nullptr;
     HFONT body_font = nullptr;
     HFONT button_font = nullptr;
     HBRUSH window_background_brush = nullptr;
     HBRUSH log_background_brush = nullptr;
+    std::unique_ptr<EmbeddedWebUiBridge> web_ui_bridge;
     DashboardSnapshot dashboard{};
     VideoRenderer renderer;
     VideoRenderer::PresentationMode presentation_mode = VideoRenderer::PresentationMode::kLowLatency;
+    StatusPage current_page = StatusPage::kOverview;
     std::mutex log_mutex;
     std::deque<std::wstring> pending_logs;
+    std::deque<std::wstring> recent_logs;
     std::wstring log_file_path;
     std::wstring status_file_path;
+    std::wstring web_ui_folder_path;
+    std::wstring web_ui_user_data_path;
     std::wstring profile_cache_path;
     std::wstring codec_config_cache_path;
+    std::wstring virtual_camera_tool_path;
+    std::wstring virtual_camera_media_source_path;
+    std::wstring virtual_camera_placeholder_path;
+    std::wstring airplay_runtime_root_path;
+    std::wstring airplay_log_path;
+    std::wstring voice_runtime_root_path;
+    std::wstring voice_model_path;
+    std::wstring voice_music_root_path;
+    std::wstring danmaku_capture_root_path;
+    std::wstring danmaku_region_file_path;
+    std::unique_ptr<VoiceCommandController> voice_controller;
+    std::unique_ptr<VoiceMusicLibrary> voice_music_library;
+    std::unique_ptr<LocalMusicPlayer> local_music_player;
+    std::unique_ptr<DanmakuController> danmaku_controller;
+    std::mutex voice_phrase_mutex;
+    std::deque<std::wstring> pending_voice_phrases;
+    std::unordered_set<std::wstring> voice_exact_phrases;
+    bool voice_control_enabled = false;
+    std::wstring voice_control_status = kTextVoiceControlDisabled;
+    ULONGLONG last_voice_media_command_tick = 0;
+    ULONGLONG last_voice_music_command_tick = 0;
     NvidiaCuvidProbeResult nvdec_probe{};
     protocol::StreamProfile selected_profile;
     bool has_selected_profile = false;
@@ -168,14 +343,23 @@ struct AppState {
     bool has_cached_codec_config = false;
     bool auto_resumed_profile = false;
     bool auto_resume_notice_logged = false;
+    std::atomic<bool> auto_resume_profile_message_pending{false};
     std::unique_ptr<ControlServer> control_server;
     std::unique_ptr<UdpVideoReceiver> udp_receiver;
+    std::unique_ptr<UdpAudioReceiver> audio_receiver;
     std::unique_ptr<VideoDecoder> decoder;
+    std::unique_ptr<AudioPlayer> audio_player;
+    AirPlayReceiverController airplay_controller;
+    VirtualCameraFrameBridge virtual_camera_bridge;
+    VirtualCameraController virtual_camera_controller;
+    mutable std::mutex session_mutex;
+    SessionSnapshot session{};
 
     std::mutex metrics_mutex;
     bool has_clock_sync = false;
     int64_t sender_clock_offset_us = 0;
     int64_t sender_clock_rtt_us = 0;
+    int64_t last_stale_video_drop_request_us = 0;
     int64_t latest_latency_us = 0;
     uint64_t latency_sample_count = 0;
     uint64_t total_latency_us = 0;
@@ -204,7 +388,87 @@ struct AppState {
     bool shutting_down = false;
 };
 
+struct PendingStreamProfileMessage {
+    protocol::StreamProfile profile;
+    bool auto_resumed = false;
+    bool submit_cached_codec_config = false;
+    uint32_t cached_codec_config_frame_id = 0;
+    std::vector<uint8_t> cached_codec_config;
+    bool log_auto_resume_notice = false;
+};
+
+struct PendingSessionUpdateMessage {
+    std::wstring sender_host;
+    std::wstring device_name;
+    bool connected = false;
+};
+
 void QueueLog(AppState* state, const std::wstring& message);
+void PostApplyStreamProfileMessage(
+    AppState* state,
+    const protocol::StreamProfile& profile,
+    bool auto_resumed,
+    bool submit_cached_codec_config = false,
+    uint32_t cached_codec_config_frame_id = 0,
+    std::vector<uint8_t> cached_codec_config = {},
+    bool log_auto_resume_notice = false);
+void PostSessionUpdateMessage(
+    AppState* state,
+    const std::wstring& sender_host,
+    const std::wstring& device_name,
+    bool connected);
+void UpdateStatusLabel(AppState* state);
+std::wstring GetExecutableDirectory();
+std::wstring BuildWebUiFolderPath();
+std::wstring BuildWebUiUserDataPath();
+std::wstring BuildAirPlayStatusText(const AppState* state);
+void RefreshAirPlayState(AppState* state);
+void StartAirPlayReceiver(AppState* state, bool automatic);
+void StopAirPlayReceiver(AppState* state, bool write_log);
+std::wstring BuildVirtualCameraStatusText(const AppState* state);
+void NotifyVirtualCameraStateChanged(AppState* state);
+void HandleVirtualCameraControllerStateChanged(AppState* state);
+void RefreshVirtualCameraState(AppState* state);
+void StopVirtualCamera(AppState* state, bool write_log);
+void InstallVirtualCamera(AppState* state);
+void StartVirtualCamera(AppState* state);
+std::wstring BuildVirtualCameraPlaceholderPath();
+std::wstring BuildVoiceRuntimeRootPath();
+std::wstring BuildVoiceModelPath();
+std::wstring BuildVoiceModelRuntimePath(const std::wstring& model_source_path);
+std::wstring BuildDanmakuCaptureRootPath();
+std::wstring BuildDanmakuRegionFilePath();
+bool EnsureDirectoryPath(const std::wstring& path);
+std::wstring BuildVoiceControlStatusText(const AppState* state);
+std::vector<std::wstring> BuildVoiceRecognitionGrammar(AppState* state);
+void RefreshVoiceRecognitionContext(AppState* state, bool restart_if_enabled, bool write_log);
+bool StartVoiceControl(AppState* state);
+void StopVoiceControl(AppState* state, bool write_log);
+void HandleVoiceCommandMessage(AppState* state);
+std::wstring BuildVoiceMusicRootPath();
+void EnsureVoiceMusicScaffold(AppState* state);
+void SetEmbeddedWebUiMode(AppState* state, bool enabled);
+void DestroyNativeStatusControls(AppState* state);
+void ExecuteVoiceMusicProjectCreate(
+    AppState* state,
+    const std::wstring& project_name,
+    const std::wstring& alias_payload);
+void RefreshVoiceMusicLibrary(AppState* state);
+void StopLocalMusicPlayback(AppState* state);
+void OpenVoiceMusicDirectory(AppState* state);
+void OpenVoiceModelDirectory(AppState* state);
+void ExecuteEmbeddedWebUiAction(
+    AppState* state,
+    const std::wstring& action,
+    const std::wstring& value,
+    const std::wstring& extra);
+std::string BuildEmbeddedWebUiSnapshotJson(AppState* state);
+void RequestKeyframe(AppState* state);
+bool FileExists(const std::wstring& path);
+std::wstring WideFromUtf8(const std::string& value);
+std::string ReadUtf8File(const std::wstring& path);
+std::wstring ExtractJsonStringField(const std::string& json_text, const char* field_name);
+std::wstring NormalizeFullPath(const std::wstring& path);
 
 int RectWidth(const RECT& rect) {
     return rect.right - rect.left;
@@ -226,6 +490,15 @@ RECT InsetRectCopy(const RECT& rect, int inset_x, int inset_y) {
     result.right -= inset_x;
     result.bottom -= inset_y;
     return result;
+}
+
+COLORREF BlendColor(COLORREF from, COLORREF to, int to_percent) {
+    const int clamped = std::clamp(to_percent, 0, 100);
+    const int from_percent = 100 - clamped;
+    return RGB(
+        (GetRValue(from) * from_percent + GetRValue(to) * clamped) / 100,
+        (GetGValue(from) * from_percent + GetGValue(to) * clamped) / 100,
+        (GetBValue(from) * from_percent + GetBValue(to) * clamped) / 100);
 }
 
 int64_t NowSteadyUs() {
@@ -282,6 +555,49 @@ std::wstring FormatBitrateValue(uint64_t bitrate) {
     return stream.str();
 }
 
+std::wstring BuildAudioProfileText(const protocol::StreamProfile* profile, bool has_profile) {
+    if (!has_profile || profile == nullptr) {
+        return L"\u7B49\u5F85\u534F\u5546";
+    }
+    if (!profile->audio_enabled || profile->audio_port <= 0 || profile->audio_sample_rate <= 0 || profile->audio_channels <= 0) {
+        return L"\u5173\u95ED";
+    }
+
+    std::wostringstream stream;
+    stream << profile->audio_sample_rate
+           << L"Hz / "
+           << profile->audio_channels
+           << L"ch / UDP/"
+           << profile->audio_port;
+    return stream.str();
+}
+
+std::wstring BuildAudioRuntimeText(
+    const protocol::StreamProfile* profile,
+    bool has_profile,
+    const AudioPlaybackStats& stats) {
+    if (!has_profile || profile == nullptr) {
+        return L"\u7B49\u5F85\u534F\u5546";
+    }
+    if (!profile->audio_enabled || profile->audio_port <= 0 || profile->audio_sample_rate <= 0 || profile->audio_channels <= 0) {
+        return L"\u5173\u95ED";
+    }
+
+    std::wostringstream stream;
+    stream << profile->audio_sample_rate
+           << L"Hz/"
+           << profile->audio_channels
+           << L"ch"
+           << L"\uFF0C\u7F13\u51B2 "
+           << stats.buffered_frames
+           << L" \u5E27 / "
+           << stats.buffered_ms
+           << L" ms"
+           << L"\uFF0C\u4E22\u5F03 "
+           << stats.dropped_frames;
+    return stream.str();
+}
+
 std::wstring FormatDataSize(uint64_t bytes) {
     std::wostringstream stream;
     stream.setf(std::ios::fixed);
@@ -320,6 +636,207 @@ std::wstring ShortenMiddle(const std::wstring& text, size_t max_length) {
     return text.substr(0, head) + L"..." + text.substr(text.size() - tail);
 }
 
+std::wstring TrimWhitespace(const std::wstring& text) {
+    const size_t start = text.find_first_not_of(L" \t\r\n");
+    if (start == std::wstring::npos) {
+        return {};
+    }
+    const size_t end = text.find_last_not_of(L" \t\r\n");
+    return text.substr(start, end - start + 1);
+}
+
+SenderIdentity ParseSenderIdentity(const std::wstring& raw_name) {
+    SenderIdentity identity{};
+    const std::wstring trimmed = TrimWhitespace(raw_name);
+    if (trimmed.empty()) {
+        return identity;
+    }
+
+    if (!trimmed.empty() && trimmed.back() == L']') {
+        const size_t open_bracket = trimmed.find_last_of(L'[');
+        if (open_bracket != std::wstring::npos && open_bracket + 1 < trimmed.size() - 1) {
+            identity.display_name = TrimWhitespace(trimmed.substr(0, open_bracket));
+            identity.version_label = TrimWhitespace(trimmed.substr(open_bracket + 1, trimmed.size() - open_bracket - 2));
+            if (!identity.display_name.empty()) {
+                return identity;
+            }
+        }
+    }
+
+    identity.display_name = trimmed;
+    return identity;
+}
+
+const wchar_t* StatusPageLabel(StatusPage page) {
+    switch (page) {
+    case StatusPage::kConnect:
+        return kTextConnectPage;
+    case StatusPage::kDisplay:
+        return kTextDisplayPage;
+    case StatusPage::kVoiceControl:
+        return kTextVoicePage;
+    case StatusPage::kDiagnostics:
+        return kTextDiagnosticsPage;
+    case StatusPage::kLogs:
+        return kTextLogsPage;
+    case StatusPage::kOverview:
+    default:
+        return kTextOverviewPage;
+    }
+}
+
+const wchar_t* StatusPageSummary(StatusPage page) {
+    switch (page) {
+    case StatusPage::kConnect:
+        return L"\u8FDE\u63A5\u3001\u5730\u5740\u548C\u534F\u5546\u72B6\u6001\u5206\u9875\u67E5\u770B";
+    case StatusPage::kDisplay:
+        return L"\u6E90\u753B\u8D28\u3001client area \u548C\u50CF\u7D20\u6620\u5C04\u5206\u5F00\u663E\u793A";
+    case StatusPage::kVoiceControl:
+        return L"\u53EA\u4FDD\u7559\u63A5\u6536\u7AEF\u81EA\u5E26\u7684\u79BB\u7EBF\u8BED\u97F3\u63A7\u5236";
+    case StatusPage::kDiagnostics:
+        return L"\u5148\u5224\u65AD\u662F\u8FDE\u63A5\u3001\u89E3\u7801\u8FD8\u662F\u6E32\u67D3\u5361\u4F4F";
+    case StatusPage::kLogs:
+        return L"\u65E5\u5FD7\u3001\u5FEB\u7167\u548C\u8F93\u51FA\u76EE\u5F55\u5728\u8FD9\u91CC";
+    case StatusPage::kOverview:
+    default:
+        return L"\u4F1A\u8BDD\u3001\u5E27\u7387\u3001\u5EF6\u8FDF\u548C\u64CD\u4F5C\u5165\u53E3\u5DF2\u62C6\u5F00";
+    }
+}
+
+int NavigationButtonIdFromPage(StatusPage page) {
+    switch (page) {
+    case StatusPage::kConnect:
+        return kNavConnectButtonId;
+    case StatusPage::kDisplay:
+        return kNavDisplayButtonId;
+    case StatusPage::kVoiceControl:
+        return kNavVoiceButtonId;
+    case StatusPage::kDiagnostics:
+        return kNavDiagnosticsButtonId;
+    case StatusPage::kLogs:
+        return kNavLogsButtonId;
+    case StatusPage::kOverview:
+    default:
+        return kNavOverviewButtonId;
+    }
+}
+
+StatusPage PageFromNavigationButtonId(int button_id) {
+    switch (button_id) {
+    case kNavConnectButtonId:
+        return StatusPage::kConnect;
+    case kNavDisplayButtonId:
+        return StatusPage::kDisplay;
+    case kNavVoiceButtonId:
+        return StatusPage::kVoiceControl;
+    case kNavDiagnosticsButtonId:
+        return StatusPage::kDiagnostics;
+    case kNavLogsButtonId:
+        return StatusPage::kLogs;
+    case kNavOverviewButtonId:
+    default:
+        return StatusPage::kOverview;
+    }
+}
+
+bool IsNavigationButtonId(int button_id) {
+    return button_id >= kNavOverviewButtonId && button_id <= kNavVoiceButtonId;
+}
+
+bool ShouldShowLogView(StatusPage page) {
+    return page == StatusPage::kDiagnostics || page == StatusPage::kLogs;
+}
+
+bool ShouldUseWideLogView(StatusPage page) {
+    return page == StatusPage::kLogs;
+}
+
+std::wstring FormatDimensions(int width, int height) {
+    if (width <= 0 || height <= 0) {
+        return kTextMeasurePending;
+    }
+
+    std::wostringstream stream;
+    stream << width << L"x" << height;
+    return stream.str();
+}
+
+std::wstring FormatScaleValue(double scale) {
+    if (scale <= 0.0) {
+        return kTextMeasurePending;
+    }
+
+    std::wostringstream stream;
+    stream.setf(std::ios::fixed);
+    stream.precision(2);
+    stream << scale << L"x";
+    return stream.str();
+}
+
+std::wstring BuildProfileDetailBlock(const protocol::StreamProfile* profile, bool has_profile, const std::wstring& mode_label) {
+    if (!has_profile || profile == nullptr) {
+        return L"\u5206\u8FA8\u7387\uFF1A\u7B49\u5F85\u534F\u5546"
+               L"\r\n\u7F16\u7801\uFF1A--"
+               L"\r\n\u5237\u65B0\uFF1A--"
+               L"\r\n\u7801\u7387\uFF1A--"
+               L"\r\n\u97F3\u9891\uFF1A\u7B49\u5F85\u534F\u5546"
+               L"\r\n\u6A21\u5F0F\uFF1A" + mode_label;
+    }
+
+    return std::wstring(L"\u5206\u8FA8\u7387\uFF1A") + FormatDimensions(profile->width, profile->height) +
+           L"\r\n\u7F16\u7801\uFF1A" + CodecName(profile->codec) +
+           L"\r\n\u5237\u65B0\uFF1A" + FormatProfileFrameRate(*profile) +
+           L"\r\n\u7801\u7387\uFF1A" + FormatBitrateValue(profile->bitrate) +
+           L"\r\n\u97F3\u9891\uFF1A" + BuildAudioProfileText(profile, true) +
+           L"\r\n\u6A21\u5F0F\uFF1A" + mode_label;
+}
+
+std::wstring BuildRateDetailBlock(double receive_fps, double decode_fps, double display_fps) {
+    return std::wstring(L"\u91CD\u7EC4\uFF1A") + FormatOptionalFps(receive_fps) +
+           L"\r\n\u89E3\u7801\uFF1A" + FormatOptionalFps(decode_fps) +
+           L"\r\n\u663E\u793A\uFF1A" + FormatOptionalFps(display_fps);
+}
+
+std::wstring BuildFrameCounterBlock(const VideoStats& stats, uint64_t displayed_frame_count, uint64_t decoded_frame_count) {
+    const uint64_t pending_frames = decoded_frame_count > displayed_frame_count ? decoded_frame_count - displayed_frame_count : 0;
+    return std::wstring(L"\u5F85\u663E\uFF1A") + std::to_wstring(pending_frames) +
+           L"\r\n\u5DF2\u6536\uFF1A" + std::to_wstring(stats.completed_frames) +
+           L"\r\n\u5DF2\u89E3\uFF1A" + std::to_wstring(decoded_frame_count) +
+           L"\r\n\u5DF2\u663E\uFF1A" + std::to_wstring(displayed_frame_count);
+}
+
+std::wstring FormatRelativeMoment(int64_t now_us, int64_t event_us, const wchar_t* fallback) {
+    if (event_us <= 0 || now_us <= event_us) {
+        return fallback;
+    }
+
+    const double seconds = static_cast<double>(now_us - event_us) / 1'000'000.0;
+    std::wostringstream stream;
+    stream.setf(std::ios::fixed);
+    if (seconds < 1.0) {
+        stream.precision(1);
+        stream << seconds << L" \u79D2\u524D";
+        return stream.str();
+    }
+    if (seconds < 60.0) {
+        stream.precision(0);
+        stream << seconds << L" \u79D2\u524D";
+        return stream.str();
+    }
+
+    const double minutes = seconds / 60.0;
+    if (minutes < 60.0) {
+        stream.precision(0);
+        stream << minutes << L" \u5206\u949F\u524D";
+        return stream.str();
+    }
+
+    const double hours = minutes / 60.0;
+    stream.precision(1);
+    stream << hours << L" \u5C0F\u65F6\u524D";
+    return stream.str();
+}
+
 UINT GetWindowDpiValue(HWND hwnd) {
     if (hwnd != nullptr) {
         const HMODULE user32 = GetModuleHandleW(L"user32.dll");
@@ -339,7 +856,53 @@ int ScaleByDpi(HWND hwnd, int value) {
     return MulDiv(value, static_cast<int>(GetWindowDpiValue(hwnd)), 96);
 }
 
-HFONT CreateUiFont(HWND hwnd, int pixel_size, int weight) {
+LRESULT HitTestFramelessStatusWindow(HWND hwnd, LPARAM l_param) {
+    if (hwnd == nullptr || IsZoomed(hwnd)) {
+        return HTCLIENT;
+    }
+
+    RECT window_rect{};
+    if (!GetWindowRect(hwnd, &window_rect)) {
+        return HTCLIENT;
+    }
+
+    const int border = ScaleByDpi(hwnd, kStatusWindowResizeBorder);
+    const int x = GET_X_LPARAM(l_param);
+    const int y = GET_Y_LPARAM(l_param);
+
+    const bool left = x >= window_rect.left && x < window_rect.left + border;
+    const bool right = x < window_rect.right && x >= window_rect.right - border;
+    const bool top = y >= window_rect.top && y < window_rect.top + border;
+    const bool bottom = y < window_rect.bottom && y >= window_rect.bottom - border;
+
+    if (top && left) {
+        return HTTOPLEFT;
+    }
+    if (top && right) {
+        return HTTOPRIGHT;
+    }
+    if (bottom && left) {
+        return HTBOTTOMLEFT;
+    }
+    if (bottom && right) {
+        return HTBOTTOMRIGHT;
+    }
+    if (left) {
+        return HTLEFT;
+    }
+    if (right) {
+        return HTRIGHT;
+    }
+    if (top) {
+        return HTTOP;
+    }
+    if (bottom) {
+        return HTBOTTOM;
+    }
+    return HTCLIENT;
+}
+
+HFONT CreateUiFont(HWND hwnd, int pixel_size, int weight, const wchar_t* face_name) {
     return CreateFontW(
         -ScaleByDpi(hwnd, pixel_size),
         0,
@@ -354,7 +917,7 @@ HFONT CreateUiFont(HWND hwnd, int pixel_size, int weight) {
         CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE,
-        L"Microsoft YaHei UI");
+        face_name);
 }
 
 void DeleteFontHandle(HFONT& font) {
@@ -368,6 +931,14 @@ void DeleteBrushHandle(HBRUSH& brush) {
     if (brush != nullptr) {
         DeleteObject(brush);
         brush = nullptr;
+    }
+}
+
+template <typename T>
+void ReleaseComHandle(T*& handle) {
+    if (handle != nullptr) {
+        handle->Release();
+        handle = nullptr;
     }
 }
 
@@ -391,15 +962,17 @@ void RecreateUiFonts(AppState* state) {
     DeleteFontHandle(state->subtitle_font);
     DeleteFontHandle(state->section_font);
     DeleteFontHandle(state->value_font);
+    DeleteFontHandle(state->spotlight_value_font);
     DeleteFontHandle(state->body_font);
     DeleteFontHandle(state->button_font);
 
-    state->title_font = CreateUiFont(state->status_window, 30, FW_BOLD);
-    state->subtitle_font = CreateUiFont(state->status_window, 15, FW_NORMAL);
-    state->section_font = CreateUiFont(state->status_window, 14, 600);
-    state->value_font = CreateUiFont(state->status_window, 20, FW_BOLD);
-    state->body_font = CreateUiFont(state->status_window, 15, FW_NORMAL);
-    state->button_font = CreateUiFont(state->status_window, 14, 600);
+    state->title_font = CreateUiFont(state->status_window, 34, 600, kUiDisplayFontFamily);
+    state->subtitle_font = CreateUiFont(state->status_window, 12, FW_NORMAL, kUiTextFontFamily);
+    state->section_font = CreateUiFont(state->status_window, 12, 600, kUiTextFontFamily);
+    state->value_font = CreateUiFont(state->status_window, 22, 600, kUiDisplayFontFamily);
+    state->spotlight_value_font = CreateUiFont(state->status_window, 28, 600, kUiDisplayFontFamily);
+    state->body_font = CreateUiFont(state->status_window, 15, FW_NORMAL, kUiTextFontFamily);
+    state->button_font = CreateUiFont(state->status_window, 13, FW_NORMAL, kUiTextFontFamily);
 }
 
 void ApplyUiToControls(AppState* state) {
@@ -407,6 +980,11 @@ void ApplyUiToControls(AppState* state) {
         return;
     }
 
+    for (HWND nav_button : state->nav_buttons) {
+        if (nav_button != nullptr && state->button_font != nullptr) {
+            SendMessageW(nav_button, WM_SETFONT, reinterpret_cast<WPARAM>(state->button_font), TRUE);
+        }
+    }
     if (state->focus_video_button != nullptr && state->button_font != nullptr) {
         SendMessageW(state->focus_video_button, WM_SETFONT, reinterpret_cast<WPARAM>(state->button_font), TRUE);
     }
@@ -437,19 +1015,169 @@ std::wstring PresentationModeLabel(VideoRenderer::PresentationMode mode) {
     }
 }
 
-std::wstring PresentationModeButtonText(VideoRenderer::PresentationMode mode) {
-    (void)mode;
-    return std::wstring(kTextFixedLowLatency);
+SessionSnapshot CopySessionSnapshot(const AppState* state) {
+    SessionSnapshot snapshot;
+    if (state == nullptr) {
+        return snapshot;
+    }
+
+    std::lock_guard<std::mutex> lock(state->session_mutex);
+    snapshot = state->session;
+    return snapshot;
 }
 
-void UpdatePresentationModeButton(AppState* state) {
-    if (state == nullptr || state->presentation_mode_button == nullptr) {
+bool HasConnectedSender(const AppState* state) {
+    if (state == nullptr) {
+        return false;
+    }
+
+    const SessionSnapshot snapshot = CopySessionSnapshot(state);
+    return snapshot.control_connected;
+}
+
+std::wstring PrimaryActionButtonText(const AppState* state) {
+    if (state == nullptr) {
+        return L"";
+    }
+
+    switch (state->current_page) {
+    case StatusPage::kDiagnostics:
+        return L"\u8BF7\u6C42\u5173\u952E\u5E27";
+    case StatusPage::kVoiceControl:
+        return state->voice_control_enabled ? L"\u5173\u95ED\u8BED\u97F3\u63A7\u5236" : L"\u5F00\u542F\u8BED\u97F3\u63A7\u5236";
+    case StatusPage::kLogs:
+        return L"\u6253\u5F00\u65E5\u5FD7";
+    case StatusPage::kOverview:
+    case StatusPage::kConnect:
+    case StatusPage::kDisplay:
+    default:
+        return L"\u6253\u5F00\u6295\u5C4F\u7A97\u53E3";
+    }
+}
+
+std::wstring SecondaryActionButtonText(const AppState* state) {
+    if (state == nullptr) {
+        return L"";
+    }
+
+    switch (state->current_page) {
+    case StatusPage::kConnect:
+        if (state->airplay_controller.running()) {
+            return L"\u5173\u95ED\u82F9\u679C\u6295\u5C4F";
+        }
+        if (state->airplay_controller.installed()) {
+            return L"\u542F\u52A8\u82F9\u679C\u6295\u5C4F";
+        }
+        return L"\u82F9\u679C\u7EC4\u4EF6\u7F3A\u5931";
+    case StatusPage::kLogs:
+        return L"\u6253\u5F00\u72B6\u6001\u5FEB\u7167";
+    case StatusPage::kVoiceControl:
+        return L"\u6253\u5F00\u65E5\u5FD7";
+    case StatusPage::kDisplay:
+        if (state->virtual_camera_controller.starting()) {
+            return L"\u542F\u52A8\u4E2D";
+        }
+        if (state->virtual_camera_controller.running()) {
+            return L"\u5173\u95ED\u865A\u62DF\u6444\u50CF\u5934";
+        }
+        if (state->virtual_camera_controller.installed()) {
+            return L"\u542F\u52A8\u865A\u62DF\u6444\u50CF\u5934";
+        }
+        return L"\u5B89\u88C5\u865A\u62DF\u6444\u50CF\u5934";
+    case StatusPage::kDiagnostics:
+        return L"\u6253\u5F00\u6295\u5C4F\u7A97\u53E3";
+    case StatusPage::kOverview:
+    default:
+        return L"\u6253\u5F00\u8BED\u97F3\u9875";
+    }
+}
+
+std::wstring TertiaryActionButtonText(const AppState* state) {
+    if (state == nullptr) {
+        return L"";
+    }
+
+    switch (state->current_page) {
+    case StatusPage::kConnect:
+        return L"\u6253\u5F00\u72B6\u6001\u5FEB\u7167";
+    case StatusPage::kDisplay:
+        return L"\u6309\u6E90\u753B\u8D28\u663E\u793A";
+    case StatusPage::kVoiceControl:
+        return L"\u6253\u5F00\u76EE\u5F55";
+    case StatusPage::kDiagnostics:
+        return L"\u6253\u5F00\u72B6\u6001\u5FEB\u7167";
+    case StatusPage::kLogs:
+        return L"\u6253\u5F00\u76EE\u5F55";
+    case StatusPage::kOverview:
+    default:
+        return L"\u6253\u5F00\u65E5\u5FD7";
+    }
+}
+
+bool SecondaryActionEnabled(const AppState* state) {
+    if (state == nullptr) {
+        return false;
+    }
+
+    switch (state->current_page) {
+    case StatusPage::kConnect:
+        return state->airplay_controller.installed() || state->airplay_controller.running();
+    case StatusPage::kDisplay:
+        return !state->virtual_camera_tool_path.empty() && !state->virtual_camera_controller.starting();
+    case StatusPage::kVoiceControl:
+        return !state->log_file_path.empty();
+    case StatusPage::kLogs:
+        return !state->status_file_path.empty();
+    case StatusPage::kDiagnostics:
+        return state->video_window != nullptr;
+    case StatusPage::kOverview:
+    default:
+        return true;
+    }
+}
+
+bool TertiaryActionEnabled(const AppState* state) {
+    if (state == nullptr) {
+        return false;
+    }
+
+    switch (state->current_page) {
+    case StatusPage::kConnect:
+        return !state->status_file_path.empty();
+    case StatusPage::kDisplay:
+        return state->video_window != nullptr && state->has_selected_profile;
+    case StatusPage::kVoiceControl:
+        return true;
+    case StatusPage::kDiagnostics:
+        return !state->status_file_path.empty();
+    case StatusPage::kLogs:
+        return true;
+    case StatusPage::kOverview:
+    default:
+        return !state->log_file_path.empty();
+    }
+}
+
+void UpdateActionButtons(AppState* state) {
+    if (state == nullptr) {
         return;
     }
 
-    const std::wstring text = PresentationModeButtonText(state->presentation_mode);
-    SetWindowTextW(state->presentation_mode_button, text.c_str());
-    EnableWindow(state->presentation_mode_button, FALSE);
+    if (state->focus_video_button != nullptr) {
+        const std::wstring text = PrimaryActionButtonText(state);
+        SetWindowTextW(state->focus_video_button, text.c_str());
+        EnableWindow(state->focus_video_button, TRUE);
+    }
+    if (state->presentation_mode_button != nullptr) {
+        const std::wstring text = SecondaryActionButtonText(state);
+        SetWindowTextW(state->presentation_mode_button, text.c_str());
+        EnableWindow(state->presentation_mode_button, SecondaryActionEnabled(state));
+    }
+    if (state->open_log_button != nullptr) {
+        const std::wstring text = TertiaryActionButtonText(state);
+        SetWindowTextW(state->open_log_button, text.c_str());
+        EnableWindow(state->open_log_button, TertiaryActionEnabled(state));
+    }
 }
 
 void ApplyPresentationMode(AppState* state, VideoRenderer::PresentationMode mode, bool log_change) {
@@ -460,7 +1188,7 @@ void ApplyPresentationMode(AppState* state, VideoRenderer::PresentationMode mode
     mode = VideoRenderer::PresentationMode::kLowLatency;
 
     if (state->presentation_mode == mode) {
-        UpdatePresentationModeButton(state);
+        UpdateActionButtons(state);
         return;
     }
 
@@ -469,7 +1197,7 @@ void ApplyPresentationMode(AppState* state, VideoRenderer::PresentationMode mode
     if (state->decoder != nullptr) {
         state->decoder->SetSmoothMode(false);
     }
-    UpdatePresentationModeButton(state);
+    UpdateActionButtons(state);
 
     if (log_change) {
         QueueLog(state, std::wstring(L"\u663e\u793a\u6a21\u5f0f: \u5df2\u5207\u6362\u5230") + PresentationModeLabel(mode) + L"\u3002");
@@ -527,6 +1255,172 @@ void ResetDashboardSnapshot(AppState* state) {
     }};
     state->dashboard.traffic_body = kTextTrafficInitial;
     state->dashboard.runtime_body = kTextRuntimeInitial;
+}
+
+void UpdateSessionSnapshot(
+    AppState* state,
+    const std::wstring& sender_host,
+    const std::wstring& device_name,
+    bool connected) {
+    if (state == nullptr) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state->session_mutex);
+        state->session.host = sender_host;
+        state->session.device_name = device_name;
+        state->session.control_connected = connected;
+        state->session.last_session_change_us = NowSteadyUs();
+        if (connected) {
+            state->session.session_started_us = state->session.last_session_change_us;
+        }
+    }
+
+    if (!connected && state->audio_player != nullptr) {
+        state->audio_player->Stop();
+    }
+
+    if (state->status_window != nullptr) {
+        PostMessageW(state->status_window, kStatsMessage, 0, 0);
+    }
+}
+
+protocol::StreamProfile CapStreamProfileTo60Fps(const protocol::StreamProfile& profile) {
+    protocol::StreamProfile normalized = profile;
+    if (normalized.fps > kMaxStreamFps) {
+        normalized.fps = kMaxStreamFps;
+    }
+    return normalized;
+}
+
+void PostApplyStreamProfileMessage(
+    AppState* state,
+    const protocol::StreamProfile& profile,
+    bool auto_resumed,
+    bool submit_cached_codec_config,
+    uint32_t cached_codec_config_frame_id,
+    std::vector<uint8_t> cached_codec_config,
+    bool log_auto_resume_notice) {
+    if (state == nullptr || state->status_window == nullptr) {
+        if (state != nullptr && auto_resumed) {
+            state->auto_resume_profile_message_pending.store(false);
+        }
+        return;
+    }
+
+    const protocol::StreamProfile capped_profile = CapStreamProfileTo60Fps(profile);
+
+    auto* message = new PendingStreamProfileMessage{
+        capped_profile,
+        auto_resumed,
+        submit_cached_codec_config,
+        cached_codec_config_frame_id,
+        std::move(cached_codec_config),
+        log_auto_resume_notice};
+    if (!PostMessageW(
+            state->status_window,
+            kApplyStreamProfileMessage,
+            0,
+            reinterpret_cast<LPARAM>(message))) {
+        if (auto_resumed) {
+            state->auto_resume_profile_message_pending.store(false);
+        }
+        delete message;
+        QueueLog(state, L"\u63A5\u6536\u7AEF: \u6295\u5C4F\u914D\u7F6E\u5207\u6362\u6D88\u606F\u6295\u9012\u5931\u8D25\u3002");
+    }
+}
+
+void PostSessionUpdateMessage(
+    AppState* state,
+    const std::wstring& sender_host,
+    const std::wstring& device_name,
+    bool connected) {
+    if (state == nullptr || state->status_window == nullptr) {
+        return;
+    }
+
+    auto* message = new PendingSessionUpdateMessage{sender_host, device_name, connected};
+    if (!PostMessageW(
+            state->status_window,
+            kSessionUpdateMessage,
+            0,
+            reinterpret_cast<LPARAM>(message))) {
+        delete message;
+        QueueLog(state, L"\u63A5\u6536\u7AEF: \u4F1A\u8BDD\u72B6\u6001\u6D88\u606F\u6295\u9012\u5931\u8D25\u3002");
+    }
+}
+
+void NavigateToPage(AppState* state, StatusPage page) {
+    if (state == nullptr || state->current_page == page) {
+        return;
+    }
+
+    state->current_page = page;
+    UpdateActionButtons(state);
+    if (state->status_window != nullptr) {
+        RedrawWindow(
+            state->status_window,
+            nullptr,
+            nullptr,
+            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    }
+}
+
+void SetEmbeddedWebUiMode(AppState* state, bool enabled) {
+    if (state == nullptr) {
+        return;
+    }
+
+    state->web_ui_ready = enabled;
+    for (HWND button : state->nav_buttons) {
+        if (button != nullptr) {
+            ShowWindow(button, enabled ? SW_HIDE : SW_SHOW);
+        }
+    }
+    if (state->focus_video_button != nullptr) {
+        ShowWindow(state->focus_video_button, enabled ? SW_HIDE : SW_SHOW);
+    }
+    if (state->presentation_mode_button != nullptr) {
+        ShowWindow(state->presentation_mode_button, enabled ? SW_HIDE : SW_SHOW);
+    }
+    if (state->open_log_button != nullptr) {
+        ShowWindow(state->open_log_button, enabled ? SW_HIDE : SW_SHOW);
+    }
+    if (state->log_view != nullptr) {
+        ShowWindow(state->log_view, enabled ? SW_HIDE : (ShouldShowLogView(state->current_page) ? SW_SHOW : SW_HIDE));
+    }
+
+    InvalidateRect(state->status_window, nullptr, TRUE);
+}
+
+void DestroyNativeStatusControls(AppState* state) {
+    if (state == nullptr) {
+        return;
+    }
+
+    for (HWND& button : state->nav_buttons) {
+        if (button != nullptr && IsWindow(button)) {
+            DestroyWindow(button);
+        }
+        button = nullptr;
+    }
+    if (state->focus_video_button != nullptr && IsWindow(state->focus_video_button)) {
+        DestroyWindow(state->focus_video_button);
+    }
+    state->focus_video_button = nullptr;
+    if (state->presentation_mode_button != nullptr && IsWindow(state->presentation_mode_button)) {
+        DestroyWindow(state->presentation_mode_button);
+    }
+    state->presentation_mode_button = nullptr;
+    if (state->open_log_button != nullptr && IsWindow(state->open_log_button)) {
+        DestroyWindow(state->open_log_button);
+    }
+    state->open_log_button = nullptr;
+    if (state->log_view != nullptr && IsWindow(state->log_view)) {
+        DestroyWindow(state->log_view);
+    }
+    state->log_view = nullptr;
 }
 
 void FocusVideoWindow(AppState* state) {
@@ -686,27 +1580,379 @@ void OpenLogFile(AppState* state) {
     ShellExecuteW(state->status_window, L"open", state->log_file_path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
+void OpenStatusSnapshotFile(AppState* state) {
+    if (state == nullptr || state->status_file_path.empty()) {
+        return;
+    }
+    ShellExecuteW(state->status_window, L"open", state->status_file_path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+void OpenOutputDirectory(AppState* state) {
+    if (state == nullptr) {
+        return;
+    }
+    const std::wstring directory = GetExecutableDirectory();
+    if (directory.empty()) {
+        return;
+    }
+    ShellExecuteW(state->status_window, L"open", directory.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+void OpenDirectoryPath(AppState* state, const std::wstring& directory) {
+    if (state == nullptr || directory.empty()) {
+        return;
+    }
+    ShellExecuteW(state->status_window, L"open", directory.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+void OpenVoiceMusicDirectory(AppState* state) {
+    if (state == nullptr) {
+        return;
+    }
+    if (state->voice_music_root_path.empty()) {
+        state->voice_control_status = L"点歌目录不可用";
+        QueueLog(state, L"语音点歌：打开点歌目录失败，目录为空。");
+        return;
+    }
+    EnsureDirectoryPath(state->voice_music_root_path);
+    OpenDirectoryPath(state, state->voice_music_root_path);
+    state->voice_control_status = L"已打开点歌目录";
+    QueueLog(state, std::wstring(L"语音点歌：已打开点歌目录：") + state->voice_music_root_path);
+}
+
+void OpenVoiceModelDirectory(AppState* state) {
+    if (state == nullptr) {
+        return;
+    }
+    if (state->voice_model_path.empty()) {
+        state->voice_control_status = L"语音模型目录不可用";
+        QueueLog(state, L"语音控制：打开模型目录失败，模型目录为空。");
+        return;
+    }
+    OpenDirectoryPath(state, state->voice_model_path);
+    state->voice_control_status = L"已打开语音模型目录";
+    QueueLog(state, std::wstring(L"语音控制：已打开模型目录：") + state->voice_model_path);
+}
+
+void RefreshVoiceMusicLibrary(AppState* state) {
+    if (state == nullptr) {
+        return;
+    }
+    EnsureVoiceMusicScaffold(state);
+    if (state->voice_music_library == nullptr) {
+        state->voice_control_status = L"刷新点歌目录失败";
+        QueueLog(state, L"语音点歌：刷新失败，曲库未初始化。");
+        return;
+    }
+    if (!state->voice_music_library->RefreshIndex()) {
+        state->voice_control_status = L"刷新点歌目录失败";
+        QueueLog(state, L"语音点歌：刷新点歌目录失败。");
+        return;
+    }
+    state->voice_control_status = L"已刷新点歌目录";
+    QueueLog(state, std::wstring(L"语音点歌：已刷新点歌目录：") + state->voice_music_root_path);
+    RefreshVoiceRecognitionContext(state, true, true);
+}
+
+void StopLocalMusicPlayback(AppState* state) {
+    if (state == nullptr || state->local_music_player == nullptr) {
+        return;
+    }
+    if (!state->local_music_player->running()) {
+        state->voice_control_status = L"当前没有正在播放的点歌";
+        QueueLog(state, L"语音点歌：停止播放已忽略，当前没有本地点歌在播放。");
+        return;
+    }
+
+    const std::wstring current_file = state->local_music_player->current_file();
+    state->local_music_player->Stop();
+    if (current_file.empty()) {
+        state->voice_control_status = L"已停止点歌播放";
+        QueueLog(state, L"语音点歌：已停止当前播放。");
+        return;
+    }
+
+    const std::wstring current_name = ExtractFileName(current_file);
+    state->voice_control_status = std::wstring(L"已停止播放：") + current_name;
+    QueueLog(state, std::wstring(L"语音点歌：已停止播放“") + current_name + L"”。");
+}
+
+void ExecuteEmbeddedWebUiAction(
+    AppState* state,
+    const std::wstring& action,
+    const std::wstring& value,
+    const std::wstring& extra) {
+    if (state == nullptr || action.empty()) {
+        return;
+    }
+
+    if (action == L"dragWindow") {
+        if (state->status_window != nullptr) {
+            ReleaseCapture();
+            SendMessageW(state->status_window, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+        }
+        return;
+    }
+    if (action == L"minimizeWindow") {
+        if (state->status_window != nullptr) {
+            ShowWindow(state->status_window, SW_MINIMIZE);
+        }
+        return;
+    }
+    if (action == L"closeWindow") {
+        if (state->status_window != nullptr) {
+            PostMessageW(state->status_window, WM_CLOSE, 0, 0);
+        }
+        return;
+    }
+    if (action == L"focusVideoWindow") {
+        FocusVideoWindow(state);
+        QueueLog(state, L"内嵌前端：已执行“聚焦投屏窗口”。");
+        return;
+    }
+    if (action == L"toggleVoiceControl") {
+        if (state->voice_control_enabled) {
+            StopVoiceControl(state, true);
+        } else {
+            StartVoiceControl(state);
+        }
+        QueueLog(state, L"内嵌前端：已执行“切换语音控制”。");
+        return;
+    }
+    if (action == L"toggleAirPlay") {
+        if (state->airplay_controller.running()) {
+            StopAirPlayReceiver(state, true);
+        } else {
+            StartAirPlayReceiver(state, false);
+        }
+        QueueLog(state, L"内嵌前端：已执行“切换苹果投屏”。");
+        return;
+    }
+    if (action == L"toggleVirtualCamera") {
+        if (state->virtual_camera_controller.running()) {
+            StopVirtualCamera(state, true);
+        } else if (!state->virtual_camera_controller.installed()) {
+            InstallVirtualCamera(state);
+        } else {
+            StartVirtualCamera(state);
+        }
+        QueueLog(state, L"内嵌前端：已执行“切换虚拟摄像头”。");
+        return;
+    }
+    if (action == L"openLogFile") {
+        OpenLogFile(state);
+        QueueLog(state, L"内嵌前端：已执行“打开日志文件”。");
+        return;
+    }
+    if (action == L"openOutputDirectory") {
+        OpenOutputDirectory(state);
+        QueueLog(state, L"内嵌前端：已执行“打开接收端目录”。");
+        return;
+    }
+    if (action == L"openVoiceMusicDirectory") {
+        OpenVoiceMusicDirectory(state);
+        QueueLog(state, L"内嵌前端：已执行“打开点歌目录”。");
+        return;
+    }
+    if (action == L"openVoiceModelDirectory") {
+        OpenVoiceModelDirectory(state);
+        QueueLog(state, L"内嵌前端：已执行“打开语音模型目录”。");
+        return;
+    }
+    if (action == L"refreshVoiceMusicLibrary") {
+        RefreshVoiceMusicLibrary(state);
+        QueueLog(state, L"内嵌前端：已执行“刷新点歌目录”。");
+        return;
+    }
+    if (action == L"stopLocalMusicPlayback") {
+        StopLocalMusicPlayback(state);
+        QueueLog(state, L"内嵌前端：已执行“停止当前点歌”。");
+        return;
+    }
+    if (action == L"createVoiceMusicProject") {
+        ExecuteVoiceMusicProjectCreate(state, value, extra);
+        return;
+    }
+    if (action == L"selectDanmakuRegion") {
+        if (state->danmaku_controller != nullptr) {
+            state->danmaku_controller->SelectRegion();
+            UpdateStatusLabel(state);
+        }
+        return;
+    }
+    if (action == L"toggleDanmakuRecognition") {
+        if (state->danmaku_controller != nullptr) {
+            const auto snapshot = state->danmaku_controller->GetSnapshot();
+            if (snapshot.running) {
+                state->danmaku_controller->Stop();
+            } else {
+                state->danmaku_controller->Start();
+            }
+            UpdateStatusLabel(state);
+        }
+        return;
+    }
+    if (action == L"toggleDanmakuReminderBundle") {
+        if (state->danmaku_controller != nullptr) {
+            auto snapshot = state->danmaku_controller->GetSnapshot();
+            const bool reminder_bundle_enabled = snapshot.running && snapshot.reminder_enabled;
+            if (reminder_bundle_enabled) {
+                if (snapshot.speech_enabled) {
+                    state->danmaku_controller->ToggleSpeech();
+                    snapshot = state->danmaku_controller->GetSnapshot();
+                }
+                if (snapshot.reminder_enabled) {
+                    state->danmaku_controller->ToggleReminder();
+                }
+                if (snapshot.running) {
+                    state->danmaku_controller->Stop();
+                }
+            } else {
+                state->danmaku_controller->StartUiAutomationProbe();
+                if (!snapshot.running) {
+                    state->danmaku_controller->Start();
+                    snapshot = state->danmaku_controller->GetSnapshot();
+                }
+                if (!snapshot.reminder_enabled) {
+                    state->danmaku_controller->ToggleReminder();
+                }
+            }
+            UpdateStatusLabel(state);
+        }
+        return;
+    }
+    if (action == L"toggleDanmakuSpeechBundle") {
+        if (state->danmaku_controller != nullptr) {
+            auto snapshot = state->danmaku_controller->GetSnapshot();
+            const bool speech_bundle_enabled =
+                snapshot.running && snapshot.reminder_enabled && snapshot.speech_enabled;
+            if (speech_bundle_enabled) {
+                state->danmaku_controller->ToggleSpeech();
+            } else {
+                state->danmaku_controller->StartUiAutomationProbe();
+                if (!snapshot.running) {
+                    state->danmaku_controller->Start();
+                    snapshot = state->danmaku_controller->GetSnapshot();
+                }
+                if (!snapshot.reminder_enabled) {
+                    state->danmaku_controller->ToggleReminder();
+                    snapshot = state->danmaku_controller->GetSnapshot();
+                }
+                if (!snapshot.speech_enabled) {
+                    state->danmaku_controller->ToggleSpeech();
+                }
+            }
+            UpdateStatusLabel(state);
+        }
+        return;
+    }
+    if (action == L"toggleDanmakuReminder") {
+        if (state->danmaku_controller != nullptr) {
+            state->danmaku_controller->ToggleReminder();
+            UpdateStatusLabel(state);
+        }
+        return;
+    }
+    if (action == L"toggleDanmakuSpeech") {
+        if (state->danmaku_controller != nullptr) {
+            state->danmaku_controller->ToggleSpeech();
+            UpdateStatusLabel(state);
+        }
+        return;
+    }
+    if (action == L"cycleDanmakuSpeechVoice") {
+        if (state->danmaku_controller != nullptr) {
+            state->danmaku_controller->CycleSpeechVoice();
+            UpdateStatusLabel(state);
+        }
+        return;
+    }
+    if (action == L"probeDanmakuUi") {
+        if (state->danmaku_controller != nullptr) {
+            state->danmaku_controller->StartUiAutomationProbe();
+            UpdateStatusLabel(state);
+        }
+        return;
+    }
+    if (action == L"testDanmakuFrame") {
+        if (state->danmaku_controller != nullptr) {
+            state->danmaku_controller->TestRecognizeFrame();
+            UpdateStatusLabel(state);
+        }
+        return;
+    }
+    if (action == L"clearDanmakuResults") {
+        if (state->danmaku_controller != nullptr) {
+            state->danmaku_controller->ClearRecentEvents();
+            UpdateStatusLabel(state);
+        }
+        return;
+    }
+    if (action == L"openDanmakuCaptureFolder") {
+        OpenDirectoryPath(state, state->danmaku_capture_root_path);
+        QueueLog(state, L"\u5185\u5d4c\u524d\u7aef\uff1a\u5df2\u6267\u884c\u201c\u6253\u5f00\u5f39\u5e55\u622a\u56fe\u76ee\u5f55\u201d\u3002");
+        return;
+    }
+    if (action == L"requestKeyframe") {
+        RequestKeyframe(state);
+        QueueLog(state, L"内嵌前端：已执行“请求关键帧”。");
+        return;
+    }
+}
+
+void RequestKeyframe(AppState* state) {
+    if (state == nullptr || state->control_server == nullptr) {
+        return;
+    }
+
+    if (!state->control_server->RequestIdr()) {
+        QueueLog(state, L"\u63A7\u5236\u670D\u52A1: \u5F53\u524D\u6CA1\u6709\u6D3B\u8DC3\u4F1A\u8BDD\uFF0C\u65E0\u6CD5\u8BF7\u6C42\u5173\u952E\u5E27\u3002");
+    }
+}
+
 void ApplyWindowBackdrop(HWND hwnd) {
     if (hwnd == nullptr) {
         return;
     }
 
+    constexpr DWORD kDwmUseImmersiveDarkMode = 20;
+    constexpr DWORD kDwmUseImmersiveDarkModeLegacy = 19;
     constexpr DWORD kDwmWindowCornerPreference = 33;
+    constexpr DWORD kDwmBorderColor = 34;
     constexpr DWORD kDwmSystemBackdropType = 38;
     constexpr int kWindowCornerRound = 2;
     constexpr int kBackdropTransientWindow = 3;
+    constexpr DWORD kDwmColorNone = 0xFFFFFFFEu;
 
     const HMODULE dwmapi = LoadLibraryW(L"dwmapi.dll");
     if (dwmapi == nullptr) {
         return;
     }
 
+    struct DwmMargins {
+        int cxLeftWidth;
+        int cxRightWidth;
+        int cyTopHeight;
+        int cyBottomHeight;
+    };
+
     using DwmSetWindowAttributeFn = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+    using DwmExtendFrameIntoClientAreaFn = HRESULT(WINAPI*)(HWND, const DwmMargins*);
     const auto set_window_attribute =
         reinterpret_cast<DwmSetWindowAttributeFn>(GetProcAddress(dwmapi, "DwmSetWindowAttribute"));
+    const auto extend_frame =
+        reinterpret_cast<DwmExtendFrameIntoClientAreaFn>(GetProcAddress(dwmapi, "DwmExtendFrameIntoClientArea"));
     if (set_window_attribute != nullptr) {
+        const BOOL dark_mode = TRUE;
+        set_window_attribute(hwnd, kDwmUseImmersiveDarkMode, &dark_mode, sizeof(dark_mode));
+        set_window_attribute(hwnd, kDwmUseImmersiveDarkModeLegacy, &dark_mode, sizeof(dark_mode));
         set_window_attribute(hwnd, kDwmWindowCornerPreference, &kWindowCornerRound, sizeof(kWindowCornerRound));
+        set_window_attribute(hwnd, kDwmBorderColor, &kDwmColorNone, sizeof(kDwmColorNone));
         set_window_attribute(hwnd, kDwmSystemBackdropType, &kBackdropTransientWindow, sizeof(kBackdropTransientWindow));
+    }
+    if (extend_frame != nullptr) {
+        const DwmMargins margins{-1, -1, -1, -1};
+        extend_frame(hwnd, &margins);
     }
     FreeLibrary(dwmapi);
 }
@@ -715,6 +1961,25 @@ void FillRoundedRect(HDC dc, const RECT& rect, int radius, COLORREF fill_color, 
     const HGDIOBJ old_brush = SelectObject(dc, GetStockObject(DC_BRUSH));
     const HGDIOBJ old_pen = SelectObject(dc, GetStockObject(DC_PEN));
     SetDCBrushColor(dc, fill_color);
+    // 加粗边框，让卡片更明显
+    SetDCPenColor(dc, border_color);
+    RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
+    
+    // 添加内边框，增强视觉效果
+    HPEN inner_pen = CreatePen(PS_SOLID, 2, border_color);
+    HGDIOBJ old_inner_pen = SelectObject(dc, inner_pen);
+    SetDCBrushColor(dc, RGB(0, 0, 0)); // 透明填充
+    RoundRect(dc, rect.left + 1, rect.top + 1, rect.right - 1, rect.bottom - 1, radius - 1, radius - 1);
+    SelectObject(dc, old_inner_pen);
+    DeleteObject(inner_pen);
+    
+    SelectObject(dc, old_pen);
+    SelectObject(dc, old_brush);
+}
+
+void StrokeRoundedRect(HDC dc, const RECT& rect, int radius, COLORREF border_color) {
+    const HGDIOBJ old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    const HGDIOBJ old_pen = SelectObject(dc, GetStockObject(DC_PEN));
     SetDCPenColor(dc, border_color);
     RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
     SelectObject(dc, old_pen);
@@ -747,34 +2012,36 @@ void DrawSoftShadow(AppState* state, HDC dc, const RECT& rect, int radius, int b
     }
 
     RECT far_shadow = rect;
-    OffsetRect(&far_shadow, 0, ScaleByDpi(state->status_window, base_offset));
-    InflateRect(&far_shadow, ScaleByDpi(state->status_window, 2), ScaleByDpi(state->status_window, 3));
+    OffsetRect(&far_shadow, 0, ScaleByDpi(state->status_window, std::max(3, base_offset)));
+    InflateRect(&far_shadow, ScaleByDpi(state->status_window, 6), ScaleByDpi(state->status_window, 7));
     FillRoundedRect(
         dc,
         far_shadow,
-        radius + ScaleByDpi(state->status_window, 10),
+        radius + ScaleByDpi(state->status_window, 12),
         kColorShadowFar,
         kColorShadowFar);
 
     RECT near_shadow = rect;
-    OffsetRect(&near_shadow, 0, ScaleByDpi(state->status_window, std::max(2, base_offset / 2)));
-    InflateRect(&near_shadow, ScaleByDpi(state->status_window, 1), ScaleByDpi(state->status_window, 1));
+    OffsetRect(&near_shadow, 0, ScaleByDpi(state->status_window, std::max(1, base_offset / 2)));
+    InflateRect(&near_shadow, ScaleByDpi(state->status_window, 2), ScaleByDpi(state->status_window, 3));
     FillRoundedRect(
         dc,
         near_shadow,
-        radius + ScaleByDpi(state->status_window, 4),
+        radius + ScaleByDpi(state->status_window, 5),
         kColorShadowNear,
         kColorShadowNear);
 }
 
 void DrawGlassCard(AppState* state, HDC dc, const RECT& rect, int radius, COLORREF fill_color, COLORREF border_color, int shadow_offset) {
-    DrawSoftShadow(state, dc, rect, radius, shadow_offset);
+    // 增强阴影效果，制造悬浮感
+    if (shadow_offset > 0) {
+        // 绘制多层阴影，增强深度感
+        DrawSoftShadow(state, dc, rect, radius, shadow_offset + 2);
+        DrawSoftShadow(state, dc, rect, radius, shadow_offset);
+    }
+    
+    // 绘制卡片背景和边框
     FillRoundedRect(dc, rect, radius, fill_color, border_color);
-
-    const int glow_height = std::max(ScaleByDpi(state->status_window, 18), RectHeight(rect) / 4);
-    RECT top_glow = rect;
-    top_glow.bottom = std::min(rect.bottom, rect.top + glow_height);
-    FillRoundedRect(dc, top_glow, radius, RGB(255, 255, 255), RGB(255, 255, 255));
 }
 
 void DrawGlassBackdrop(AppState* state, HDC dc, const RECT& client_rect) {
@@ -782,25 +2049,42 @@ void DrawGlassBackdrop(AppState* state, HDC dc, const RECT& client_rect) {
         return;
     }
 
-    RECT glow_blue = MakeRect(
-        client_rect.left - ScaleByDpi(state->status_window, 120),
-        client_rect.top - ScaleByDpi(state->status_window, 60),
-        client_rect.left + ScaleByDpi(state->status_window, 260),
-        client_rect.top + ScaleByDpi(state->status_window, 260));
-    RECT glow_pink = MakeRect(
-        client_rect.right - ScaleByDpi(state->status_window, 320),
-        client_rect.top + ScaleByDpi(state->status_window, 20),
-        client_rect.right + ScaleByDpi(state->status_window, 40),
-        client_rect.top + ScaleByDpi(state->status_window, 320));
-    RECT glow_mint = MakeRect(
-        client_rect.left + ScaleByDpi(state->status_window, 80),
-        client_rect.bottom - ScaleByDpi(state->status_window, 260),
-        client_rect.left + ScaleByDpi(state->status_window, 420),
+    if (state->web_ui_ready) {
+        RECT left_glow = MakeRect(
+            client_rect.left - ScaleByDpi(state->status_window, 220),
+            client_rect.top - ScaleByDpi(state->status_window, 120),
+            client_rect.left + ScaleByDpi(state->status_window, 380),
+            client_rect.bottom + ScaleByDpi(state->status_window, 180));
+        RECT left_edge = MakeRect(
+            client_rect.left - ScaleByDpi(state->status_window, 80),
+            client_rect.top - ScaleByDpi(state->status_window, 90),
+            client_rect.left + ScaleByDpi(state->status_window, 260),
+            client_rect.top + ScaleByDpi(state->status_window, 220));
+        RECT grounding = MakeRect(
+            client_rect.left - ScaleByDpi(state->status_window, 120),
+            client_rect.bottom - ScaleByDpi(state->status_window, 180),
+            client_rect.left + ScaleByDpi(state->status_window, 320),
+            client_rect.bottom + ScaleByDpi(state->status_window, 90));
+
+        FillEllipseColor(dc, left_glow, kColorEmbeddedGlassGlowLeft);
+        FillEllipseColor(dc, left_edge, kColorEmbeddedGlassGlowEdge);
+        FillEllipseColor(dc, grounding, kColorEmbeddedGlassGlowGround);
+        return;
+    }
+
+    RECT highlight = MakeRect(
+        client_rect.right - ScaleByDpi(state->status_window, 480),
+        client_rect.top - ScaleByDpi(state->status_window, 120),
+        client_rect.right + ScaleByDpi(state->status_window, 120),
+        client_rect.top + ScaleByDpi(state->status_window, 300));
+    RECT grounding = MakeRect(
+        client_rect.left - ScaleByDpi(state->status_window, 160),
+        client_rect.bottom - ScaleByDpi(state->status_window, 240),
+        client_rect.left + ScaleByDpi(state->status_window, 360),
         client_rect.bottom + ScaleByDpi(state->status_window, 60));
 
-    FillEllipseColor(dc, glow_blue, kColorGlassGlowBlue);
-    FillEllipseColor(dc, glow_pink, kColorGlassGlowPink);
-    FillEllipseColor(dc, glow_mint, kColorGlassGlowMint);
+    FillEllipseColor(dc, highlight, kColorGlassGlowBlue);
+    FillEllipseColor(dc, grounding, kColorGlassGlowMint);
 }
 
 void DrawTextBlock(HDC dc, HFONT font, const std::wstring& text, RECT rect, COLORREF color, UINT format) {
@@ -816,6 +2100,40 @@ void DrawTextBlock(HDC dc, HFONT font, const std::wstring& text, RECT rect, COLO
     }
 }
 
+int MeasureTextBlockHeight(HDC dc, HFONT font, const std::wstring& text, int width, UINT format) {
+    if (dc == nullptr || text.empty()) {
+        return 0;
+    }
+
+    RECT rect{0, 0, std::max(1, width), 0};
+    HGDIOBJ old_font = nullptr;
+    if (font != nullptr) {
+        old_font = SelectObject(dc, font);
+    }
+    DrawTextW(dc, text.c_str(), -1, &rect, format | DT_CALCRECT);
+    if (old_font != nullptr) {
+        SelectObject(dc, old_font);
+    }
+    return std::max(0L, rect.bottom - rect.top);
+}
+
+int MeasureSingleLineTextWidth(HDC dc, HFONT font, const std::wstring& text) {
+    if (dc == nullptr || text.empty()) {
+        return 0;
+    }
+
+    RECT rect{0, 0, 0, 0};
+    HGDIOBJ old_font = nullptr;
+    if (font != nullptr) {
+        old_font = SelectObject(dc, font);
+    }
+    DrawTextW(dc, text.c_str(), -1, &rect, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_CALCRECT);
+    if (old_font != nullptr) {
+        SelectObject(dc, old_font);
+    }
+    return std::max(0L, rect.right - rect.left);
+}
+
 StatusWindowLayout CalculateStatusWindowLayout(AppState* state) {
     StatusWindowLayout layout{};
     if (state == nullptr || state->status_window == nullptr) {
@@ -827,25 +2145,65 @@ StatusWindowLayout CalculateStatusWindowLayout(AppState* state) {
     const int width = std::max(1, RectWidth(client_rect));
     const int height = std::max(1, RectHeight(client_rect));
 
-    const int padding = ScaleByDpi(state->status_window, 20);
+    const int padding = ScaleByDpi(state->status_window, 16);
     const int gap = ScaleByDpi(state->status_window, 16);
-    const int hero_height = ScaleByDpi(state->status_window, 148);
-    const int summary_height = ScaleByDpi(state->status_window, 176);
-    const int detail_preferred_height = ScaleByDpi(state->status_window, 176);
-    const int detail_min_height = ScaleByDpi(state->status_window, 136);
-    const int log_min_height = ScaleByDpi(state->status_window, 250);
+    const int topbar_height = ScaleByDpi(state->status_window, 84);
+    const int sidebar_width = ScaleByDpi(state->status_window, 228);
+    const int hero_height = ScaleByDpi(state->status_window, 224);
+    const int summary_height = ScaleByDpi(state->status_window, 164);
     const int hero_inner_padding = ScaleByDpi(state->status_window, 24);
-    const int button_width = ScaleByDpi(state->status_window, 150);
+    const int button_width = ScaleByDpi(state->status_window, 146);
     const int button_height = ScaleByDpi(state->status_window, 42);
     const int button_gap = ScaleByDpi(state->status_window, 12);
+    const int nav_height = ScaleByDpi(state->status_window, 46);
 
-    layout.hero = MakeRect(padding, padding, width - padding, padding + hero_height);
+    layout.shell = MakeRect(padding, padding, width - padding, height - padding);
+    layout.topbar = MakeRect(
+        layout.shell.left + padding,
+        layout.shell.top + padding,
+        layout.shell.right - padding,
+        layout.shell.top + padding + topbar_height);
+    layout.sidebar = MakeRect(
+        layout.shell.left + padding,
+        layout.topbar.bottom + gap,
+        layout.shell.left + padding + sidebar_width,
+        layout.shell.bottom - padding);
+    layout.content = MakeRect(
+        layout.sidebar.right + gap,
+        layout.topbar.bottom + gap,
+        layout.shell.right - padding,
+        layout.shell.bottom - padding);
 
-    const int button_top = layout.hero.top + hero_inner_padding;
+    const int nav_padding = ScaleByDpi(state->status_window, 14);
+    const int nav_gap = ScaleByDpi(state->status_window, 8);
+    int nav_top = layout.sidebar.top + ScaleByDpi(state->status_window, 68);
+    for (size_t index = 0; index < layout.nav_buttons.size(); ++index) {
+        layout.nav_buttons[index] = MakeRect(
+            layout.sidebar.left + nav_padding,
+            nav_top,
+            layout.sidebar.right - nav_padding,
+            nav_top + nav_height);
+        nav_top += nav_height + nav_gap;
+    }
+
+    const int content_width = RectWidth(layout.content);
+    const int hero_main_width = std::max(ScaleByDpi(state->status_window, 380), content_width * 56 / 100);
+    layout.hero_main = MakeRect(
+        layout.content.left,
+        layout.content.top,
+        layout.content.left + hero_main_width,
+        layout.content.top + hero_height);
+    layout.hero_side = MakeRect(
+        layout.hero_main.right + gap,
+        layout.content.top,
+        layout.content.right,
+        layout.content.top + hero_height);
+
+    const int button_top = layout.hero_main.bottom - hero_inner_padding - button_height;
     layout.open_log_button = MakeRect(
-        layout.hero.right - hero_inner_padding - button_width,
+        layout.hero_main.right - hero_inner_padding - button_width,
         button_top,
-        layout.hero.right - hero_inner_padding,
+        layout.hero_main.right - hero_inner_padding,
         button_top + button_height);
     layout.mode_button = MakeRect(
         layout.open_log_button.left - button_gap - button_width,
@@ -858,86 +2216,81 @@ StatusWindowLayout CalculateStatusWindowLayout(AppState* state) {
         layout.mode_button.left - button_gap,
         button_top + button_height);
 
-    const int summary_top = layout.hero.bottom + gap;
-    const int summary_width = std::max(ScaleByDpi(state->status_window, 150), (width - padding * 2 - gap * 3) / 4);
+    const int summary_top = layout.hero_main.bottom + gap;
+    const int summary_width =
+        std::max(ScaleByDpi(state->status_window, 150), (RectWidth(layout.content) - gap * 3) / 4);
     for (size_t index = 0; index < layout.summary_cards.size(); ++index) {
-        const int left = padding + static_cast<int>(index) * (summary_width + gap);
+        const int left = layout.content.left + static_cast<int>(index) * (summary_width + gap);
         layout.summary_cards[index] = MakeRect(left, summary_top, left + summary_width, summary_top + summary_height);
     }
 
     const int detail_top = summary_top + summary_height + gap;
-    const int remaining_height = std::max(ScaleByDpi(state->status_window, 420), height - detail_top - padding);
-    int detail_height = detail_preferred_height;
-    if (remaining_height - detail_height - gap < log_min_height) {
-        detail_height = std::max(detail_min_height, remaining_height - gap - log_min_height);
-    }
-    detail_height = std::max(detail_min_height, detail_height);
-    const int detail_width = (width - padding * 2 - gap) / 2;
-    layout.traffic_card = MakeRect(padding, detail_top, padding + detail_width, detail_top + detail_height);
-    layout.runtime_card = MakeRect(
-        layout.traffic_card.right + gap,
+    layout.detail_full = MakeRect(layout.content.left, detail_top, layout.content.right, layout.content.bottom);
+    const int detail_left_width = std::max(ScaleByDpi(state->status_window, 360), (RectWidth(layout.content) - gap) * 58 / 100);
+    layout.detail_left = MakeRect(
+        layout.content.left,
         detail_top,
-        layout.traffic_card.right + gap + detail_width,
-        detail_top + detail_height);
-
-    const int log_top = detail_top + detail_height + gap;
-    layout.log_card = MakeRect(padding, log_top, width - padding, height - padding);
+        layout.content.left + detail_left_width,
+        layout.content.bottom);
+    layout.detail_right = MakeRect(
+        layout.detail_left.right + gap,
+        detail_top,
+        layout.content.right,
+        layout.content.bottom);
 
     const int card_inner_padding = ScaleByDpi(state->status_window, 20);
-    const int log_title_height = ScaleByDpi(state->status_window, 26);
+    const int log_title_height = ScaleByDpi(state->status_window, 44);
+    const RECT log_host = ShouldUseWideLogView(state->current_page) ? layout.detail_full : layout.detail_left;
     layout.log_view = MakeRect(
-        layout.log_card.left + card_inner_padding,
-        layout.log_card.top + card_inner_padding + log_title_height + ScaleByDpi(state->status_window, 10),
-        layout.log_card.right - card_inner_padding,
-        layout.log_card.bottom - card_inner_padding);
+        log_host.left + card_inner_padding,
+        log_host.top + card_inner_padding + log_title_height + ScaleByDpi(state->status_window, 10),
+        log_host.right - card_inner_padding,
+        log_host.bottom - card_inner_padding);
     return layout;
 }
 
 void DrawPill(HDC dc, HFONT font, const RECT& rect, const std::wstring& text, COLORREF fill_color, COLORREF text_color) {
     FillRoundedRect(dc, rect, RectHeight(rect), fill_color, fill_color);
     RECT text_rect = rect;
-    DrawTextBlock(dc, font, text, text_rect, text_color, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    text_rect.left += 14;
+    text_rect.right -= 14;
+    DrawTextBlock(dc, font, text, text_rect, text_color, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
 void DrawBrandGlyph(HDC dc, const RECT& rect) {
-    const int radius = std::max(16, RectHeight(rect) / 4);
-    FillRoundedRect(dc, rect, radius, RGB(226, 236, 255), RGB(255, 255, 255));
+    const HMODULE instance = GetModuleHandleW(nullptr);
+    if (instance != nullptr) {
+        HICON icon = LoadAppIconHandle(instance, std::max(16, std::min(RectWidth(rect), RectHeight(rect))));
+        if (icon != nullptr) {
+            DrawIconEx(
+                dc,
+                rect.left,
+                rect.top,
+                icon,
+                RectWidth(rect),
+                RectHeight(rect),
+                0,
+                nullptr,
+                DI_NORMAL);
+            DestroyIcon(icon);
+            return;
+        }
+    }
 
-    RECT glow_rect = MakeRect(
-        rect.left - RectWidth(rect) / 8,
-        rect.top - RectHeight(rect) / 7,
-        rect.left + RectWidth(rect) * 3 / 4,
-        rect.top + RectHeight(rect) * 3 / 5);
-    FillEllipseColor(dc, glow_rect, RGB(245, 249, 255));
-
-    const int width = RectWidth(rect);
-    const int height = RectHeight(rect);
-    const int left = rect.left;
-    const int top = rect.top;
-
-    POINT brand_z[] = {
-        {left + width * 20 / 100, top + height * 20 / 100},
-        {left + width * 80 / 100, top + height * 20 / 100},
-        {left + width * 47 / 100, top + height * 49 / 100},
-        {left + width * 72 / 100, top + height * 49 / 100},
-        {left + width * 33 / 100, top + height * 80 / 100},
-        {left + width * 79 / 100, top + height * 80 / 100},
-        {left + width * 79 / 100, top + height * 89 / 100},
-        {left + width * 20 / 100, top + height * 89 / 100},
-        {left + width * 52 / 100, top + height * 58 / 100},
-        {left + width * 20 / 100, top + height * 58 / 100},
-    };
-    FillPolygonColor(dc, brand_z, static_cast<int>(_countof(brand_z)), RGB(79, 114, 255), RGB(79, 114, 255));
+    const int radius = std::max(14, RectHeight(rect) / 4);
+    FillRoundedRect(dc, rect, radius, kColorWhite, kColorTopbarBorder);
+    RECT fallback = InsetRectCopy(rect, std::max(6, RectWidth(rect) / 5), std::max(6, RectHeight(rect) / 5));
+    FillRoundedRect(dc, fallback, std::max(8, RectHeight(fallback) / 4), kColorAccent, kColorAccent);
 }
 
 void DrawSummaryCard(AppState* state, HDC dc, const RECT& rect, const DashboardCard& card, bool accent_style) {
-    const int radius = ScaleByDpi(state->status_window, 22);
-    const int inner_padding = ScaleByDpi(state->status_window, 20);
-    const COLORREF fill_color = accent_style ? kColorHeroBackground : kColorCardBackground;
-    const COLORREF border_color = accent_style ? RGB(232, 240, 255) : kColorBorder;
+    const int radius = ScaleByDpi(state->status_window, 16);
+    const int inner_padding = ScaleByDpi(state->status_window, 22);
+    const COLORREF fill_color = accent_style ? RGB(250, 252, 255) : kColorCardBackground;
+    const COLORREF border_color = accent_style ? BlendColor(kColorAccent, kColorWhite, 92) : kColorBorder;
     const COLORREF value_color = accent_style ? kColorAccent : kColorTextPrimary;
 
-    DrawGlassCard(state, dc, rect, radius, fill_color, border_color, 9);
+    DrawGlassCard(state, dc, rect, radius, fill_color, border_color, 6);
 
     RECT title_rect = MakeRect(
         rect.left + inner_padding,
@@ -946,16 +2299,26 @@ void DrawSummaryCard(AppState* state, HDC dc, const RECT& rect, const DashboardC
         rect.top + inner_padding + ScaleByDpi(state->status_window, 22));
     DrawTextBlock(dc, state->section_font, card.title, title_rect, kColorTextSecondary, DT_LEFT | DT_TOP | DT_SINGLELINE);
 
+    const int content_width = std::max(1, RectWidth(rect) - inner_padding * 2);
+    const int min_note_height = ScaleByDpi(state->status_window, 48);
+    const int available_value_space =
+        static_cast<int>(rect.bottom) - inner_padding - static_cast<int>(title_rect.bottom) - ScaleByDpi(state->status_window, 12) - min_note_height;
+    const int available_value_height = std::max(
+        ScaleByDpi(state->status_window, 28),
+        available_value_space);
+    int value_height = MeasureTextBlockHeight(dc, state->value_font, card.value, content_width, DT_LEFT | DT_TOP | DT_WORDBREAK);
+    value_height = std::max(value_height, ScaleByDpi(state->status_window, 28));
+    value_height = std::min(value_height, available_value_height);
     RECT value_rect = MakeRect(
         rect.left + inner_padding,
         title_rect.bottom + ScaleByDpi(state->status_window, 10),
         rect.right - inner_padding,
-        title_rect.bottom + ScaleByDpi(state->status_window, 34));
-    DrawTextBlock(dc, state->value_font, card.value, value_rect, value_color, DT_LEFT | DT_TOP | DT_SINGLELINE);
+        title_rect.bottom + ScaleByDpi(state->status_window, 10) + value_height);
+    DrawTextBlock(dc, state->value_font, card.value, value_rect, value_color, DT_LEFT | DT_TOP | DT_WORDBREAK);
 
     RECT note_rect = MakeRect(
         rect.left + inner_padding,
-        value_rect.bottom + ScaleByDpi(state->status_window, 10),
+        value_rect.bottom + ScaleByDpi(state->status_window, 8),
         rect.right - inner_padding,
         rect.bottom - inner_padding);
     DrawTextBlock(dc, state->body_font, card.note, note_rect, kColorTextSecondary, DT_LEFT | DT_TOP | DT_WORDBREAK);
@@ -967,9 +2330,9 @@ void DrawSectionCard(
     const RECT& rect,
     const std::wstring& title,
     const std::wstring& body) {
-    const int radius = ScaleByDpi(state->status_window, 22);
-    const int inner_padding = ScaleByDpi(state->status_window, 20);
-    DrawGlassCard(state, dc, rect, radius, kColorCardBackground, kColorBorder, 10);
+    const int radius = ScaleByDpi(state->status_window, 16);
+    const int inner_padding = ScaleByDpi(state->status_window, 22);
+    DrawGlassCard(state, dc, rect, radius, kColorCardBackground, kColorBorder, 5);
 
     RECT title_rect = MakeRect(
         rect.left + inner_padding,
@@ -986,46 +2349,234 @@ void DrawSectionCard(
     DrawTextBlock(dc, state->body_font, body, body_rect, kColorTextSecondary, DT_LEFT | DT_TOP | DT_WORDBREAK);
 }
 
+void DrawSpotlightCard(
+    AppState* state,
+    HDC dc,
+    const RECT& rect,
+    const std::wstring& label,
+    const std::wstring& value,
+    const std::wstring& body,
+    bool accent_style) {
+    const int radius = ScaleByDpi(state->status_window, 20);
+    const int inner_padding = ScaleByDpi(state->status_window, 22);
+    const COLORREF fill_color = accent_style ? RGB(250, 252, 255) : kColorCardBackground;
+    const COLORREF border_color = accent_style ? BlendColor(kColorAccent, kColorWhite, 92) : kColorBorder;
+    const COLORREF value_color = accent_style ? kColorAccent : kColorTextPrimary;
+    DrawGlassCard(state, dc, rect, radius, fill_color, border_color, 7);
+
+    const int content_width = std::max(1, RectWidth(rect) - inner_padding * 2);
+    RECT label_rect = MakeRect(
+        rect.left + inner_padding,
+        rect.top + inner_padding,
+        rect.right - inner_padding,
+        rect.top + inner_padding + ScaleByDpi(state->status_window, 20));
+    DrawTextBlock(dc, state->section_font, label, label_rect, kColorTextSecondary, DT_LEFT | DT_TOP | DT_SINGLELINE);
+
+    const HFONT value_font = state->spotlight_value_font != nullptr ? state->spotlight_value_font : state->value_font;
+    const int value_top = label_rect.bottom + ScaleByDpi(state->status_window, 12);
+    const int body_gap = ScaleByDpi(state->status_window, 14);
+    const int min_body_height = ScaleByDpi(state->status_window, 60);
+    const int available_value_height = static_cast<int>(rect.bottom) - inner_padding - value_top - body_gap - min_body_height;
+    const int max_value_height = std::max(
+        ScaleByDpi(state->status_window, 28),
+        available_value_height);
+    int value_height = MeasureTextBlockHeight(dc, value_font, value, content_width, DT_LEFT | DT_TOP | DT_WORDBREAK);
+    value_height = std::max(value_height, ScaleByDpi(state->status_window, 28));
+    value_height = std::min(value_height, max_value_height);
+    RECT value_rect = MakeRect(
+        rect.left + inner_padding,
+        value_top,
+        rect.right - inner_padding,
+        value_top + value_height);
+    DrawTextBlock(dc, value_font, value, value_rect, value_color, DT_LEFT | DT_TOP | DT_WORDBREAK);
+
+    const int body_top = std::min(
+        value_rect.bottom + body_gap,
+        rect.bottom - inner_padding - ScaleByDpi(state->status_window, 44));
+    RECT body_rect = MakeRect(
+        rect.left + inner_padding,
+        body_top,
+        rect.right - inner_padding,
+        rect.bottom - inner_padding);
+    DrawTextBlock(dc, state->body_font, body, body_rect, kColorTextSecondary, DT_LEFT | DT_TOP | DT_WORDBREAK);
+}
+
+std::wstring BuildRecentLogPreview(AppState* state, size_t max_lines) {
+    if (state == nullptr) {
+        return {};
+    }
+
+    std::lock_guard<std::mutex> lock(state->log_mutex);
+    if (state->recent_logs.empty()) {
+        return L"\u6700\u8FD1\u8FD8\u6CA1\u6709\u65B0\u7684\u8FD0\u884C\u65E5\u5FD7\u3002";
+    }
+
+    const size_t start_index = state->recent_logs.size() > max_lines ? state->recent_logs.size() - max_lines : 0;
+    std::wstring combined;
+    for (size_t index = start_index; index < state->recent_logs.size(); ++index) {
+        if (!combined.empty()) {
+            combined += L"\r\n";
+        }
+        combined += state->recent_logs[index];
+    }
+    return combined;
+}
+
+void GetVideoClientSize(AppState* state, int* width, int* height) {
+    if (width != nullptr) {
+        *width = 0;
+    }
+    if (height != nullptr) {
+        *height = 0;
+    }
+    if (state == nullptr || state->video_window == nullptr) {
+        return;
+    }
+
+    RECT client_rect{};
+    GetClientRect(state->video_window, &client_rect);
+    if (width != nullptr) {
+        *width = std::max(0L, client_rect.right - client_rect.left);
+    }
+    if (height != nullptr) {
+        *height = std::max(0L, client_rect.bottom - client_rect.top);
+    }
+}
+
+void DrawLogCard(
+    AppState* state,
+    HDC dc,
+    const RECT& rect,
+    const std::wstring& title,
+    const std::wstring& hint) {
+    DrawGlassCard(state, dc, rect, ScaleByDpi(state->status_window, 18), kColorCardBackground, kColorBorder, 6);
+    RECT title_rect = MakeRect(
+        rect.left + ScaleByDpi(state->status_window, 20),
+        rect.top + ScaleByDpi(state->status_window, 20),
+        rect.right - ScaleByDpi(state->status_window, 20),
+        rect.top + ScaleByDpi(state->status_window, 42));
+    DrawTextBlock(dc, state->section_font, title, title_rect, kColorTextPrimary, DT_LEFT | DT_TOP | DT_SINGLELINE);
+
+    RECT hint_rect = MakeRect(
+        rect.left + ScaleByDpi(state->status_window, 20),
+        title_rect.bottom + ScaleByDpi(state->status_window, 4),
+        rect.right - ScaleByDpi(state->status_window, 20),
+        rect.top + ScaleByDpi(state->status_window, 78));
+    DrawTextBlock(dc, state->subtitle_font, hint, hint_rect, kColorTextSecondary, DT_LEFT | DT_TOP | DT_WORDBREAK);
+}
+
 void DrawActionButton(AppState* state, const DRAWITEMSTRUCT* draw_item) {
     if (draw_item == nullptr) {
         return;
     }
 
-    const bool accent_style = draw_item->CtlID == kFocusVideoButtonId;
+    const bool navigation_button = IsNavigationButtonId(static_cast<int>(draw_item->CtlID));
+    const bool nav_active =
+        navigation_button &&
+        state != nullptr &&
+        PageFromNavigationButtonId(static_cast<int>(draw_item->CtlID)) == state->current_page;
+    const bool accent_style = navigation_button ? nav_active : draw_item->CtlID == kFocusVideoButtonId;
     const bool pressed = (draw_item->itemState & ODS_SELECTED) != 0;
     const bool disabled = (draw_item->itemState & ODS_DISABLED) != 0;
-    COLORREF fill_color = accent_style ? (pressed ? kColorAccentDark : kColorAccent) : RGB(252, 253, 255);
-    COLORREF border_color = accent_style ? fill_color : kColorBorder;
-    COLORREF text_color = accent_style ? kColorWhite : kColorTextPrimary;
+    const bool hot = (draw_item->itemState & ODS_HOTLIGHT) != 0;
+    
+    COLORREF fill_color = navigation_button
+        ? (nav_active ? kColorSidebarActive : kColorSidebarSurface)
+        : (accent_style ? (pressed ? kColorAccentDark : kColorAccent) : kColorWhite);
+    COLORREF border_color = navigation_button
+        ? (nav_active ? kColorSidebarActiveBorder : kColorSidebarSurface)
+        : (accent_style ? fill_color : kColorBorder);
+    COLORREF text_color = navigation_button
+        ? (nav_active ? kColorSidebarTextActive : kColorSidebarText)
+        : (accent_style ? kColorWhite : kColorTextPrimary);
 
+    // 禁用状态
     if (disabled) {
-        fill_color = RGB(234, 238, 244);
-        border_color = RGB(220, 226, 233);
-        text_color = RGB(149, 158, 170);
-    } else if (!accent_style && pressed) {
-        fill_color = RGB(239, 243, 248);
+        fill_color = navigation_button ? RGB(246, 246, 248) : RGB(248, 248, 250);
+        border_color = navigation_button ? RGB(241, 241, 244) : RGB(236, 236, 240);
+        text_color = navigation_button ? RGB(165, 165, 170) : RGB(160, 160, 165);
+    } 
+    // 按下状态 - 变暗
+    else if (pressed && !nav_active) {
+        if (navigation_button) {
+            fill_color = RGB(243, 243, 246);
+        } else if (!accent_style) {
+            fill_color = RGB(247, 247, 249);
+        } else {
+            fill_color = RGB(0, 80, 180);
+        }
+    }
+    // Hover 状态 - 变亮
+    else if (hot && !pressed && !nav_active) {
+        if (navigation_button) {
+            fill_color = RGB(45, 45, 47);
+        } else if (accent_style) {
+            fill_color = RGB(30, 150, 255);
+        } else {
+            fill_color = RGB(255, 255, 255);
+        }
     }
 
-    if (!pressed) {
-        DrawSoftShadow(state, draw_item->hDC, draw_item->rcItem, std::max(14, RectHeight(draw_item->rcItem) / 2), 6);
+    // 绘制阴影（非按下、非禁用状态）
+    if (!pressed && !disabled && (!navigation_button || nav_active)) {
+        DrawSoftShadow(
+            state,
+            draw_item->hDC,
+            draw_item->rcItem,
+            std::max(14, RectHeight(draw_item->rcItem) / 2),
+            navigation_button ? 3 : 4);
     }
-    FillRoundedRect(draw_item->hDC, draw_item->rcItem, std::max(14, RectHeight(draw_item->rcItem) / 2), fill_color, border_color);
+    
+    const int radius = navigation_button ? std::max(16, RectHeight(draw_item->rcItem) / 2) :
+                                           std::max(18, RectHeight(draw_item->rcItem) / 2);
+    FillRoundedRect(draw_item->hDC, draw_item->rcItem, radius, fill_color, border_color);
 
-    wchar_t text_buffer[64]{};
+    // 添加左侧光晕效果（hover 或 active 状态）- 适用于所有按钮类型
+    if ((hot || nav_active || (accent_style && hot)) && !disabled) {
+        RECT glow_rect = draw_item->rcItem;
+        glow_rect.right = glow_rect.left + ScaleByDpi(state->status_window, 60);
+        InflateRect(&glow_rect, -4, -4);
+        
+        // 创建渐变光晕区域
+        HRGN button_rgn = CreateRoundRectRgn(
+            draw_item->rcItem.left, draw_item->rcItem.top,
+            draw_item->rcItem.right, draw_item->rcItem.bottom, radius, radius);
+        HRGN glow_rgn = CreateRoundRectRgn(
+            glow_rect.left, glow_rect.top,
+            glow_rect.right, glow_rect.bottom, radius - 2, radius - 2);
+        HRGN intersect_rgn = CreateRectRgn(0, 0, 1, 1);
+        CombineRgn(intersect_rgn, button_rgn, glow_rgn, RGN_AND);
+        
+        // 绘制半透明蓝色光晕
+        HBRUSH glow_brush = CreateSolidBrush(RGB(30, 60, 120));
+        SetBkColor(draw_item->hDC, RGB(30, 60, 120));
+        FillRgn(draw_item->hDC, intersect_rgn, glow_brush);
+        
+        DeleteObject(glow_brush);
+        DeleteObject(intersect_rgn);
+        DeleteObject(glow_rgn);
+        DeleteObject(button_rgn);
+    }
+
+    wchar_t text_buffer[96]{};
     GetWindowTextW(draw_item->hwndItem, text_buffer, static_cast<int>(_countof(text_buffer)));
     RECT text_rect = draw_item->rcItem;
+    if (navigation_button) {
+        text_rect.left += ScaleByDpi(state != nullptr ? state->status_window : nullptr, 18);
+        text_rect.right -= ScaleByDpi(state != nullptr ? state->status_window : nullptr, 14);
+    }
     DrawTextBlock(
         draw_item->hDC,
         state != nullptr ? state->button_font : nullptr,
         text_buffer,
         text_rect,
         text_color,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        navigation_button ? (DT_LEFT | DT_VCENTER | DT_SINGLELINE) : (DT_CENTER | DT_VCENTER | DT_SINGLELINE));
 
     if ((draw_item->itemState & ODS_FOCUS) != 0) {
         RECT focus_rect = draw_item->rcItem;
-        InflateRect(&focus_rect, -4, -4);
-        DrawFocusRect(draw_item->hDC, &focus_rect);
+        InflateRect(&focus_rect, -3, -3);
+        StrokeRoundedRect(draw_item->hDC, focus_rect, std::max(12, radius - 4), kColorFocusRing);
     }
 }
 
@@ -1039,105 +2590,452 @@ void PaintStatusWindow(AppState* state, HWND hwnd, HDC target_dc) {
     const HBITMAP bitmap = CreateCompatibleBitmap(target_dc, width, height);
     const HGDIOBJ old_bitmap = SelectObject(memory_dc, bitmap);
 
+    HBRUSH temporary_background_brush = nullptr;
     HBRUSH background_brush = state != nullptr ? state->window_background_brush : nullptr;
+    if (state != nullptr && state->web_ui_ready) {
+        temporary_background_brush = CreateSolidBrush(kColorEmbeddedWindowBackground);
+        background_brush = temporary_background_brush;
+    }
     if (background_brush == nullptr) {
         background_brush = CreateSolidBrush(kColorWindowBackground);
     }
     FillRect(memory_dc, &client_rect, background_brush);
     DrawGlassBackdrop(state, memory_dc, client_rect);
 
-    if (state != nullptr) {
+    if (state != nullptr && state->web_ui_bridge == nullptr) {
         const StatusWindowLayout layout = CalculateStatusWindowLayout(state);
-        const int hero_radius = ScaleByDpi(hwnd, 28);
-        const int hero_inner_padding = ScaleByDpi(hwnd, 24);
-        const int icon_size = ScaleByDpi(hwnd, 70);
-        const int pill_height = ScaleByDpi(hwnd, 30);
-        const int pill_width = ScaleByDpi(hwnd, 122);
-        const int pill_gap = ScaleByDpi(hwnd, 10);
-        const int version_pill_width = ScaleByDpi(hwnd, 286);
-        const int version_pill_gap = ScaleByDpi(hwnd, 12);
+        const SessionSnapshot session = CopySessionSnapshot(state);
+        const VideoStats stats = state->udp_receiver != nullptr ? state->udp_receiver->GetStats() : VideoStats{};
+        const size_t decoder_queue_depth =
+            state->decoder != nullptr ? state->decoder->GetPendingAccessUnitCount() : 0;
 
-        DrawGlassCard(state, memory_dc, layout.hero, hero_radius, kColorHeroBackground, RGB(255, 255, 255), 12);
+        bool has_clock_sync = false;
+        int64_t sender_clock_rtt_us = 0;
+        int64_t latest_latency_us = 0;
+        double content_fps = 0.0;
+        double receive_fps = 0.0;
+        double decode_fps = 0.0;
+        double display_fps = 0.0;
+        uint64_t decoded_frame_count = 0;
+        uint64_t displayed_frame_count = 0;
+        {
+            std::lock_guard<std::mutex> lock(state->metrics_mutex);
+            has_clock_sync = state->has_clock_sync;
+            sender_clock_rtt_us = state->sender_clock_rtt_us;
+            latest_latency_us = state->latest_latency_us;
+            content_fps = state->content_fps;
+            receive_fps = state->receive_fps;
+            decode_fps = state->decode_fps;
+            display_fps = state->display_fps;
+            decoded_frame_count = state->decoded_frame_count;
+            displayed_frame_count = state->displayed_frame_count;
+        }
+        const uint64_t display_dropped_frames =
+            decoded_frame_count > displayed_frame_count ? decoded_frame_count - displayed_frame_count : 0;
+        const int64_t now_us = NowSteadyUs();
+        const SenderIdentity sender_identity = ParseSenderIdentity(session.device_name);
+        const std::wstring current_sender_name =
+            !sender_identity.display_name.empty() ? sender_identity.display_name : L"\u7B49\u5F85\u5B89\u5353\u53D1\u9001\u7AEF";
+        const std::wstring sender_version_label = sender_identity.version_label;
+        const std::wstring sender_version_line =
+            sender_version_label.empty()
+                ? std::wstring()
+                : (std::wstring(L"\r\n\u53D1\u9001\u7AEF\u7248\u672C\uFF1A") + sender_version_label);
+        const std::wstring current_host = !session.host.empty() ? session.host : L"--";
+        const std::wstring last_frame_text =
+            FormatRelativeMoment(now_us, session.last_present_us, L"\u7B49\u5F85\u9996\u5E27");
+        const std::wstring sync_text =
+            has_clock_sync ? FormatLatencyMs(sender_clock_rtt_us) : L"\u7B49\u5F85\u6821\u65F6";
 
+        int video_client_width = 0;
+        int video_client_height = 0;
+        GetVideoClientSize(state, &video_client_width, &video_client_height);
+        double pixel_scale = 0.0;
+        if (state->has_selected_profile && state->selected_profile.width > 0 && state->selected_profile.height > 0 &&
+            video_client_width > 0 && video_client_height > 0) {
+            pixel_scale = std::min(
+                static_cast<double>(video_client_width) / static_cast<double>(state->selected_profile.width),
+                static_cast<double>(video_client_height) / static_cast<double>(state->selected_profile.height));
+        }
+
+        const std::wstring current_profile_summary =
+            state->has_selected_profile
+                ? (FormatDimensions(state->selected_profile.width, state->selected_profile.height) +
+                    L" / " + CodecName(state->selected_profile.codec) +
+                    L" / " + FormatProfileFrameRate(state->selected_profile))
+                : std::wstring(L"\u7B49\u5F85\u534F\u8BAE\u534F\u5546");
+        const std::wstring current_profile_details = BuildProfileDetailBlock(
+            state->has_selected_profile ? &state->selected_profile : nullptr,
+            state->has_selected_profile,
+            PresentationModeLabel(state->presentation_mode));
+        const std::wstring airplay_status = BuildAirPlayStatusText(state);
+        const std::wstring voice_control_status = BuildVoiceControlStatusText(state);
+        const std::wstring airplay_error = state->airplay_controller.last_error();
+        const std::wstring airplay_log_name =
+            state->airplay_log_path.empty() ? std::wstring(L"--") : ExtractFileName(state->airplay_log_path);
+
+        std::wstring hero_title;
+        std::wstring hero_body;
+        std::wstring side_label;
+        std::wstring side_value;
+        std::wstring side_body;
+        std::array<DashboardCard, 4> summary_cards = state->dashboard.summary_cards;
+        std::wstring left_title = kTextTrafficTitle;
+        std::wstring left_body = state->dashboard.traffic_body;
+        std::wstring right_title = kTextRuntimeTitle;
+        std::wstring right_body = state->dashboard.runtime_body;
+        std::wstring log_title = kTextLogTitle;
+        std::wstring log_hint = std::wstring(kTextFilePrefix) + ExtractFileName(state->log_file_path);
+
+        switch (state->current_page) {
+        case StatusPage::kConnect:
+            hero_title = session.control_connected
+                ? (std::wstring(L"\u5F53\u524D\u6B63\u5728\u63A5\u6536 ") + current_sender_name)
+                : L"\u5B89\u5353\u548C iPhone \u90FD\u53EF\u4EE5\u4ECE\u8FD9\u91CC\u627E\u5230\u5165\u53E3";
+            hero_body =
+                L"\u8FD9\u4E00\u9875\u4F1A\u540C\u65F6\u544A\u8BC9\u4F60 Android \u63A7\u5236\u901A\u9053\u3001\u89C6\u9891\u901A\u9053\u4EE5\u53CA Apple AirPlay \u670D\u52A1\u7684\u72B6\u6001\u3002"
+                L"\r\n\u6240\u4EE5\u73B0\u5728\u4E0D\u7528\u518D\u5230\u65E5\u5FD7\u91CC\u53CD\u590D\u627E\u201C\u662F\u4E0D\u662F\u6CA1\u8D77\u6765\u201D\u4E86\u3002";
+            side_label = L"\u5F53\u524D\u4F1A\u8BDD";
+            side_value = session.control_connected ? current_sender_name : L"\u7B49\u5F85\u8BBE\u5907";
+            side_body =
+                std::wstring(L"\u5730\u5740\uFF1A") + current_host +
+                L"\r\n\u63A7\u5236\u901A\u9053\uFF1ATCP/" + std::to_wstring(kControlPort) +
+                L"\r\n\u89C6\u9891\u901A\u9053\uFF1AUDP/" + std::to_wstring(kVideoPort) +
+                L"\r\n\u82F9\u679C\u6295\u5C4F\uFF1A" + airplay_status +
+                L"\r\n\u63E1\u624B\u72B6\u6001\uFF1A" + (session.control_connected ? L"\u5DF2\u8FDE\u901A" : L"\u7B49\u5F85\u8FDE\u63A5") +
+                L"\r\n\u6700\u8FD1\u753B\u9762\uFF1A" + last_frame_text +
+                sender_version_line;
+            summary_cards = {{
+                DashboardCard{L"\u5F53\u524D\u8BBE\u5907", current_sender_name, std::wstring(L"\u5730\u5740\uFF1A") + current_host + sender_version_line},
+                DashboardCard{L"\u5B89\u5353\u901A\u9053", session.control_connected ? L"\u5DF2\u8FDE\u901A" : L"\u7B49\u5F85 HELLO", L"TCP/5500\r\nTCP/55000"},
+                DashboardCard{L"\u82F9\u679C\u6295\u5C4F", airplay_status, state->airplay_controller.running() ? L"iPhone / iPad \u53EF\u4ECE\u201C\u5C4F\u5E55\u955C\u50CF\u201D\u76F4\u63A5\u9009\u62E9\u201C\u76F4\u64AD\u6295\u5C4F\u52A9\u624B\u201D" : (airplay_error.empty() ? L"\u53EF\u901A\u8FC7\u4E0B\u65B9\u6309\u94AE\u542F\u52A8 Apple AirPlay \u670D\u52A1" : airplay_error)},
+                DashboardCard{L"\u534F\u8BAE\u72B6\u6001", state->has_selected_profile ? L"\u5DF2\u534F\u5546" : L"\u5F85\u534F\u5546", current_profile_details},
+            }};
+            left_title = L"\u8FDE\u63A5\u4F53\u68C0";
+            left_body =
+                std::wstring(L"\u63A7\u5236\u7AEF\u53E3\uFF1ATCP/") + std::to_wstring(kControlPort) +
+                L"\r\n\u89C6\u9891\u7AEF\u53E3\uFF1AUDP/" + std::to_wstring(kVideoPort) +
+                L"\r\nAirPlay \u72B6\u6001\uFF1A" + airplay_status +
+                L"\r\n\u65F6\u949F\u6821\u65F6\uFF1A" + sync_text +
+                L"\r\n\u5F53\u524D\u914D\u7F6E\uFF1A" + current_profile_summary;
+            right_title = L"\u63A5\u4E0B\u6765\u600E\u4E48\u505A";
+            right_body =
+                session.control_connected
+                    ? L"\u5982\u679C\u5DF2\u7ECF\u6709\u753B\u9762\u7A97\u53E3\uFF0C\u4F18\u5148\u76F4\u63A5\u6253\u5F00\u6295\u5C4F\u7A97\u53E3\u770B\u753B\u9762\u3002"
+                      L"\r\n\u82E5\u8FDE\u4E0A\u4E86\u4F46\u753B\u9762\u4E0D\u65B0\uFF0C\u53EF\u4EE5\u8BF7\u6C42\u5173\u952E\u5E27\u6216\u6253\u5F00\u72B6\u6001\u5FEB\u7167\u7ED9\u6211\u3002"
+                    : (state->airplay_controller.running()
+                        ? (std::wstring(L"Android \u8FD8\u6CA1\u8D77\u6765\u4E5F\u6CA1\u5173\u7CFB\u3002")
+                            + L"\r\n\u73B0\u5728 iPhone / iPad \u53EF\u4EE5\u76F4\u63A5\u5728\u201C\u5C4F\u5E55\u955C\u50CF\u201D\u91CC\u9009\u62E9\u201C\u76F4\u64AD\u6295\u5C4F\u52A9\u624B\u201D\uFF0CApple \u753B\u9762\u4F1A\u7528\u72EC\u7ACB\u7A97\u53E3\u663E\u793A\u3002")
+                        : (std::wstring(L"\u5F53\u524D\u8FD8\u6CA1\u6709 Android \u53D1\u9001\u7AEF\u8FDE\u4E0A\u3002")
+                            + L"\r\n\u4F60\u53EF\u4EE5\u5728\u624B\u673A\u7AEF\u542F\u52A8 Android \u6295\u5C4F\uFF0C\u6216\u8005\u5148\u542F\u52A8 Apple AirPlay \u670D\u52A1\uFF0C\u8BA9 iPhone / iPad \u76F4\u63A5\u955C\u50CF\u5230\u8FD9\u53F0 PC\u3002"
+                            + L"\r\nAirPlay \u65E5\u5FD7\u6587\u4EF6\uFF1A" + airplay_log_name));
+            break;
+        case StatusPage::kDisplay:
+            hero_title = L"\u663E\u793A\u6A21\u5F0F\u4E0D\u518D\u85CF\u5728\u6295\u5C4F\u7A97\u53E3\u91CC";
+            hero_body =
+                L"\u8FD9\u91CC\u4F1A\u628A\u6E90\u5206\u8FA8\u7387\u3001\u6295\u5C4F\u7A97\u53E3 client area\u3001\u50CF\u7D20\u6620\u5C04\u548C GPU \u6E32\u67D3\u94FE\u8DEF\u62C6\u5F00\u663E\u793A\u3002"
+                L"\r\n\u8FD9\u6837\u5C31\u4E0D\u4F1A\u518D\u628A\u7A97\u53E3\u7F29\u653E\u8BEF\u5224\u6210\u7801\u7387\u6216\u89E3\u7801\u95EE\u9898\u3002";
+            side_label = L"\u5F53\u524D\u7A97\u53E3";
+            side_value = FormatDimensions(video_client_width, video_client_height);
+            side_body =
+                std::wstring(L"\u6E90\u753B\u8D28\uFF1A") +
+                (state->has_selected_profile ? FormatDimensions(state->selected_profile.width, state->selected_profile.height) : kTextMeasurePending) +
+                L"\r\n\u50CF\u7D20\u6620\u5C04\uFF1A" + FormatScaleValue(pixel_scale) +
+                L"\r\n\u865A\u62DF\u6444\u50CF\u5934\uFF1A" + BuildVirtualCameraStatusText(state) +
+                L"\r\n\u6E32\u67D3\u663E\u5361\uFF1A" + (state->renderer.gpu_name().empty() ? L"\u7B49\u5F85 GPU" : state->renderer.gpu_name()) +
+                L"\r\n\u9ED8\u8BA4\u52A8\u4F5C\uFF1A\u6309\u6E90\u753B\u8D28\u663E\u793A";
+            summary_cards = {{
+                DashboardCard{L"\u6E90\u5206\u8FA8\u7387", state->has_selected_profile ? FormatDimensions(state->selected_profile.width, state->selected_profile.height) : kTextMeasurePending, current_profile_details},
+                DashboardCard{L"\u5F53\u524D\u663E\u793A\u533A\u57DF", FormatDimensions(video_client_width, video_client_height), L"client area\r\n\u4F1A\u6309\u6E90\u753B\u8D28\u91CD\u8BBE"},
+                DashboardCard{L"\u50CF\u7D20\u6620\u5C04", FormatScaleValue(pixel_scale), L"\u5C0F\u4E8E 1.00x \u65F6\u4E3A\u7B49\u6BD4\u7F29\u5C0F\r\n\u5927\u4E8E 1.00x \u65F6\u4E3A\u7A97\u53E3\u653E\u5927"},
+                DashboardCard{L"\u865A\u62DF\u6444\u50CF\u5934", BuildVirtualCameraStatusText(state), state->virtual_camera_controller.running() ? L"\u53EF\u5728 OBS \u3001\u4F1A\u8BAE\u8F6F\u4EF6\u6216\u5176\u4ED6\u652F\u6301\u6444\u50CF\u5934\u7684\u5E94\u7528\u4E2D\u9009\u62E9\u201C\u76F4\u64AD\u6295\u5C4F\u52A9\u624B\u865A\u62DF\u6444\u50CF\u5934\u201D" : L"\u5148\u5B89\u88C5\u518D\u542F\u52A8\uFF0C\u8F93\u51FA\u5F53\u524D\u6295\u5C4F\u753B\u9762"},
+            }};
+            left_title = L"\u663E\u793A\u68C0\u67E5";
+            left_body =
+                std::wstring(L"\u6E90\u753B\u8D28\uFF1A") +
+                (state->has_selected_profile ? FormatDimensions(state->selected_profile.width, state->selected_profile.height) : kTextMeasurePending) +
+                L"\r\n\u6295\u5C4F\u7A97\u53E3 client area\uFF1A" + FormatDimensions(video_client_width, video_client_height) +
+                L"\r\n\u50CF\u7D20\u6620\u5C04\uFF1A" + FormatScaleValue(pixel_scale) +
+                L"\r\n\u865A\u62DF\u6444\u50CF\u5934\uFF1A" + BuildVirtualCameraStatusText(state) +
+                L"\r\n\u5F53\u524D\u663E\u793A\u901F\u7387\uFF1A" + FormatOptionalFps(display_fps) +
+                L"\r\n\u7AEF\u5230\u7AEF\u5EF6\u8FDF\uFF1A" + (latest_latency_us > 0 ? FormatLatencyMs(latest_latency_us) : std::wstring(kTextWaitingSync));
+            right_title = L"\u663E\u793A\u8BF4\u660E";
+            right_body =
+                L"\u5982\u679C\u4F60\u89C9\u5F97\u6587\u5B57\u53D1\u7CCA\uFF0C\u5148\u770B\u201C\u50CF\u7D20\u6620\u5C04\u201D\u662F\u4E0D\u662F\u5C0F\u4E8E 1.00x\u3002"
+                L"\r\n\u5982\u679C\u753B\u9762\u7A97\u53E3\u6BD4\u6E90\u753B\u8D28\u5C0F\uFF0C\u5B83\u4ECD\u7136\u662F\u9AD8\u6E05\u6E90\uFF0C\u53EA\u662F\u88AB\u7B49\u6BD4\u7F29\u5C0F\u663E\u793A\u3002"
+                L"\r\n\u5982\u679C\u9700\u8981\u7ED9 OBS \u6216\u5176\u4ED6\u8F6F\u4EF6\u91C7\u96C6\u753B\u9762\uFF0C\u5148\u70B9\u51FB\u201C\u5B89\u88C5 / \u542F\u52A8\u865A\u62DF\u6444\u50CF\u5934\u201D\u3002"
+                L"\r\n\u201C\u6309\u6E90\u753B\u8D28\u663E\u793A\u201D\u4F1A\u91CD\u8BBE\u6295\u5C4F\u7A97\u53E3 client area\u3002";
+            break;
+        case StatusPage::kVoiceControl:
+            hero_title = L"\u53EA\u4FDD\u7559\u63A5\u6536\u7AEF\u81EA\u5E26\u7684\u79BB\u7EBF\u8BED\u97F3\u63A7\u5236";
+            hero_body =
+                L"\u8FD9\u4E00\u9875\u53EA\u5904\u7406 PC \u7AEF\u7684\u8BED\u97F3\u64CD\u4F5C\u3002"
+                L"\r\n\u73B0\u5728\u5DF2\u5B8C\u5168\u79FB\u9664 Windows \u7CFB\u7EDF\u8BED\u97F3\u8BBF\u95EE\u5165\u53E3\uFF0C\u53EA\u7559\u4E0B\u63A5\u6536\u7AEF\u81EA\u5DF1\u7684\u79BB\u7EBF\u8BC6\u522B\u3002"
+                L"\r\n\u4E3A\u4E86\u517C\u987E\u54CD\u5E94\u901F\u5EA6\u548C\u9632\u8BEF\u89E6\u53D1\uFF0C\u73B0\u5728\u4F1A\u5BF9\u7A33\u5B9A\u547D\u4E2D\u7684\u4E2D\u9014\u8BC6\u522B\u7ED3\u679C\u63D0\u524D\u89E6\u53D1\uFF0C\u540C\u65F6\u4FDD\u7559\u6700\u7EC8\u8BC6\u522B\u786E\u8BA4\u548C\u6267\u884C\u540E\u7684\u77ED\u6682\u56DE\u58F0\u6291\u5236\u3002"
+                L"\r\n\u9664\u4E86\u201C\u97F3\u4E50 / \u64AD\u653E / \u6682\u505C\u201D\uFF0C\u73B0\u5728\u4E5F\u53EF\u4EE5\u76F4\u63A5\u8BF4\u201C\u70ED\u8840\u201D\u3001\u201C\u7EAF\u97F3\u4E50\u201D\u6216\u201C123\u201D\u8FD9\u79CD\u76EE\u5F55\u540D\u6765\u968F\u673A\u64AD\u653E\u672C\u5730\u97F3\u4E50\u3002";
+            side_label = L"\u5F53\u524D\u8BED\u97F3";
+            side_value = voice_control_status;
+            side_body =
+                std::wstring(L"\u5E94\u7528\u8BED\u97F3\uFF1A") + voice_control_status +
+                L"\r\n\u5173\u952E\u8BCD\uFF1A\u5A92\u4F53\u6307\u4EE4 + \u8BED\u97F3\u70B9\u6B4C\u76EE\u5F55\u540D" +
+                L"\r\n\u89E6\u53D1\u89C4\u5219\uFF1A\u7A33\u5B9A\u4E2D\u9014\u7ED3\u679C\u53EF\u63D0\u524D\u89E6\u53D1\uFF0C\u6700\u7EC8\u8BC6\u522B\u4ECD\u4F1A\u5160\u5E95" +
+                L"\r\n\u52A8\u4F5C\uFF1A\u5A92\u4F53\u63A7\u5236 / \u968F\u673A\u64AD\u653E\u8BED\u97F3\u70B9\u6B4C";
+            summary_cards = {{
+                DashboardCard{L"\u5E94\u7528\u8BED\u97F3\u72B6\u6001", state->voice_control_enabled ? L"\u5DF2\u5F00\u542F" : L"\u672A\u5F00\u542F", voice_control_status},
+                DashboardCard{L"\u7CFB\u7EDF\u8BED\u97F3", L"\u5DF2\u79FB\u9664", L"\u4E0D\u518D\u63A5\u5165 Windows Voice Access \u6216\u7CFB\u7EDF\u542C\u5199"},
+                DashboardCard{L"\u8BC6\u522B\u5173\u952E\u8BCD", L"\u5A92\u4F53\u6307\u4EE4 + \u76EE\u5F55\u540D", L"\u7A33\u5B9A\u4E2D\u9014\u7ED3\u679C\u4E5F\u53EF\u63D0\u524D\u6267\u884C"},
+                DashboardCard{L"\u8BED\u97F3\u70B9\u6B4C\u76EE\u5F55", L"\u8BED\u97F3\u70B9\u6B4C", L"\u628A\u4E0D\u540C\u98CE\u683C\u7684\u97F3\u4E50\u5206\u5B50\u76EE\u5F55\u653E\u5230\u6210\u54C1\u4E3B\u76EE\u5F55\u4E0B"},
+            }};
+            left_title = L"\u4F7F\u7528\u8BF4\u660E";
+            left_body =
+                L"1. \u5148\u70B9\u51FB\u201C\u5F00\u542F\u8BED\u97F3\u63A7\u5236\u201D\uFF0C\u8BA9\u63A5\u6536\u7AEF\u5F00\u59CB\u76D1\u542C\u9EA6\u514B\u98CE\u3002"
+                L"\r\n2. \u5F53\u4E2D\u9014\u8BC6\u522B\u7ED3\u679C\u5DF2\u7ECF\u7A33\u5B9A\u547D\u4E2D\u201C\u97F3\u4E50\u201D\u3001\u201C\u64AD\u653E\u201D\u3001\u201C\u6682\u505C\u201D\u6216\u5305\u542B\u201C\u64AD\u653E\u97F3\u4E50 / \u6682\u505C\u97F3\u4E50\u201D\u65F6\uFF0C\u5E94\u7528\u4F1A\u63D0\u524D\u6267\u884C\u3002"
+                L"\r\n3. \u628A\u4E0D\u540C\u98CE\u683C\u7684\u97F3\u4E50\u653E\u5230\u6210\u54C1\u4E3B\u76EE\u5F55\u4E0B\u7684\u201C\u8BED\u97F3\u70B9\u6B4C\u201D\u5B50\u76EE\u5F55\u91CC\uFF0C\u7136\u540E\u5BF9\u7740 PC \u8BF4\u76EE\u5F55\u540D\u5C31\u4F1A\u968F\u673A\u64AD\u653E\u3002"
+                L"\r\n4. \u7B2C\u4E8C\u4E2A\u6309\u94AE\u53EF\u4EE5\u76F4\u63A5\u6253\u5F00\u672C\u6B21\u8FD0\u884C\u65E5\u5FD7\uFF0C\u7B2C\u4E09\u4E2A\u6309\u94AE\u6253\u5F00\u6210\u54C1\u76EE\u5F55\u3002";
+            right_title = L"\u8BBE\u7F6E\u4E0E\u6392\u67E5";
+            right_body =
+                L"\u5982\u679C\u73AF\u5883\u58F0\u8FD8\u662F\u4F1A\u8BEF\u89E6\u53D1\uFF0C\u5148\u67E5\u770B\u65E5\u5FD7\u91CC\u7684\u201C\u8BC6\u522B\u5230\u201D\u6587\u5B57\uFF0C\u786E\u8BA4\u7A76\u7ADF\u88AB\u542C\u6210\u4E86\u54EA\u4E2A\u53E3\u4EE4\u3002"
+                L"\r\n\u5F53\u524D\u7248\u672C\u5DF2\u7ECF\u5B8C\u5168\u79FB\u9664 Windows \u7CFB\u7EDF\u8BED\u97F3\u8BBF\u95EE\u7EC4\u4EF6\uFF0C\u4E0D\u4F1A\u518D\u53BB\u6253\u5F00\u6216\u5173\u95ED\u5B83\u3002"
+                L"\r\n\u5982\u679C\u4F60\u7A0D\u540E\u8FD8\u60F3\u628A\u8BEF\u89E6\u53D1\u538B\u5F97\u66F4\u4F4E\uFF0C\u6211\u53EF\u4EE5\u518D\u7ED9\u5B83\u52A0\u5524\u9192\u8BCD\u6216\u80FD\u91CF\u95E8\u9650\u3002";
+            break;
+        case StatusPage::kDiagnostics:
+            hero_title = L"\u8BCA\u65AD\u6062\u590D\u96C6\u4E2D\u5230\u4E00\u5C4F";
+            hero_body =
+                L"\u8FD9\u4E00\u9875\u4F18\u5148\u56DE\u7B54\u201C\u662F\u54EA\u4E00\u6BB5\u5361\u4F4F\u4E86\u201D\u3002"
+                L"\r\n\u5982\u679C\u63A7\u5236\u901A\u9053\u8FD8\u5728\uFF0C\u4F46\u753B\u9762\u5361\u4F4F\uFF0C\u5C31\u5148\u770B\u961F\u5217\u548C\u6700\u8FD1\u65E5\u5FD7\u3002";
+            side_label = L"\u5F53\u524D\u5224\u65AD";
+            side_value =
+                !session.control_connected ? L"\u7B49\u5F85\u4F1A\u8BDD" :
+                (decoder_queue_depth > 0 ? L"\u5173\u6CE8\u89E3\u7801\u961F\u5217" : L"\u94FE\u8DEF\u57FA\u672C\u7A33\u5B9A");
+            side_body =
+                std::wstring(L"\u63A7\u5236\u8FDE\u63A5\uFF1A") + (session.control_connected ? L"\u5DF2\u8FDE\u901A" : L"\u672A\u8FDE\u901A") +
+                L"\r\n\u961F\u5217\u79EF\u538B\uFF1A" + std::to_wstring(decoder_queue_depth) +
+                L"\r\n\u6700\u65B0\u65E5\u5FD7\u4F1A\u76F4\u63A5\u663E\u793A\u5728\u4E0B\u65B9";
+            summary_cards = {{
+                DashboardCard{L"\u63A7\u5236\u72B6\u6001", session.control_connected ? L"\u5DF2\u8FDE\u901A" : L"\u7B49\u5F85", L"\u4E0A\u6B21\u753B\u9762 " + last_frame_text},
+                DashboardCard{L"\u5F85\u89E3\u961F\u5217", std::to_wstring(decoder_queue_depth), L"\u89E3\u7801\u961F\u5217 / \u5DF2\u663E " + std::to_wstring(displayed_frame_count)},
+                DashboardCard{L"\u7AEF\u5230\u7AEF\u5EF6\u8FDF", latest_latency_us > 0 ? FormatLatencyMs(latest_latency_us) : kTextWaitingSync, L"\u6821\u65F6 RTT " + sync_text},
+                DashboardCard{L"NVDEC", BuildNvdecStatusText(state), state->renderer.gpu_name().empty() ? L"\u7B49\u5F85 GPU \u521D\u59CB\u5316" : state->renderer.gpu_name()},
+            }};
+            right_title = L"\u6062\u590D\u52A8\u4F5C";
+            right_body =
+                L"1. \u63A7\u5236\u901A\u9053\u8FD8\u5728\u4F46\u753B\u9762\u7A81\u7136\u4E0D\u65B0\uFF0C\u5148\u8BF7\u6C42\u5173\u952E\u5E27\u3002"
+                L"\r\n2. \u6709\u5E27\u7387\u4F46\u7A97\u53E3\u9ED1\u5C4F\uFF0C\u4F18\u5148\u5BF9\u7167 GPU/NVDEC \u72B6\u6001\u3002"
+                L"\r\n3. \u8981\u53D1\u6211\u6392\u67E5\u65F6\uFF0C\u76F4\u63A5\u6253\u5F00\u72B6\u6001\u5FEB\u7167\u548C\u65E5\u5FD7\u6587\u4EF6\u3002";
+            log_title = L"\u5B9E\u65F6\u65E5\u5FD7";
+            break;
+        case StatusPage::kLogs:
+            hero_title = L"\u65E5\u5FD7\u548C\u72B6\u6001\u5FEB\u7167\u5355\u72EC\u6536\u53E3";
+            hero_body =
+                L"\u8FD9\u4E00\u9875\u4FDD\u7559\u5B9E\u65F6\u65E5\u5FD7\u67E5\u770B\uFF0C\u540C\u65F6\u7ED9\u4F60\u65E5\u5FD7\u6587\u4EF6\u3001\u72B6\u6001\u5FEB\u7167\u548C\u8F93\u51FA\u76EE\u5F55\u5165\u53E3\u3002"
+                L"\r\n\u9700\u8981\u53D1\u6211\u6392\u67E5\u65F6\uFF0C\u76F4\u63A5\u4ECE\u8FD9\u91CC\u6253\u5F00\u5C31\u884C\u3002";
+            side_label = L"\u5BFC\u51FA\u4FE1\u606F";
+            side_value = ExtractFileName(state->log_file_path);
+            side_body =
+                std::wstring(L"\u72B6\u6001\u5FEB\u7167\uFF1A") + ExtractFileName(state->status_file_path) +
+                L"\r\n\u6700\u8FD1\u753B\u9762\uFF1A" + last_frame_text +
+                L"\r\n\u603B\u6570\u636E\u5305\uFF1A" + std::to_wstring(stats.total_packets);
+            summary_cards = {{
+                DashboardCard{L"\u603B\u6570\u636E\u5305", std::to_wstring(stats.total_packets), FormatDataSize(stats.total_bytes)},
+                DashboardCard{L"\u5B8C\u6574\u5E27", std::to_wstring(stats.completed_frames), L"\u5173\u952E\u5E27 " + std::to_wstring(stats.keyframes)},
+                DashboardCard{L"\u4E22\u5E27", std::to_wstring(stats.dropped_frames), L"\u663E\u793A\u4E22\u5E27 " + std::to_wstring(display_dropped_frames)},
+                DashboardCard{L"\u6700\u540E\u5E27", std::to_wstring(stats.last_frame_id), last_frame_text},
+            }};
+            log_hint = std::wstring(kTextFilePrefix) + state->log_file_path;
+            break;
+        case StatusPage::kOverview:
+        default:
+            hero_title = state->has_selected_profile ? L"\u4E00\u4F53\u5316\u63A5\u6536\u524D\u53F0\u5DF2\u5C31\u7EEA" : L"\u63A5\u6536\u7AEF\u524D\u53F0\u5DF2\u6253\u5F00\uFF0C\u7B49\u5F85\u624B\u673A\u63A5\u5165";
+            hero_body =
+                std::wstring(L"\u53D1\u9001\u7AEF\uFF1A") + current_sender_name +
+                L"\r\n\u5730\u5740\uFF1A" + current_host +
+                L"\r\n\u5F53\u524D\u914D\u7F6E\uFF1A" + current_profile_summary +
+                L"\r\n\u8FD9\u91CC\u5C31\u662F\u63A5\u6536\u3001\u663E\u793A\u3001\u8BED\u97F3\u548C\u8BCA\u65AD\u5171\u7528\u7684\u540C\u4E00\u4E2A\u524D\u53F0\u7A0B\u5E8F\uFF0C\u4E0D\u518D\u62C6\u5206\u72EC\u7ACB\u63A7\u5236\u7AEF\u3002";
+            side_label = L"\u5F53\u524D\u4F1A\u8BDD";
+            side_value = session.control_connected ? current_sender_name : L"\u7B49\u5F85\u8FDE\u63A5";
+            side_body =
+                std::wstring(L"\u5730\u5740\uFF1A") + current_host +
+                L"\r\n\u5F53\u524D\u914D\u7F6E\uFF1A" + current_profile_summary +
+                L"\r\n\u6700\u8FD1\u753B\u9762\uFF1A" + last_frame_text +
+                L"\r\n\u6E32\u67D3\u663E\u5361\uFF1A" +
+                (state->renderer.gpu_name().empty() ? L"\u7B49\u5F85\u521D\u59CB\u5316" : state->renderer.gpu_name()) +
+                sender_version_line;
+            summary_cards = {{
+                DashboardCard{L"\u5F53\u524D\u914D\u7F6E", state->has_selected_profile ? FormatDimensions(state->selected_profile.width, state->selected_profile.height) : L"\u7B49\u5F85\u8FDE\u63A5", current_profile_details},
+                DashboardCard{L"\u5185\u5BB9\u6E90\u5E27\u7387", FormatOptionalFps(content_fps), BuildRateDetailBlock(receive_fps, decode_fps, display_fps)},
+                DashboardCard{L"\u4F30\u7B97\u7AEF\u5230\u7AEF\u5EF6\u8FDF", latest_latency_us > 0 ? FormatLatencyMs(latest_latency_us) : kTextWaitingSync, std::wstring(L"\u6821\u65F6\u5F80\u8FD4\uFF1A") + sync_text + L"\r\n\u6700\u8FD1\u753B\u9762\uFF1A" + last_frame_text},
+                DashboardCard{L"\u663E\u793A\u4E22\u5E27", std::to_wstring(display_dropped_frames), BuildFrameCounterBlock(stats, displayed_frame_count, decoded_frame_count)},
+            }};
+            break;
+        }
+
+        const COLORREF shell_fill = kColorWindowBackground;
+        const COLORREF shell_border = kColorWindowBackground;
+        DrawGlassCard(state, memory_dc, layout.shell, ScaleByDpi(hwnd, 30), shell_fill, shell_border, 0);
+        DrawGlassCard(
+            state,
+            memory_dc,
+            layout.topbar,
+            ScaleByDpi(hwnd, 24),
+            kColorTopbarBackground,
+            kColorTopbarBorder,
+            5);
+        DrawGlassCard(
+            state,
+            memory_dc,
+            layout.sidebar,
+            ScaleByDpi(hwnd, 24),
+            kColorSidebarBackground,
+            kColorSidebarBorder,
+            4);
+
+        const int icon_size = ScaleByDpi(hwnd, 58);
         const RECT icon_rect = MakeRect(
-            layout.hero.left + hero_inner_padding,
-            layout.hero.top + hero_inner_padding,
-            layout.hero.left + hero_inner_padding + icon_size,
-            layout.hero.top + hero_inner_padding + icon_size);
+            layout.topbar.left + ScaleByDpi(hwnd, 18),
+            layout.topbar.top + ScaleByDpi(hwnd, 14),
+            layout.topbar.left + ScaleByDpi(hwnd, 18) + icon_size,
+            layout.topbar.top + ScaleByDpi(hwnd, 14) + icon_size);
         DrawBrandGlyph(memory_dc, icon_rect);
 
-        const int title_left = icon_rect.right + ScaleByDpi(hwnd, 20);
-        const int version_pill_right = static_cast<int>(layout.focus_button.left) - ScaleByDpi(hwnd, 20);
-        const int version_pill_left = std::max(
-            title_left + ScaleByDpi(hwnd, 180),
-            version_pill_right - version_pill_width);
-        const int title_right = std::max(
-            title_left + ScaleByDpi(hwnd, 120),
-            version_pill_left - version_pill_gap);
-        RECT title_rect = MakeRect(
-            title_left,
-            layout.hero.top + hero_inner_padding,
-            title_right,
-            layout.hero.top + hero_inner_padding + ScaleByDpi(hwnd, 36));
-        DrawTextBlock(memory_dc, state->title_font, kStatusWindowTitle, title_rect, kColorTextPrimary, DT_LEFT | DT_TOP | DT_SINGLELINE);
-
-        RECT version_pill_rect = MakeRect(
-            version_pill_left,
-            layout.hero.top + hero_inner_padding + ScaleByDpi(hwnd, 2),
-            version_pill_right,
-            layout.hero.top + hero_inner_padding + ScaleByDpi(hwnd, 2) + pill_height);
+        const int title_left = icon_rect.right + ScaleByDpi(hwnd, 16);
+        const int pill_top = layout.topbar.top + ScaleByDpi(hwnd, 18);
+        const int pill_height = ScaleByDpi(hwnd, 28);
+        const int pill_gap = ScaleByDpi(hwnd, 10);
+        const std::wstring version_text = std::wstring(kTextVersionPrefix) + kAppBuildLabel;
+        const std::wstring page_text = StatusPageLabel(state->current_page);
+        const int version_pill_width = std::max(
+            ScaleByDpi(hwnd, 220),
+            MeasureSingleLineTextWidth(memory_dc, state->subtitle_font, version_text) + ScaleByDpi(hwnd, 28));
+        const int page_pill_width = std::max(
+            ScaleByDpi(hwnd, 96),
+            MeasureSingleLineTextWidth(memory_dc, state->subtitle_font, page_text) + ScaleByDpi(hwnd, 28));
+        const RECT version_pill_rect = MakeRect(
+            layout.topbar.right - ScaleByDpi(hwnd, 18) - version_pill_width,
+            pill_top,
+            layout.topbar.right - ScaleByDpi(hwnd, 18),
+            pill_top + pill_height);
+        const RECT page_pill_rect = MakeRect(
+            version_pill_rect.left - pill_gap - page_pill_width,
+            pill_top,
+            version_pill_rect.left - pill_gap,
+            pill_top + pill_height);
         DrawPill(
             memory_dc,
-            state->body_font,
+            state->subtitle_font,
+            page_pill_rect,
+            page_text,
+            RGB(237, 245, 255),
+            kColorAccentDark);
+        DrawPill(
+            memory_dc,
+            state->subtitle_font,
             version_pill_rect,
-            std::wstring(kTextVersionPrefix) + kAppBuildLabel,
-            RGB(255, 255, 255),
+            version_text,
+            RGB(249, 249, 251),
             kColorTextSecondary);
 
+        const int title_right = std::max(title_left + ScaleByDpi(hwnd, 220), static_cast<int>(page_pill_rect.left) - ScaleByDpi(hwnd, 18));
+        RECT title_rect = MakeRect(
+            title_left,
+            layout.topbar.top + ScaleByDpi(hwnd, 16),
+            title_right,
+            layout.topbar.top + ScaleByDpi(hwnd, 42));
+        DrawTextBlock(
+            memory_dc,
+            state->value_font,
+            kTextAppDisplayTitle,
+            title_rect,
+            kColorTextPrimary,
+            DT_LEFT | DT_TOP | DT_SINGLELINE);
         RECT subtitle_rect = MakeRect(
             title_left,
-            title_rect.bottom + ScaleByDpi(hwnd, 8),
+            title_rect.bottom + ScaleByDpi(hwnd, 6),
             title_right,
-            title_rect.bottom + ScaleByDpi(hwnd, 44));
+            layout.topbar.bottom - ScaleByDpi(hwnd, 14));
         DrawTextBlock(
             memory_dc,
             state->subtitle_font,
-            state->dashboard.subtitle,
+            StatusPageSummary(state->current_page),
             subtitle_rect,
             kColorTextSecondary,
             DT_LEFT | DT_TOP | DT_WORDBREAK);
 
-        RECT control_pill = MakeRect(
-            title_left,
-            layout.hero.bottom - hero_inner_padding - pill_height,
-            title_left + pill_width,
-            layout.hero.bottom - hero_inner_padding);
-        RECT video_pill = MakeRect(
-            control_pill.right + pill_gap,
-            control_pill.top,
-            control_pill.right + pill_gap + pill_width,
-            control_pill.bottom);
-        DrawPill(memory_dc, state->subtitle_font, control_pill, kTextControlPill, kColorAccent, kColorWhite);
-        DrawPill(memory_dc, state->subtitle_font, video_pill, kTextVideoPill, RGB(255, 255, 255), kColorTextPrimary);
+        RECT nav_label_rect = MakeRect(
+            layout.sidebar.left + ScaleByDpi(hwnd, 18),
+            layout.sidebar.top + ScaleByDpi(hwnd, 18),
+            layout.sidebar.right - ScaleByDpi(hwnd, 18),
+            layout.sidebar.top + ScaleByDpi(hwnd, 38));
+        DrawTextBlock(memory_dc, state->subtitle_font, L"\u63A7\u5236\u53F0", nav_label_rect, kColorSidebarMuted, DT_LEFT | DT_TOP | DT_SINGLELINE);
+        RECT nav_subtitle_rect = MakeRect(
+            layout.sidebar.left + ScaleByDpi(hwnd, 18),
+            nav_label_rect.bottom + ScaleByDpi(hwnd, 4),
+            layout.sidebar.right - ScaleByDpi(hwnd, 18),
+            layout.sidebar.top + ScaleByDpi(hwnd, 58));
+        DrawTextBlock(memory_dc, state->section_font, StatusPageLabel(state->current_page), nav_subtitle_rect, kColorSidebarText, DT_LEFT | DT_TOP | DT_SINGLELINE);
+        RECT sidebar_hint_rect = MakeRect(
+            layout.sidebar.left + ScaleByDpi(hwnd, 18),
+            layout.sidebar.bottom - ScaleByDpi(hwnd, 210),
+            layout.sidebar.right - ScaleByDpi(hwnd, 18),
+            layout.sidebar.bottom - ScaleByDpi(hwnd, 18));
+        DrawTextBlock(
+            memory_dc,
+            state->subtitle_font,
+            std::wstring(kTextFeatureDescription) +
+                L"\r\n" + kTextFeatureGroups +
+                L"\r\n" + kTextAuthor +
+                L"\r\n\r\n\u53D1\u9001\u7AEF\uFF1A" + current_sender_name +
+                (sender_version_label.empty() ? std::wstring() : (std::wstring(L"\r\n\u7248\u672C\uFF1A") + sender_version_label)) +
+                L"\r\n\u5730\u5740\uFF1A" + current_host +
+                L"\r\nTCP/" + std::to_wstring(kControlPort) + L"    UDP/" + std::to_wstring(kVideoPort),
+            sidebar_hint_rect,
+            kColorSidebarMuted,
+            DT_LEFT | DT_TOP | DT_WORDBREAK);
+
+        DrawGlassCard(
+            state,
+            memory_dc,
+            layout.hero_main,
+            ScaleByDpi(hwnd, 24),
+            kColorHeroBackground,
+            kColorBorder,
+            7);
+        const int hero_inner_padding = ScaleByDpi(hwnd, 24);
+        const int hero_title_top = layout.hero_main.top + ScaleByDpi(hwnd, 22);
+        const int hero_content_width = std::max(1, RectWidth(layout.hero_main) - hero_inner_padding * 2);
+        const int hero_title_height = std::max(
+            ScaleByDpi(hwnd, 34),
+            MeasureTextBlockHeight(memory_dc, state->title_font, hero_title, hero_content_width, DT_LEFT | DT_TOP | DT_WORDBREAK));
+        RECT hero_title_rect = MakeRect(
+            layout.hero_main.left + hero_inner_padding,
+            hero_title_top,
+            layout.hero_main.right - hero_inner_padding,
+            hero_title_top + hero_title_height);
+        DrawTextBlock(memory_dc, state->title_font, hero_title, hero_title_rect, kColorTextPrimary, DT_LEFT | DT_TOP | DT_WORDBREAK);
+        RECT hero_body_rect = MakeRect(
+            layout.hero_main.left + hero_inner_padding,
+            hero_title_rect.bottom + ScaleByDpi(hwnd, 10),
+            layout.hero_main.right - hero_inner_padding,
+            layout.focus_button.top - ScaleByDpi(hwnd, 14));
+        DrawTextBlock(memory_dc, state->body_font, hero_body, hero_body_rect, kColorTextSecondary, DT_LEFT | DT_TOP | DT_WORDBREAK);
+
+        DrawSpotlightCard(state, memory_dc, layout.hero_side, side_label, side_value, side_body, false);
 
         for (size_t index = 0; index < layout.summary_cards.size(); ++index) {
-            DrawSummaryCard(state, memory_dc, layout.summary_cards[index], state->dashboard.summary_cards[index], index == 0);
+            DrawSummaryCard(state, memory_dc, layout.summary_cards[index], summary_cards[index], index == 0);
         }
 
-        DrawSectionCard(state, memory_dc, layout.traffic_card, kTextTrafficTitle, state->dashboard.traffic_body);
-        DrawSectionCard(state, memory_dc, layout.runtime_card, kTextRuntimeTitle, state->dashboard.runtime_body);
-
-        DrawGlassCard(state, memory_dc, layout.log_card, ScaleByDpi(hwnd, 22), kColorCardBackground, kColorBorder, 11);
-        RECT log_title_rect = MakeRect(
-            layout.log_card.left + ScaleByDpi(hwnd, 20),
-            layout.log_card.top + ScaleByDpi(hwnd, 20),
-            layout.log_card.right - ScaleByDpi(hwnd, 20),
-            layout.log_card.top + ScaleByDpi(hwnd, 48));
-        DrawTextBlock(memory_dc, state->section_font, kTextLogTitle, log_title_rect, kColorTextPrimary, DT_LEFT | DT_TOP | DT_SINGLELINE);
-
-        const std::wstring log_hint = std::wstring(kTextFilePrefix) + ShortenMiddle(ExtractFileName(state->log_file_path), 28);
-        RECT log_hint_rect = log_title_rect;
-        DrawTextBlock(memory_dc, state->body_font, log_hint, log_hint_rect, kColorTextSecondary, DT_RIGHT | DT_TOP | DT_SINGLELINE);
+        if (state->current_page == StatusPage::kDisplay) {
+            DrawSectionCard(state, memory_dc, layout.detail_left, left_title, left_body);
+            DrawSectionCard(state, memory_dc, layout.detail_right, right_title, right_body);
+        } else if (state->current_page == StatusPage::kDiagnostics) {
+            DrawLogCard(state, memory_dc, layout.detail_left, log_title, log_hint);
+            DrawSectionCard(state, memory_dc, layout.detail_right, right_title, right_body + L"\r\n\r\n" + BuildRecentLogPreview(state, 4));
+        } else if (state->current_page == StatusPage::kLogs) {
+            DrawLogCard(state, memory_dc, layout.detail_full, log_title, log_hint);
+        } else {
+            DrawSectionCard(state, memory_dc, layout.detail_left, left_title, left_body);
+            DrawSectionCard(state, memory_dc, layout.detail_right, right_title, right_body);
+        }
     }
 
     BitBlt(target_dc, 0, 0, width, height, memory_dc, 0, 0, SRCCOPY);
@@ -1146,6 +3044,10 @@ void PaintStatusWindow(AppState* state, HWND hwnd, HDC target_dc) {
     DeleteObject(bitmap);
     DeleteDC(memory_dc);
 
+    if (temporary_background_brush != nullptr) {
+        DeleteObject(temporary_background_brush);
+        return;
+    }
     if (state == nullptr || state->window_background_brush != nullptr) {
         return;
     }
@@ -1168,6 +3070,117 @@ std::wstring GetExecutableDirectory() {
     return path.substr(0, slash);
 }
 
+bool FileExists(const std::wstring& path) {
+    if (path.empty()) {
+        return false;
+    }
+
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+bool DirectoryExists(const std::wstring& path) {
+    if (path.empty()) {
+        return false;
+    }
+
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+std::wstring GetLocalAppDataPath() {
+    DWORD required = GetEnvironmentVariableW(L"LOCALAPPDATA", nullptr, 0);
+    if (required == 0) {
+        return L"";
+    }
+
+    std::wstring path(required, L'\0');
+    const DWORD written = GetEnvironmentVariableW(L"LOCALAPPDATA", path.data(), required);
+    if (written == 0) {
+        return L"";
+    }
+    if (!path.empty() && path.back() == L'\0') {
+        path.pop_back();
+    } else {
+        path.resize(written);
+    }
+    return path;
+}
+
+bool EnsureDirectoryPath(const std::wstring& path) {
+    if (path.empty()) {
+        return false;
+    }
+
+    std::error_code error;
+    std::filesystem::create_directories(std::filesystem::path(path), error);
+    return !error;
+}
+
+bool ShouldRefreshVoiceAsset(const std::wstring& source_probe_path, const std::wstring& dest_probe_path) {
+    if (!FileExists(source_probe_path)) {
+        return false;
+    }
+    if (!FileExists(dest_probe_path)) {
+        return true;
+    }
+
+    std::error_code error;
+    const auto source_time = std::filesystem::last_write_time(std::filesystem::path(source_probe_path), error);
+    if (error) {
+        return false;
+    }
+    error.clear();
+    const auto dest_time = std::filesystem::last_write_time(std::filesystem::path(dest_probe_path), error);
+    if (error) {
+        return true;
+    }
+    return source_time > dest_time;
+}
+
+bool CopyDirectoryContents(const std::wstring& source_path, const std::wstring& destination_path) {
+    if (!DirectoryExists(source_path)) {
+        return false;
+    }
+
+    std::error_code error;
+    std::filesystem::create_directories(std::filesystem::path(destination_path), error);
+    if (error) {
+        return false;
+    }
+
+    std::filesystem::copy(
+        std::filesystem::path(source_path),
+        std::filesystem::path(destination_path),
+        std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing,
+        error);
+    return !error;
+}
+
+std::wstring NormalizeFullPath(const std::wstring& path) {
+    if (path.empty()) {
+        return {};
+    }
+
+    DWORD required = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+    if (required == 0) {
+        return path;
+    }
+
+    std::wstring normalized(required, L'\0');
+    const DWORD written = GetFullPathNameW(path.c_str(), required, normalized.data(), nullptr);
+    if (written == 0) {
+        return path;
+    }
+
+    if (!normalized.empty() && normalized.back() == L'\0') {
+        normalized.pop_back();
+    } else {
+        normalized.resize(written);
+    }
+    return normalized;
+}
+
 std::wstring BuildLogFilePath() {
     return GetExecutableDirectory() + L"\\receiver-log.txt";
 }
@@ -1176,12 +3189,1022 @@ std::wstring BuildStatusFilePath() {
     return GetExecutableDirectory() + L"\\receiver-status.json";
 }
 
+std::wstring BuildWebUiFolderPath() {
+    return GetExecutableDirectory() + L"\\web-ui";
+}
+
+std::wstring BuildWebUiUserDataPath() {
+    return GetExecutableDirectory() + L"\\webview-data";
+}
+
 std::wstring BuildProfileCachePath() {
     return GetExecutableDirectory() + L"\\receiver-profile-cache.json";
 }
 
 std::wstring BuildCodecConfigCachePath() {
     return GetExecutableDirectory() + L"\\receiver-codec-config.bin";
+}
+
+std::wstring BuildDanmakuCaptureRootPath() {
+    return NormalizeFullPath(GetExecutableDirectory() + L"\\\u5f39\u5e55\u8bc6\u522b");
+}
+
+std::wstring BuildDanmakuRegionFilePath() {
+    return NormalizeFullPath(BuildDanmakuCaptureRootPath() + L"\\\u5f39\u5e55\u533a\u57df.json");
+}
+
+std::wstring BuildVirtualCameraToolPath() {
+    return GetExecutableDirectory() + L"\\" + virtual_camera::kToolFileName;
+}
+
+std::wstring BuildVirtualCameraMediaSourcePath() {
+    return GetExecutableDirectory() + L"\\" + virtual_camera::kMediaSourceFileName;
+}
+
+std::wstring BuildVirtualCameraPlaceholderPath() {
+    const std::wstring packaged = GetExecutableDirectory() + L"\\" + virtual_camera::kPlaceholderImageFileName;
+    if (FileExists(packaged)) {
+        return packaged;
+    }
+
+    const std::wstring dev_fallback =
+        NormalizeFullPath(GetExecutableDirectory() + L"\\..\\assets\\" + virtual_camera::kPlaceholderImageFileName);
+    if (FileExists(dev_fallback)) {
+        return dev_fallback;
+    }
+
+    return packaged;
+}
+
+std::wstring BuildAirPlayRuntimeRootPath() {
+    const std::wstring packaged = GetExecutableDirectory() + L"\\apple-airplay";
+    if (FileExists(packaged + L"\\_internal\\bin\\uxplay.exe")) {
+        return packaged;
+    }
+
+    const std::wstring dev_fallback = NormalizeFullPath(GetExecutableDirectory() + L"\\..\\..\\..\\tools\\uxplay-windows\\installed");
+    if (FileExists(dev_fallback + L"\\_internal\\bin\\uxplay.exe")) {
+        return dev_fallback;
+    }
+
+    return packaged;
+}
+
+std::wstring BuildAirPlayLogPath() {
+    return GetExecutableDirectory() + L"\\airplay-receiver.log";
+}
+
+std::wstring BuildVoiceRuntimeRootPath() {
+    const std::wstring packaged_source = GetExecutableDirectory() + L"\\voice-runtime";
+    std::wstring source = packaged_source;
+    if (!FileExists(source + L"\\sherpa-onnx-c-api.dll")) {
+        source = NormalizeFullPath(
+            GetExecutableDirectory() + L"\\..\\..\\third_party\\sherpa-onnx\\" +
+            std::wstring(kVoiceRuntimePackageFolder) + L"\\lib");
+    }
+    if (!FileExists(source + L"\\sherpa-onnx-c-api.dll")) {
+        return packaged_source;
+    }
+
+    const std::wstring local_app_data = GetLocalAppDataPath();
+    if (local_app_data.empty()) {
+        return source;
+    }
+
+    const std::wstring cache_root = NormalizeFullPath(local_app_data + L"\\LiveCastAssistant\\offline-voice\\voice-runtime");
+    if (ShouldRefreshVoiceAsset(source + L"\\sherpa-onnx-c-api.dll", cache_root + L"\\sherpa-onnx-c-api.dll") ||
+        !FileExists(cache_root + L"\\sherpa-onnx-c-api.dll")) {
+        if (CopyDirectoryContents(source, cache_root)) {
+            return cache_root;
+        }
+    }
+    return FileExists(cache_root + L"\\sherpa-onnx-c-api.dll") ? cache_root : source;
+}
+
+std::wstring BuildVoiceModelPath() {
+    const std::wstring packaged_target =
+        NormalizeFullPath(BuildVoiceMusicRootPath() + L"\\voice-model\\" + std::wstring(kVoiceModelFolderName));
+    if (FileExists(packaged_target + L"\\encoder.int8.onnx") &&
+        FileExists(packaged_target + L"\\decoder.onnx") &&
+        FileExists(packaged_target + L"\\joiner.int8.onnx") &&
+        FileExists(packaged_target + L"\\tokens.txt")) {
+        return packaged_target;
+    }
+
+    const std::wstring packaged_source = GetExecutableDirectory() + L"\\voice-model\\" + std::wstring(kVoiceModelFolderName);
+    std::wstring source = packaged_source;
+    if (!(FileExists(source + L"\\encoder.int8.onnx") &&
+          FileExists(source + L"\\decoder.onnx") &&
+          FileExists(source + L"\\joiner.int8.onnx") &&
+          FileExists(source + L"\\tokens.txt"))) {
+        source = NormalizeFullPath(
+            GetExecutableDirectory() + L"\\..\\..\\assets\\voice-model-sherpa\\" +
+            std::wstring(kVoiceModelFolderName));
+    }
+    if (!(FileExists(source + L"\\encoder.int8.onnx") &&
+          FileExists(source + L"\\decoder.onnx") &&
+          FileExists(source + L"\\joiner.int8.onnx") &&
+          FileExists(source + L"\\tokens.txt"))) {
+        return packaged_target;
+    }
+
+    if (ShouldRefreshVoiceAsset(source + L"\\encoder.int8.onnx", packaged_target + L"\\encoder.int8.onnx") ||
+        !(FileExists(packaged_target + L"\\encoder.int8.onnx") &&
+          FileExists(packaged_target + L"\\decoder.onnx") &&
+          FileExists(packaged_target + L"\\joiner.int8.onnx") &&
+          FileExists(packaged_target + L"\\tokens.txt"))) {
+        if (CopyDirectoryContents(source, packaged_target)) {
+            return packaged_target;
+        }
+    }
+    return (FileExists(packaged_target + L"\\encoder.int8.onnx") &&
+            FileExists(packaged_target + L"\\decoder.onnx") &&
+            FileExists(packaged_target + L"\\joiner.int8.onnx") &&
+            FileExists(packaged_target + L"\\tokens.txt"))
+               ? packaged_target
+               : source;
+}
+
+std::wstring BuildVoiceModelRuntimePath(const std::wstring& model_source_path) {
+    if (!(FileExists(model_source_path + L"\\encoder.int8.onnx") &&
+          FileExists(model_source_path + L"\\decoder.onnx") &&
+          FileExists(model_source_path + L"\\joiner.int8.onnx") &&
+          FileExists(model_source_path + L"\\tokens.txt"))) {
+        return model_source_path;
+    }
+
+    std::error_code error;
+    const std::filesystem::path exe_dir(GetExecutableDirectory());
+    const std::wstring drive_root = exe_dir.root_path().wstring();
+    if (drive_root.empty()) {
+        return model_source_path;
+    }
+
+    const std::wstring runtime_root =
+        NormalizeFullPath(drive_root + L"LiveCastAssistantRuntime\\voice-model\\" + std::wstring(kVoiceModelFolderName));
+    if (ShouldRefreshVoiceAsset(model_source_path + L"\\encoder.int8.onnx", runtime_root + L"\\encoder.int8.onnx") ||
+        !(FileExists(runtime_root + L"\\encoder.int8.onnx") &&
+          FileExists(runtime_root + L"\\decoder.onnx") &&
+          FileExists(runtime_root + L"\\joiner.int8.onnx") &&
+          FileExists(runtime_root + L"\\tokens.txt"))) {
+        std::filesystem::create_directories(std::filesystem::path(runtime_root).parent_path(), error);
+        error.clear();
+        if (CopyDirectoryContents(model_source_path, runtime_root)) {
+            return runtime_root;
+        }
+    }
+
+    return (FileExists(runtime_root + L"\\encoder.int8.onnx") &&
+            FileExists(runtime_root + L"\\decoder.onnx") &&
+            FileExists(runtime_root + L"\\joiner.int8.onnx") &&
+            FileExists(runtime_root + L"\\tokens.txt"))
+               ? runtime_root
+               : model_source_path;
+}
+
+std::wstring BuildVoiceMusicRootPath() {
+    return GetExecutableDirectory() + L"\\\u8BED\u97F3\u70B9\u6B4C";
+}
+
+std::wstring BuildAirPlayStatusText(const AppState* state) {
+    if (state == nullptr) {
+        return L"\u672A\u5C31\u7EEA";
+    }
+
+    if (state->airplay_controller.running()) {
+        return L"\u5DF2\u542F\u52A8";
+    }
+    if (!state->airplay_controller.installed()) {
+        return L"\u7EC4\u4EF6\u7F3A\u5931";
+    }
+    if (!state->airplay_controller.bonjour_installed()) {
+        return L"Bonjour \u7F3A\u5931";
+    }
+    if (!state->airplay_controller.bonjour_running()) {
+        return L"Bonjour \u672A\u8FD0\u884C";
+    }
+    if (!state->airplay_controller.last_error().empty()) {
+        return L"\u542F\u52A8\u5931\u8D25";
+    }
+    return L"\u5DF2\u5C31\u7EEA\u672A\u542F\u52A8";
+}
+
+void RefreshAirPlayState(AppState* state) {
+    if (state == nullptr) {
+        return;
+    }
+
+    state->airplay_controller.RefreshInstallState();
+    UpdateActionButtons(state);
+    if (state->status_window != nullptr) {
+        PostMessageW(state->status_window, kStatsMessage, 0, 0);
+    }
+}
+
+void StartAirPlayReceiver(AppState* state, bool automatic) {
+    if (state == nullptr) {
+        return;
+    }
+
+    RefreshAirPlayState(state);
+    if (!state->airplay_controller.installed()) {
+        if (!automatic) {
+            QueueLog(state, L"\u82F9\u679C\u6295\u5C4F: \u672A\u68C0\u6D4B\u5230 apple-airplay \u8FD0\u884C\u65F6\u76EE\u5F55\uFF0C\u8BF7\u4F7F\u7528\u968F\u6210\u54C1\u4E00\u8D77\u6253\u5305\u7684 PC \u7248\u672C\u3002");
+        }
+        return;
+    }
+
+    if (state->airplay_controller.running()) {
+        if (!automatic) {
+            QueueLog(state, L"\u82F9\u679C\u6295\u5C4F: AirPlay \u670D\u52A1\u5DF2\u5728\u8FD0\u884C\u3002");
+        }
+        return;
+    }
+
+    state->airplay_controller.Start(kAirPlayServerName);
+    RefreshAirPlayState(state);
+}
+
+void StopAirPlayReceiver(AppState* state, bool write_log) {
+    if (state == nullptr) {
+        return;
+    }
+
+    (void)write_log;
+    state->airplay_controller.Stop();
+    RefreshAirPlayState(state);
+}
+
+std::wstring BuildVirtualCameraStatusText(const AppState* state) {
+    if (state == nullptr) {
+        return L"\u672A\u5C31\u7EEA";
+    }
+
+    if (state->virtual_camera_controller.starting()) {
+        return L"\u542F\u52A8\u4E2D";
+    }
+    if (state->virtual_camera_controller.running()) {
+        return L"\u5DF2\u542F\u52A8";
+    }
+    if (state->virtual_camera_controller.installed()) {
+        if (!state->virtual_camera_controller.last_error().empty()) {
+            return L"\u542F\u52A8\u5931\u8D25";
+        }
+        if (!state->virtual_camera_controller.install_warning().empty()) {
+            return L"\u5DF2\u5B89\u88C5\uFF0C\u4F46\u76EE\u5F55\u4E0D\u4E00\u81F4";
+        }
+        return L"\u5DF2\u5B89\u88C5\u672A\u542F\u52A8";
+    }
+    if (FileExists(state->virtual_camera_tool_path) && FileExists(state->virtual_camera_media_source_path)) {
+        return L"\u5F85\u5B89\u88C5";
+    }
+    return L"\u7EC4\u4EF6\u7F3A\u5931";
+}
+
+void NotifyVirtualCameraStateChanged(AppState* state) {
+    if (state == nullptr) {
+        return;
+    }
+
+    UpdateActionButtons(state);
+    if (state->status_window != nullptr) {
+        PostMessageW(state->status_window, kStatsMessage, 0, 0);
+    }
+}
+
+void HandleVirtualCameraControllerStateChanged(AppState* state) {
+    if (state == nullptr) {
+        return;
+    }
+
+    if (!state->virtual_camera_controller.running() && !state->virtual_camera_controller.starting()) {
+        if (state->virtual_camera_bridge.running()) {
+            state->virtual_camera_bridge.Stop();
+        }
+        if (state->decoder != nullptr) {
+            state->decoder->SetPreferBgraOutput(false);
+        }
+    }
+
+    NotifyVirtualCameraStateChanged(state);
+}
+
+void RefreshVirtualCameraState(AppState* state) {
+    if (state == nullptr) {
+        return;
+    }
+
+    state->virtual_camera_controller.RefreshInstallState(state->virtual_camera_media_source_path);
+    NotifyVirtualCameraStateChanged(state);
+}
+
+std::vector<std::wstring> BuildVoiceCommandPhraseList() {
+    return VoiceIntentResolver::CollectMediaCommandPhrases();
+}
+
+std::vector<std::wstring> BuildVoiceRecognitionGrammar(AppState* state) {
+    std::unordered_set<std::wstring> dedup;
+    std::vector<std::wstring> grammar;
+
+    auto append = [&](const std::wstring& phrase) {
+        const std::wstring trimmed = TrimWhitespace(phrase);
+        if (trimmed.empty()) {
+            return;
+        }
+        if (dedup.insert(trimmed).second) {
+            grammar.push_back(trimmed);
+        }
+    };
+
+    for (const auto& phrase : BuildVoiceCommandPhraseList()) {
+        append(phrase);
+    }
+
+    if (state != nullptr && state->voice_music_library != nullptr) {
+        for (const auto& alias : state->voice_music_library->CollectAliases()) {
+            append(alias);
+        }
+    }
+
+    if (state != nullptr) {
+        state->voice_exact_phrases = dedup;
+    }
+    return grammar;
+}
+
+std::vector<std::wstring> BuildVoiceRecognitionHotwords(AppState* state) {
+    std::unordered_set<std::wstring> dedup;
+    std::vector<std::wstring> hotwords;
+
+    auto append = [&](const std::wstring& phrase) {
+        const std::wstring trimmed = TrimWhitespace(phrase);
+        if (trimmed.empty()) {
+            return;
+        }
+
+        const std::wstring normalized = VoiceIntentResolver::NormalizePhrase(trimmed);
+        if (normalized.size() < 2) {
+            return;
+        }
+
+        if (dedup.insert(normalized).second) {
+            hotwords.push_back(trimmed);
+        }
+    };
+
+    for (const auto& phrase : BuildVoiceCommandPhraseList()) {
+        append(phrase);
+    }
+
+    if (state != nullptr && state->voice_music_library != nullptr) {
+        for (const auto& alias : state->voice_music_library->CollectAliases()) {
+            append(alias);
+        }
+    }
+
+    return hotwords;
+}
+
+void RefreshVoiceRecognitionContext(AppState* state, bool restart_if_enabled, bool write_log) {
+    if (state == nullptr) {
+        return;
+    }
+
+    const std::vector<std::wstring> grammar = BuildVoiceRecognitionGrammar(state);
+    const std::vector<std::wstring> hotwords = BuildVoiceRecognitionHotwords(state);
+    if (write_log) {
+        std::wostringstream stream;
+        stream << L"语音控制：已刷新识别词表，短语数=" << grammar.size() << L"。";
+        stream.str(L"");
+        stream.clear();
+        stream << L"\u8BED\u97F3\u63A7\u5236: \u5DF2\u5237\u65B0\u8BC6\u522B\u8BCD\u8868\uFF0C\u77ED\u8BED\u6570="
+               << grammar.size()
+               << L"\uFF0C\u70ED\u8BCD\u6570="
+               << hotwords.size()
+               << L"\u3002";
+        QueueLog(state, stream.str());
+    }
+
+    if (!restart_if_enabled || !state->voice_control_enabled) {
+        return;
+    }
+
+    StopVoiceControl(state, false);
+    if (StartVoiceControl(state)) {
+        if (write_log) {
+            QueueLog(state, L"语音控制：已重新加载识别词表。");
+        }
+    } else if (write_log) {
+        QueueLog(state, L"语音控制：重新加载识别词表失败。");
+    }
+}
+
+std::wstring BuildVoiceControlStatusText(const AppState* state) {
+    if (state == nullptr) {
+        return kTextVoiceControlUnavailable;
+    }
+    if (state->voice_control_enabled) {
+        return state->voice_control_status.empty() ? std::wstring(kTextVoiceControlListening) : state->voice_control_status;
+    }
+    return state->voice_control_status.empty() ? std::wstring(kTextVoiceControlDisabled) : state->voice_control_status;
+}
+
+bool ShouldQueueVoicePhrase(AppState* state, const std::wstring& phrase, bool is_final) {
+    static_cast<void>(state);
+    static_cast<void>(phrase);
+    return is_final;
+}
+
+std::wstring FormatVoiceIntentScore(float score) {
+    std::wostringstream stream;
+    stream << std::fixed << std::setprecision(2) << score;
+    return stream.str();
+}
+
+std::wstring VoiceMediaCommandIntentText(VoiceMediaCommandIntent intent) {
+    return VoiceIntentResolver::IntentDisplayText(intent);
+}
+
+bool TryInvokeSessionMediaCommand(
+    const winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSession& session,
+    VoiceMediaCommandIntent intent) {
+    if (!session) {
+        return false;
+    }
+
+    const auto playback_info = session.GetPlaybackInfo();
+    const auto controls = playback_info.Controls();
+    switch (intent) {
+    case VoiceMediaCommandIntent::kPlay:
+        return controls.IsPlayEnabled() && session.TryPlayAsync().get();
+    case VoiceMediaCommandIntent::kPause:
+        return controls.IsPauseEnabled() && session.TryPauseAsync().get();
+    case VoiceMediaCommandIntent::kPrevious:
+        return controls.IsPreviousEnabled() && session.TrySkipPreviousAsync().get();
+    case VoiceMediaCommandIntent::kNext:
+        return controls.IsNextEnabled() && session.TrySkipNextAsync().get();
+    case VoiceMediaCommandIntent::kNone:
+    default:
+        if (controls.IsPlayPauseToggleEnabled()) {
+            return session.TryTogglePlayPauseAsync().get();
+        }
+
+        constexpr int kPlaybackStatusPlaying = 4;
+        const int playback_status = static_cast<int>(playback_info.PlaybackStatus());
+        if (playback_status == kPlaybackStatusPlaying && controls.IsPauseEnabled()) {
+            return session.TryPauseAsync().get();
+        }
+        if (controls.IsPlayEnabled()) {
+            return session.TryPlayAsync().get();
+        }
+        return controls.IsPauseEnabled() && session.TryPauseAsync().get();
+    }
+}
+
+bool TryDispatchSystemMediaSession(VoiceMediaCommandIntent intent, std::wstring* failure_detail) {
+    try {
+        const auto manager =
+            winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
+
+        const auto current_session = manager.GetCurrentSession();
+        if (TryInvokeSessionMediaCommand(current_session, intent)) {
+            return true;
+        }
+
+        const auto sessions = manager.GetSessions();
+        const uint32_t session_count = sessions.Size();
+        for (uint32_t index = 0; index < session_count; ++index) {
+            if (TryInvokeSessionMediaCommand(sessions.GetAt(index), intent)) {
+                return true;
+            }
+        }
+
+        if (failure_detail != nullptr) {
+            *failure_detail = L"\u5F53\u524D\u6CA1\u6709\u627E\u5230\u53EF\u63A7\u5236\u7684\u7CFB\u7EDF\u5A92\u4F53\u4F1A\u8BDD";
+        }
+    } catch (const winrt::hresult_error& error) {
+        if (failure_detail != nullptr) {
+            *failure_detail = std::wstring(L"\u7CFB\u7EDF\u5A92\u4F53\u4F1A\u8BDD\u63A5\u53E3\u5931\u8D25\uFF1A") + error.message().c_str();
+        }
+    } catch (...) {
+        if (failure_detail != nullptr) {
+            *failure_detail = L"\u7CFB\u7EDF\u5A92\u4F53\u4F1A\u8BDD\u63A5\u53E3\u5F02\u5E38";
+        }
+    }
+    return false;
+}
+
+bool SendMediaAppCommand(VoiceMediaCommandIntent intent) {
+    WORD app_command = APPCOMMAND_MEDIA_PLAY_PAUSE;
+    switch (intent) {
+    case VoiceMediaCommandIntent::kPlay:
+        app_command = APPCOMMAND_MEDIA_PLAY;
+        break;
+    case VoiceMediaCommandIntent::kPause:
+        app_command = APPCOMMAND_MEDIA_PAUSE;
+        break;
+    case VoiceMediaCommandIntent::kPrevious:
+        app_command = APPCOMMAND_MEDIA_PREVIOUSTRACK;
+        break;
+    case VoiceMediaCommandIntent::kNext:
+        app_command = APPCOMMAND_MEDIA_NEXTTRACK;
+        break;
+    case VoiceMediaCommandIntent::kNone:
+    default:
+        app_command = APPCOMMAND_MEDIA_PLAY_PAUSE;
+        break;
+    }
+
+    const LPARAM command_param = static_cast<LPARAM>(static_cast<DWORD>(app_command) << 16);
+    DWORD_PTR result = 0;
+    bool sent = false;
+
+    const HWND foreground_window = GetForegroundWindow();
+    if (foreground_window != nullptr) {
+        sent = SendMessageTimeoutW(
+                   foreground_window,
+                   WM_APPCOMMAND,
+                   reinterpret_cast<WPARAM>(foreground_window),
+                   command_param,
+                   SMTO_ABORTIFHUNG,
+                   250,
+                   &result) != 0 ||
+               sent;
+    }
+
+    const HWND shell_window = GetShellWindow();
+    if (shell_window != nullptr && shell_window != foreground_window) {
+        sent = SendMessageTimeoutW(
+                   shell_window,
+                   WM_APPCOMMAND,
+                   reinterpret_cast<WPARAM>(shell_window),
+                   command_param,
+                   SMTO_ABORTIFHUNG,
+                   250,
+                   &result) != 0 ||
+               sent;
+    }
+
+    sent = SendMessageTimeoutW(
+               HWND_BROADCAST,
+               WM_APPCOMMAND,
+               0,
+               command_param,
+               SMTO_ABORTIFHUNG,
+               250,
+               &result) != 0 ||
+           sent;
+    return sent;
+}
+
+bool SendMediaKey(AppState* state, WORD virtual_key) {
+    INPUT inputs[2]{};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = virtual_key;
+    inputs[0].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = virtual_key;
+    inputs[1].ki.dwFlags = KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP;
+    const UINT sent = SendInput(static_cast<UINT>(_countof(inputs)), inputs, sizeof(INPUT));
+    if (sent != _countof(inputs)) {
+        if (state != nullptr) {
+            state->voice_control_status = L"\u5A92\u4F53\u952E\u53D1\u9001\u5931\u8D25";
+        }
+        return false;
+    }
+    return true;
+}
+
+bool DispatchVoiceMediaCommand(AppState* state, VoiceMediaCommandIntent intent, std::wstring* result_text) {
+    std::wstring failure_detail;
+    if (TryDispatchSystemMediaSession(intent, &failure_detail)) {
+        if (result_text != nullptr) {
+            *result_text = VoiceMediaCommandIntentText(intent) + L"\uFF08\u7CFB\u7EDF\u5A92\u4F53\u4F1A\u8BDD\uFF09";
+        }
+        return true;
+    }
+
+    if (SendMediaAppCommand(intent)) {
+        if (result_text != nullptr) {
+            *result_text = VoiceMediaCommandIntentText(intent) + L"\uFF08\u7CFB\u7EDF\u5A92\u4F53\u547D\u4EE4\uFF09";
+        }
+        return true;
+    }
+
+    WORD fallback_key = VK_MEDIA_PLAY_PAUSE;
+    switch (intent) {
+    case VoiceMediaCommandIntent::kPrevious:
+        fallback_key = VK_MEDIA_PREV_TRACK;
+        break;
+    case VoiceMediaCommandIntent::kNext:
+        fallback_key = VK_MEDIA_NEXT_TRACK;
+        break;
+    case VoiceMediaCommandIntent::kPause:
+    case VoiceMediaCommandIntent::kPlay:
+    case VoiceMediaCommandIntent::kNone:
+    default:
+        fallback_key = VK_MEDIA_PLAY_PAUSE;
+        break;
+    }
+
+    if (SendMediaKey(state, fallback_key)) {
+        if (result_text != nullptr) {
+            *result_text = VoiceMediaCommandIntentText(intent) + L"\uFF08\u5A92\u4F53\u952E\u517C\u5BB9\u515C\u5E95\uFF09";
+        }
+        return true;
+    }
+
+    if (result_text != nullptr) {
+        *result_text = failure_detail.empty() ? L"\u672A\u627E\u5230\u53EF\u63A7\u5236\u7684\u5A92\u4F53" : failure_detail;
+    }
+    return false;
+}
+
+bool DispatchVoiceMusicCommand(AppState* state, const std::wstring& phrase, std::wstring* result_text) {
+    if (state == nullptr || state->voice_music_library == nullptr || state->local_music_player == nullptr) {
+        return false;
+    }
+
+    VoiceMusicSelection selection;
+    std::wstring detail;
+    const VoiceMusicResolveStatus resolve_status =
+        state->voice_music_library->ResolveRandomTrack(phrase, &selection, &detail);
+    if (resolve_status == VoiceMusicResolveStatus::kNoMatch) {
+        return false;
+    }
+
+    if (resolve_status == VoiceMusicResolveStatus::kNoFiles) {
+        if (result_text != nullptr) {
+            *result_text = std::wstring(L"\u547D\u4E2D\u201C") + selection.folder_name +
+                           L"\u201D\u76EE\u5F55\uFF0C\u4F46\u91CC\u9762\u8FD8\u6CA1\u6709\u53EF\u64AD\u653E\u7684\u97F3\u9891";
+        }
+        return true;
+    }
+
+    if (resolve_status == VoiceMusicResolveStatus::kError) {
+        if (result_text != nullptr) {
+            *result_text = detail.empty() ? L"\u8BED\u97F3\u70B9\u6B4C\u76EE\u5F55\u521D\u59CB\u5316\u5931\u8D25" : detail;
+        }
+        return true;
+    }
+
+    std::wstring play_detail;
+    if (!state->local_music_player->PlayFile(selection.file_path, &play_detail)) {
+        if (result_text != nullptr) {
+            *result_text = play_detail.empty() ? L"\u672C\u5730\u97F3\u4E50\u64AD\u653E\u542F\u52A8\u5931\u8D25" : play_detail;
+        }
+        return true;
+    }
+
+    if (result_text != nullptr) {
+        *result_text = std::wstring(L"\u5DF2\u5728\u201C") + selection.folder_name + L"\u201D\u91CC\u968F\u673A\u64AD\u653E\u300C" +
+                       selection.file_name + L"\u300D";
+    }
+    return true;
+}
+
+bool DispatchStopLocalMusicCommand(AppState* state, const std::wstring& phrase, std::wstring* result_text) {
+    if (state == nullptr || state->local_music_player == nullptr) {
+        return false;
+    }
+
+    if (!state->local_music_player->running()) {
+        if (result_text != nullptr) {
+            *result_text = L"\u5F53\u524D\u6CA1\u6709\u6B63\u5728\u64AD\u653E\u7684\u70B9\u6B4C\u97F3\u4E50";
+        }
+        return true;
+    }
+
+    const std::wstring current_file = state->local_music_player->current_file();
+    state->local_music_player->Stop();
+
+    if (result_text != nullptr) {
+        if (current_file.empty()) {
+            *result_text = L"\u5DF2\u505C\u6B62\u5F53\u524D\u70B9\u6B4C\u64AD\u653E";
+        } else {
+            const size_t slash = current_file.find_last_of(L"\\/");
+            const std::wstring file_name =
+                slash == std::wstring::npos ? current_file : current_file.substr(slash + 1);
+            *result_text = std::wstring(L"\u5DF2\u505C\u6B62\u64AD\u653E\u300C") + file_name + L"\u300D";
+        }
+    }
+    return true;
+}
+
+bool StartVoiceControl(AppState* state) {
+    if (state == nullptr || state->status_window == nullptr) {
+        return false;
+    }
+    if (state->voice_control_enabled) {
+        return true;
+    }
+
+    StopVoiceControl(state, false);
+
+    if (state->voice_controller == nullptr) {
+        state->voice_controller = std::make_unique<VoiceCommandController>(
+            [state](const std::wstring& line) { QueueLog(state, line); });
+    }
+
+    VoiceCommandController::Config config;
+    config.runtime_directory = state->voice_runtime_root_path;
+    config.model_directory = BuildVoiceModelRuntimePath(state->voice_model_path);
+    config.grammar_phrases = BuildVoiceRecognitionGrammar(state);
+    config.hotwords_phrases = BuildVoiceRecognitionHotwords(state);
+    config.hotwords_score = 1.5f;
+    if (config.model_directory != state->voice_model_path) {
+        QueueLog(state, std::wstring(L"语音控制：模型源目录=") + state->voice_model_path);
+        QueueLog(state, std::wstring(L"语音控制：模型运行目录=") + config.model_directory);
+    }
+
+    if (!FileExists(config.runtime_directory + L"\\sherpa-onnx-c-api.dll")) {
+        state->voice_control_status = L"\u79BB\u7EBF\u8BED\u97F3\u7EC4\u4EF6\u7F3A\u5931";
+        QueueLog(state, L"\u8BED\u97F3\u63A7\u5236: \u672A\u627E\u5230 sherpa-onnx-c-api.dll\uFF0C\u8BF7\u786E\u8BA4 voice-runtime \u76EE\u5F55\u5B58\u5728\u3002");
+        UpdateActionButtons(state);
+        return false;
+    }
+    if (!FileExists(config.model_directory + L"\\encoder.int8.onnx") ||
+        !FileExists(config.model_directory + L"\\decoder.onnx") ||
+        !FileExists(config.model_directory + L"\\joiner.int8.onnx") ||
+        !FileExists(config.model_directory + L"\\tokens.txt")) {
+        state->voice_control_status = L"\u79BB\u7EBF\u8BED\u97F3\u6A21\u578B\u7F3A\u5931";
+        QueueLog(state, L"\u8BED\u97F3\u63A7\u5236: \u672A\u627E\u5230 sherpa-onnx \u4E2D\u6587\u6A21\u578B\u6587\u4EF6\uFF0C\u8BF7\u786E\u8BA4 voice-model \u76EE\u5F55\u5B58\u5728\u3002");
+        UpdateActionButtons(state);
+        return false;
+    }
+
+    const bool started = state->voice_controller->Start(
+        config,
+        [state](const std::wstring& phrase, bool is_final) {
+            if (!ShouldQueueVoicePhrase(state, phrase, is_final)) {
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(state->voice_phrase_mutex);
+                state->pending_voice_phrases.push_back(phrase);
+            }
+            if (state->status_window != nullptr) {
+                PostMessageW(state->status_window, kVoiceCommandMessage, 0, 0);
+            }
+        });
+    if (!started) {
+        state->voice_control_status = kTextVoiceControlUnavailable;
+        UpdateActionButtons(state);
+        if (state->status_window != nullptr) {
+            PostMessageW(state->status_window, kStatsMessage, 0, 0);
+        }
+        return false;
+    }
+
+    state->voice_control_enabled = true;
+    state->voice_control_status = L"\u79BB\u7EBF\u8BED\u97F3\u5DF2\u5F00\u542F\uFF0C\u53EA\u5904\u7406\u660E\u786E\u53E3\u4EE4";
+    QueueLog(state, L"\u8BED\u97F3\u63A7\u5236: \u5DF2\u5207\u6362\u4E3A\u63A5\u6536\u7AEF\u81EA\u5E26\u7684\u79BB\u7EBF\u8BC6\u522B\u3002\u73B0\u5728\u53EA\u6709\u201C\u64AD\u653E\u97F3\u4E50\u201D\u3001\u201C\u6682\u505C\u97F3\u4E50\u201D\u3001\u201C\u4E0A\u4E00\u66F2\u201D\u3001\u201C\u4E0B\u4E00\u66F2\u201D\u8FD9\u56DB\u7C7B\u5A92\u4F53\u53E3\u4EE4\u4F1A\u8D70\u7CFB\u7EDF\u5A92\u4F53\u952E\u63A7\u5236\u3002\u9664\u6B64\u4E4B\u5916\u7684\u8BED\u97F3\u7ED3\u679C\uFF0C\u53EA\u8981\u547D\u4E2D\u201C\u8BED\u97F3\u70B9\u6B4C\u201D\u66F2\u5E93\u76EE\u5F55\u6216\u522B\u540D\uFF0C\u5C31\u4E00\u5F8B\u4EA4\u7ED9\u5185\u7F6E\u64AD\u653E\u5668\u5904\u7406\u3002\u6267\u884C\u540E\u4F1A\u77ED\u6682\u5FFD\u7565\u9EA6\u514B\u98CE\u56DE\u58F0\u3002");
+    UpdateActionButtons(state);
+    PostMessageW(state->status_window, kStatsMessage, 0, 0);
+    return true;
+}
+
+void StopVoiceControl(AppState* state, bool write_log) {
+    if (state == nullptr) {
+        return;
+    }
+
+    const bool was_enabled = state->voice_control_enabled;
+    if (state->voice_controller != nullptr) {
+        state->voice_controller->Stop();
+    }
+    {
+        std::lock_guard<std::mutex> lock(state->voice_phrase_mutex);
+        state->pending_voice_phrases.clear();
+    }
+    state->voice_control_enabled = false;
+    state->voice_control_status = kTextVoiceControlDisabled;
+    if (write_log && was_enabled) {
+        QueueLog(state, L"\u8BED\u97F3\u63A7\u5236: \u5DF2\u5173\u95ED\u3002");
+    }
+    UpdateActionButtons(state);
+    if (state->status_window != nullptr) {
+        PostMessageW(state->status_window, kStatsMessage, 0, 0);
+    }
+}
+
+void HandleVoiceCommandMessage(AppState* state) {
+    if (state == nullptr || !state->voice_control_enabled) {
+        return;
+    }
+
+    std::deque<std::wstring> phrases;
+    {
+        std::lock_guard<std::mutex> lock(state->voice_phrase_mutex);
+        phrases.swap(state->pending_voice_phrases);
+    }
+    if (phrases.empty()) {
+        return;
+    }
+
+    for (const std::wstring& phrase : phrases) {
+        const std::wstring normalized_phrase = VoiceIntentResolver::NormalizePhrase(phrase);
+        const VoiceMediaIntentMatch media_match = VoiceIntentResolver::ResolveMediaCommand(phrase);
+        state->voice_control_status = std::wstring(L"\u5DF2\u542C\u5230\uFF1A") + phrase;
+        const ULONGLONG now = GetTickCount64();
+
+        std::wstring dispatch_result;
+        bool handled = false;
+        if (media_match.accepted && media_match.intent != VoiceMediaCommandIntent::kNone) {
+            if (now - state->last_voice_media_command_tick < kVoiceMediaCommandDebounceMs) {
+                continue;
+            }
+            handled = true;
+            if (DispatchVoiceMediaCommand(state, media_match.intent, &dispatch_result)) {
+                state->last_voice_media_command_tick = now;
+                if (state->voice_controller != nullptr) {
+                    state->voice_controller->SuppressFor(kVoiceCommandRecoverySuppressMs);
+                }
+                state->voice_control_status = std::wstring(L"\u5DF2\u542C\u5230\uFF1A") + phrase + L"\uFF0C\u5DF2\u6267\u884C" + dispatch_result;
+                std::wostringstream stream;
+                stream << L"\u8BED\u97F3\u63A7\u5236: \u8BC6\u522B\u5230\u201C" << phrase
+                       << L"\u201D\uFF0C\u5F52\u4E00\u5316\u201C" << normalized_phrase
+                       << L"\u201D\uFF0C\u610F\u56FE=" << VoiceMediaCommandIntentText(media_match.intent)
+                       << L"\uFF0C\u5339\u914D\u201C" << media_match.matched_phrase
+                       << L"\u201D\uFF0C\u5F97\u5206=" << FormatVoiceIntentScore(media_match.score)
+                       << L"\uFF0C\u5DF2\u6267\u884C" << dispatch_result << L"\u3002";
+                QueueLog(state, stream.str());
+            } else {
+                state->voice_control_status = std::wstring(L"\u5DF2\u542C\u5230\uFF1A") + phrase + L"\uFF0C\u4F46" + dispatch_result;
+                std::wostringstream stream;
+                stream << L"\u8BED\u97F3\u63A7\u5236: \u8BC6\u522B\u5230\u201C" << phrase
+                       << L"\u201D\uFF0C\u5F52\u4E00\u5316\u201C" << normalized_phrase
+                       << L"\u201D\uFF0C\u610F\u56FE=" << VoiceMediaCommandIntentText(media_match.intent)
+                       << L"\uFF0C\u5339\u914D\u201C" << media_match.matched_phrase
+                       << L"\u201D\uFF0C\u5F97\u5206=" << FormatVoiceIntentScore(media_match.score)
+                       << L"\uFF0C\u4F46" << dispatch_result << L"\u3002";
+                QueueLog(state, stream.str());
+            }
+            continue;
+        }
+
+        if (now - state->last_voice_music_command_tick < kVoiceMusicCommandDebounceMs) {
+            continue;
+        }
+        if (DispatchVoiceMusicCommand(state, phrase, &dispatch_result)) {
+            handled = true;
+            state->last_voice_music_command_tick = now;
+            if (state->voice_controller != nullptr) {
+                state->voice_controller->SuppressFor(kVoiceCommandRecoverySuppressMs);
+            }
+            state->voice_control_status = std::wstring(L"\u5DF2\u542C\u5230\uFF1A") + phrase + L"\uFF0C" + dispatch_result;
+            std::wostringstream stream;
+            stream << L"\u8BED\u97F3\u70B9\u6B4C: \u8BC6\u522B\u5230\u201C" << phrase
+                   << L"\u201D\uFF0C\u5F52\u4E00\u5316\u201C" << normalized_phrase
+                   << L"\u201D\uFF0C\u4EA4\u7ED9\u5185\u7F6E\u64AD\u653E\u5668\u5904\u7406\uFF0C"
+                   << dispatch_result << L"\u3002";
+            QueueLog(state, stream.str());
+        }
+
+        if (handled) {
+            continue;
+        }
+
+        state->voice_control_status = std::wstring(L"\u5DF2\u542C\u5230\uFF1A") + phrase + L"\uFF0C\u672A\u547D\u4E2D\u6307\u4EE4";
+        std::wostringstream stream;
+        stream << L"\u8BED\u97F3\u63A7\u5236: \u8BC6\u522B\u5230\u201C" << phrase
+               << L"\u201D\uFF0C\u5F52\u4E00\u5316\u201C" << normalized_phrase
+               << L"\u201D\uFF0C\u672A\u547D\u4E2D\u5A92\u4F53\u6307\u4EE4\u6216\u70B9\u6B4C\u76EE\u5F55\u3002";
+        QueueLog(state, stream.str());
+    }
+    if (state->status_window != nullptr) {
+        PostMessageW(state->status_window, kStatsMessage, 0, 0);
+    }
+}
+
+bool RunVirtualCameraTool(AppState* state, const wchar_t* arguments, bool elevated) {
+    if (state == nullptr) {
+        return false;
+    }
+    if (!FileExists(state->virtual_camera_tool_path)) {
+        QueueLog(state, L"\u865A\u62DF\u6444\u50CF\u5934: \u627E\u4E0D\u5230\u5B89\u88C5\u5DE5\u5177\uFF0C\u8BF7\u786E\u8BA4 live-cast-virtual-camera-tool.exe \u4E0E\u63A5\u6536\u7AEF\u5728\u540C\u76EE\u5F55\u3002");
+        return false;
+    }
+
+    const std::wstring working_directory = GetExecutableDirectory();
+    SHELLEXECUTEINFOW execute_info{};
+    execute_info.cbSize = sizeof(execute_info);
+    execute_info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    execute_info.hwnd = state->status_window;
+    execute_info.lpVerb = elevated ? L"runas" : L"open";
+    execute_info.lpFile = state->virtual_camera_tool_path.c_str();
+    execute_info.lpParameters = arguments;
+    execute_info.lpDirectory = working_directory.empty() ? nullptr : working_directory.c_str();
+    execute_info.nShow = SW_SHOWNORMAL;
+
+    if (!ShellExecuteExW(&execute_info)) {
+        const DWORD last_error = GetLastError();
+        if (last_error == ERROR_CANCELLED) {
+            QueueLog(state, L"\u865A\u62DF\u6444\u50CF\u5934: \u5DF2\u53D6\u6D88\u7BA1\u7406\u5458\u6388\u6743\uFF0C\u672C\u6B21\u5B89\u88C5\u672A\u6267\u884C\u3002");
+        } else {
+            std::wostringstream stream;
+            stream << L"\u865A\u62DF\u6444\u50CF\u5934: \u542F\u52A8\u5DE5\u5177\u5931\u8D25\uFF0CWin32 \u9519\u8BEF " << last_error;
+            QueueLog(state, stream.str());
+        }
+        return false;
+    }
+
+    DWORD exit_code = ERROR_GEN_FAILURE;
+    WaitForSingleObject(execute_info.hProcess, INFINITE);
+    GetExitCodeProcess(execute_info.hProcess, &exit_code);
+    CloseHandle(execute_info.hProcess);
+
+    if (exit_code != 0) {
+        std::wostringstream stream;
+        stream << L"\u865A\u62DF\u6444\u50CF\u5934: \u5DE5\u5177\u6267\u884C\u5931\u8D25\uFF0C\u9000\u51FA\u7801 " << exit_code;
+        QueueLog(state, stream.str());
+        return false;
+    }
+
+    return true;
+}
+
+void StopVirtualCamera(AppState* state, bool write_log) {
+    if (state == nullptr) {
+        return;
+    }
+
+    const bool was_running =
+        state->virtual_camera_controller.starting() ||
+        state->virtual_camera_controller.running() ||
+        state->virtual_camera_bridge.running();
+    state->virtual_camera_controller.Stop();
+    state->virtual_camera_bridge.Stop();
+    if (state->decoder != nullptr) {
+        state->decoder->SetPreferBgraOutput(false);
+    }
+    NotifyVirtualCameraStateChanged(state);
+
+    if (write_log && was_running) {
+        QueueLog(state, L"\u865A\u62DF\u6444\u50CF\u5934: \u5DF2\u5173\u95ED\u865A\u62DF\u6444\u50CF\u5934\u8F93\u51FA\u3002");
+    }
+}
+
+void InstallVirtualCamera(AppState* state) {
+    if (state == nullptr) {
+        return;
+    }
+    if (!FileExists(state->virtual_camera_media_source_path)) {
+        QueueLog(state, L"\u865A\u62DF\u6444\u50CF\u5934: \u627E\u4E0D\u5230 media source DLL\uFF0C\u8BF7\u786E\u8BA4 live-cast-virtual-camera-media-source.dll \u4E0E\u63A5\u6536\u7AEF\u5728\u540C\u76EE\u5F55\u3002");
+        RefreshVirtualCameraState(state);
+        return;
+    }
+
+    QueueLog(state, L"\u865A\u62DF\u6444\u50CF\u5934: \u6B63\u5728\u4EE5\u7BA1\u7406\u5458\u6743\u9650\u5B89\u88C5\u865A\u62DF\u6444\u50CF\u5934\u7EC4\u4EF6\u3002");
+    if (RunVirtualCameraTool(state, L"install", true)) {
+        QueueLog(state, L"\u865A\u62DF\u6444\u50CF\u5934: \u5B89\u88C5\u5B8C\u6210\uFF0C\u73B0\u5728\u53EF\u4EE5\u70B9\u51FB\u201C\u542F\u52A8\u865A\u62DF\u6444\u50CF\u5934\u201D\u3002");
+    }
+    RefreshVirtualCameraState(state);
+}
+
+void StartVirtualCamera(AppState* state) {
+    if (state == nullptr) {
+        return;
+    }
+    if (state->virtual_camera_controller.running() || state->virtual_camera_controller.starting()) {
+        return;
+    }
+
+    RefreshVirtualCameraState(state);
+    if (!state->virtual_camera_controller.installed()) {
+        const std::wstring install_warning = state->virtual_camera_controller.install_warning();
+        if (!install_warning.empty()) {
+            QueueLog(state, install_warning);
+        } else {
+            QueueLog(state, L"\u865A\u62DF\u6444\u50CF\u5934: \u5C1A\u672A\u5B89\u88C5\uFF0C\u8BF7\u5148\u70B9\u51FB\u201C\u5B89\u88C5\u865A\u62DF\u6444\u50CF\u5934\u201D\u3002");
+        }
+        return;
+    }
+
+    if (!state->virtual_camera_bridge.Start(state->renderer.d3d_device())) {
+        RefreshVirtualCameraState(state);
+        return;
+    }
+
+    if (state->decoder != nullptr) {
+        state->decoder->SetPreferBgraOutput(true);
+    }
+
+    QueueLog(state, L"\u865A\u62DF\u6444\u50CF\u5934: \u6B63\u5728\u542F\u52A8\uFF0C\u8BF7\u7A0D\u5019\u3002");
+    if (!state->virtual_camera_controller.Start()) {
+        const std::wstring error_text = state->virtual_camera_controller.last_error();
+        if (!error_text.empty()) {
+            QueueLog(state, std::wstring(L"\u865A\u62DF\u6444\u50CF\u5934: ") + error_text);
+        }
+        state->virtual_camera_bridge.Stop();
+        if (state->decoder != nullptr) {
+            state->decoder->SetPreferBgraOutput(false);
+        }
+        NotifyVirtualCameraStateChanged(state);
+        return;
+    }
+
+    NotifyVirtualCameraStateChanged(state);
 }
 
 std::string WideToUtf8(const std::wstring& value) {
@@ -1318,6 +4341,49 @@ std::string QuoteJsonWide(const std::wstring& value) {
     return "\"" + EscapeJsonUtf8(WideToUtf8(value)) + "\"";
 }
 
+std::wstring WideFromUtf8(const std::string& value) {
+    if (value.empty()) {
+        return {};
+    }
+
+    const int required = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
+    if (required <= 0) {
+        return {};
+    }
+
+    std::wstring wide(required, L'\0');
+    const int written = MultiByteToWideChar(
+        CP_UTF8,
+        0,
+        value.data(),
+        static_cast<int>(value.size()),
+        wide.data(),
+        static_cast<int>(wide.size()));
+    if (written <= 0) {
+        return {};
+    }
+
+    if (written < static_cast<int>(wide.size())) {
+        wide.resize(static_cast<size_t>(written));
+    }
+    return wide;
+}
+
+std::wstring ExtractJsonStringField(const std::string& json_text, const char* field_name) {
+    if (field_name == nullptr || *field_name == '\0' || json_text.empty()) {
+        return {};
+    }
+
+    const std::regex field_regex(
+        std::string("\"") + field_name + "\"\\s*:\\s*\"([^\"]*)\"",
+        std::regex::icase);
+    std::smatch match;
+    if (!std::regex_search(json_text, match, field_regex) || match.size() < 2) {
+        return {};
+    }
+    return WideFromUtf8(match[1].str());
+}
+
 bool LoadCachedSelectedProfile(const std::wstring& path, protocol::StreamProfile* out) {
     if (out == nullptr) {
         return false;
@@ -1329,7 +4395,7 @@ bool LoadCachedSelectedProfile(const std::wstring& path, protocol::StreamProfile
     }
 
     const std::regex profile_regex(
-        R"json((?:"selectedProfile"\s*:\s*)?\{\s*"codec"\s*:\s*"([^"]+)"\s*,\s*"width"\s*:\s*(\d+)\s*,\s*"height"\s*:\s*(\d+)\s*,\s*"fps"\s*:\s*(\d+)\s*,\s*"adaptiveFps"\s*:\s*(true|false)\s*,\s*"bitrate"\s*:\s*(\d+)\s*\})json");
+        R"json((?:"selectedProfile"\s*:\s*)?\{\s*"codec"\s*:\s*"([^"]+)"\s*,\s*"width"\s*:\s*(\d+)\s*,\s*"height"\s*:\s*(\d+)\s*,\s*"fps"\s*:\s*(\d+)\s*,\s*"adaptiveFps"\s*:\s*(true|false)\s*,\s*"bitrate"\s*:\s*(\d+)(?:\s*,\s*"audioEnabled"\s*:\s*(true|false)\s*,\s*"audioPort"\s*:\s*(\d+)\s*,\s*"audioSampleRate"\s*:\s*(\d+)\s*,\s*"audioChannels"\s*:\s*(\d+))?\s*\})json");
     std::smatch match;
     if (!std::regex_search(json_text, match, profile_regex)) {
         return false;
@@ -1343,6 +4409,12 @@ bool LoadCachedSelectedProfile(const std::wstring& path, protocol::StreamProfile
     profile.adaptive_fps = match[5].str() == "true";
     profile.bitrate = std::stoi(match[6].str());
     profile.video_port = kVideoPort;
+    if (match[7].matched) {
+        profile.audio_enabled = match[7].str() == "true";
+        profile.audio_port = std::stoi(match[8].str());
+        profile.audio_sample_rate = std::stoi(match[9].str());
+        profile.audio_channels = std::stoi(match[10].str());
+    }
     if (profile.codec == protocol::Codec::kUnknown ||
         profile.width <= 0 ||
         profile.height <= 0 ||
@@ -1351,19 +4423,24 @@ bool LoadCachedSelectedProfile(const std::wstring& path, protocol::StreamProfile
         return false;
     }
 
-    *out = profile;
+    *out = CapStreamProfileTo60Fps(profile);
     return true;
 }
 
 std::string BuildProfileCacheJson(const protocol::StreamProfile& profile) {
+    const protocol::StreamProfile capped_profile = CapStreamProfileTo60Fps(profile);
     std::ostringstream json;
     json << "{"
-         << "\"codec\":\"" << protocol::CodecToWireName(profile.codec) << "\","
-         << "\"width\":" << profile.width << ","
-         << "\"height\":" << profile.height << ","
-         << "\"fps\":" << profile.fps << ","
-         << "\"adaptiveFps\":" << (profile.adaptive_fps ? "true" : "false") << ","
-         << "\"bitrate\":" << profile.bitrate
+         << "\"codec\":\"" << protocol::CodecToWireName(capped_profile.codec) << "\","
+         << "\"width\":" << capped_profile.width << ","
+         << "\"height\":" << capped_profile.height << ","
+         << "\"fps\":" << capped_profile.fps << ","
+         << "\"adaptiveFps\":" << (capped_profile.adaptive_fps ? "true" : "false") << ","
+         << "\"bitrate\":" << capped_profile.bitrate << ","
+         << "\"audioEnabled\":" << (capped_profile.audio_enabled ? "true" : "false") << ","
+         << "\"audioPort\":" << capped_profile.audio_port << ","
+         << "\"audioSampleRate\":" << capped_profile.audio_sample_rate << ","
+         << "\"audioChannels\":" << capped_profile.audio_channels
          << "}\n";
     return json.str();
 }
@@ -1384,6 +4461,170 @@ void WriteUtf8File(const std::wstring& path, const std::string& utf8_text) {
         fwrite(utf8_text.data(), 1, utf8_text.size(), file);
     }
     fclose(file);
+}
+
+void EnsureVoiceMusicScaffold(AppState* state) {
+    if (state == nullptr || state->voice_music_root_path.empty()) {
+        return;
+    }
+
+    if (!EnsureDirectoryPath(state->voice_music_root_path)) {
+        return;
+    }
+
+    const std::array<const wchar_t*, 2> default_music_folders = {
+        L"\u6218\u6B4C",
+        L"\u51FA\u8D27",
+    };
+    for (const wchar_t* folder_name : default_music_folders) {
+        if (folder_name == nullptr || *folder_name == L'\0') {
+            continue;
+        }
+        EnsureDirectoryPath(state->voice_music_root_path + L"\\" + folder_name);
+    }
+
+    const std::wstring note_path = state->voice_music_root_path + L"\\\u8BED\u97F3\u70B9\u6B4C\u8BF4\u660E.txt";
+    if (FileExists(note_path)) {
+        return;
+    }
+
+    const std::string note_text = WideToUtf8(
+        L"\u8BED\u97F3\u70B9\u6B4C\u4F7F\u7528\u8BF4\u660E\r\n"
+        L"========================\r\n"
+        L"1. \u7A0B\u5E8F\u4F1A\u9ED8\u8BA4\u521B\u5EFA\u201C\u6218\u6B4C\u201D\u548C\u201C\u51FA\u8D27\u201D\u4E24\u4E2A\u793A\u4F8B\u5206\u7C7B\u76EE\u5F55\u3002\r\n"
+        L"2. \u4F60\u4E5F\u53EF\u4EE5\u5728\u201C\u8BED\u97F3\u70B9\u6B4C\u201D\u76EE\u5F55\u4E0B\u7EE7\u7EED\u4E3A\u6BCF\u79CD\u98CE\u683C\u65B0\u5EFA\u5B50\u76EE\u5F55\u3002\r\n"
+        L"3. \u5B50\u76EE\u5F55\u540D\u5C31\u662F\u53EF\u4EE5\u5BF9\u7740 PC \u8BF4\u7684\u53E3\u4EE4\u3002\u6BD4\u5982\u201C\u6218\u6B4C\u201D\u3001\u201C\u51FA\u8D27\u201D\u3001\u201C\u7EAF\u97F3\u4E50\u201D\u3002\r\n"
+        L"4. \u5982\u679C\u5B50\u76EE\u5F55\u540D\u662F\u7EAF\u6570\u5B57\uFF0C\u4F8B\u5982 123\uFF0C\u7A0B\u5E8F\u4E5F\u4F1A\u81EA\u52A8\u8BC6\u522B\u201C\u4E00\u4E8C\u4E09\u201D\u8FD9\u79CD\u8BFB\u6CD5\u3002\r\n"
+        L"5. \u6BCF\u4E2A\u5B50\u76EE\u5F55\u53EF\u4EE5\u76F4\u63A5\u653E mp3 / wav / m4a / aac / flac / wma \u7B49\u6587\u4EF6\u3002\r\n"
+        L"6. \u5BF9\u7740 PC \u8BF4\u201C\u64AD\u653E\u6218\u6B4C\u201D\u3001\u201C\u6765\u70B9\u51FA\u8D27\u201D\u3001\u201C123\u201D\u90FD\u53EF\u4EE5\u89E6\u53D1\u968F\u673A\u64AD\u653E\u3002\r\n");
+    WriteUtf8File(note_path, note_text);
+}
+
+std::wstring SanitizeVoiceMusicProjectName(const std::wstring& raw_name) {
+    std::wstring sanitized = TrimWhitespace(raw_name);
+    for (wchar_t& ch : sanitized) {
+        switch (ch) {
+        case L'\\':
+        case L'/':
+        case L':':
+        case L'*':
+        case L'?':
+        case L'"':
+        case L'<':
+        case L'>':
+        case L'|':
+            ch = L'_';
+            break;
+        default:
+            break;
+        }
+    }
+
+    while (!sanitized.empty() && (sanitized.back() == L'.' || std::iswspace(sanitized.back()))) {
+        sanitized.pop_back();
+    }
+    return TrimWhitespace(sanitized);
+}
+
+std::vector<std::wstring> ParseVoiceAliasLines(const std::wstring& text) {
+    std::vector<std::wstring> lines;
+    std::wstring current;
+    current.reserve(text.size());
+
+    auto flush = [&]() {
+        const std::wstring trimmed = TrimWhitespace(current);
+        if (!trimmed.empty() && trimmed[0] != L'#' && trimmed[0] != L';') {
+            lines.push_back(trimmed);
+        }
+        current.clear();
+    };
+
+    for (wchar_t ch : text) {
+        if (ch == L'|' || ch == L'\r' || ch == L'\n') {
+            flush();
+            continue;
+        }
+        current.push_back(ch);
+    }
+    flush();
+    return lines;
+}
+
+void ExecuteVoiceMusicProjectCreate(
+    AppState* state,
+    const std::wstring& project_name,
+    const std::wstring& alias_payload) {
+    if (state == nullptr) {
+        return;
+    }
+
+    const std::wstring sanitized_name = SanitizeVoiceMusicProjectName(project_name);
+    if (sanitized_name.empty()) {
+        state->voice_control_status = L"新增项目失败：目录名称不能为空";
+        QueueLog(state, L"语音点歌：新增项目失败，目录名称为空。");
+        return;
+    }
+    if (state->voice_music_root_path.empty()) {
+        state->voice_control_status = L"新增项目失败：点歌目录不可用";
+        QueueLog(state, L"语音点歌：新增项目失败，点歌根目录为空。");
+        return;
+    }
+
+    if (!EnsureDirectoryPath(state->voice_music_root_path)) {
+        state->voice_control_status = L"新增项目失败：无法创建点歌目录";
+        QueueLog(state, L"语音点歌：新增项目失败，无法创建点歌根目录。");
+        return;
+    }
+
+    const std::wstring project_path = state->voice_music_root_path + L"\\" + sanitized_name;
+    if (!EnsureDirectoryPath(project_path)) {
+        state->voice_control_status = std::wstring(L"新增项目失败：无法创建目录“") + sanitized_name + L"”";
+        QueueLog(state, std::wstring(L"语音点歌：新增项目失败，无法创建目录“") + sanitized_name + L"”。");
+        return;
+    }
+
+    std::vector<std::wstring> alias_lines = ParseVoiceAliasLines(alias_payload);
+    alias_lines.push_back(sanitized_name);
+
+    const std::wstring alias_file_path = project_path + L"\\别名.txt";
+    const std::string existing_alias_text = ReadUtf8File(alias_file_path);
+    if (!existing_alias_text.empty()) {
+        const std::vector<std::wstring> existing_lines = ParseVoiceAliasLines(WideFromUtf8(existing_alias_text));
+        alias_lines.insert(alias_lines.end(), existing_lines.begin(), existing_lines.end());
+    }
+
+    std::unordered_set<std::wstring> dedup;
+    std::vector<std::wstring> merged_aliases;
+    merged_aliases.reserve(alias_lines.size());
+    for (const std::wstring& alias : alias_lines) {
+        const std::wstring trimmed = TrimWhitespace(alias);
+        if (trimmed.empty()) {
+            continue;
+        }
+        if (dedup.insert(trimmed).second) {
+            merged_aliases.push_back(trimmed);
+        }
+    }
+
+    std::wstring content =
+        L"# 自动生成的语音点歌别名，一行一个。\r\n"
+        L"# 可以继续手动追加常见口语、同音字、外号。\r\n";
+    for (const std::wstring& alias : merged_aliases) {
+        content += alias;
+        content += L"\r\n";
+    }
+    WriteUtf8File(alias_file_path, WideToUtf8(content));
+
+    if (state->voice_music_library != nullptr) {
+        state->voice_music_library->RefreshIndex();
+    }
+    RefreshVoiceRecognitionContext(state, true, true);
+
+    state->voice_control_status = std::wstring(L"已新增点歌项目：") + sanitized_name;
+    std::wostringstream stream;
+    stream << L"语音点歌：已新增项目“" << sanitized_name << L"”，目录=" << project_path
+           << L"，别名数=" << merged_aliases.size() << L"。";
+    QueueLog(state, stream.str());
 }
 
 void WriteBinaryFile(const std::wstring& path, const std::vector<uint8_t>& data) {
@@ -1456,6 +4697,10 @@ void QueueLog(AppState* state, const std::wstring& message) {
         std::lock_guard<std::mutex> lock(state->log_mutex);
         AppendLogFileLine(state->log_file_path, message);
         state->pending_logs.push_back(message);
+        state->recent_logs.push_back(message);
+        while (state->recent_logs.size() > 120) {
+            state->recent_logs.pop_front();
+        }
     }
 
     if (state->status_window != nullptr) {
@@ -1469,6 +4714,10 @@ void UpdateLatencyEstimate(AppState* state, uint64_t sender_pts_us) {
     }
 
     const int64_t receiver_present_us = NowSteadyUs();
+    {
+        std::lock_guard<std::mutex> session_lock(state->session_mutex);
+        state->session.last_present_us = receiver_present_us;
+    }
     {
         std::lock_guard<std::mutex> lock(state->metrics_mutex);
         if (state->has_clock_sync) {
@@ -1570,6 +4819,7 @@ void ResetRuntimeMetricsForStream(AppState* state) {
     state->has_clock_sync = false;
     state->sender_clock_offset_us = 0;
     state->sender_clock_rtt_us = 0;
+    state->last_stale_video_drop_request_us = 0;
     state->latest_latency_us = 0;
     state->latency_sample_count = 0;
     state->total_latency_us = 0;
@@ -1603,7 +4853,9 @@ std::wstring FormatProfileSummaryForLog(const protocol::StreamProfile& profile) 
            << L" / "
            << FormatProfileFrameRate(profile)
            << L" / "
-           << FormatBitrateValue(profile.bitrate);
+           << FormatBitrateValue(profile.bitrate)
+           << L" / \u97F3\u9891 "
+           << BuildAudioProfileText(&profile, true);
     return stream.str();
 }
 
@@ -1612,14 +4864,29 @@ void ApplyStreamProfile(AppState* state, const protocol::StreamProfile& profile,
         return;
     }
 
-    state->selected_profile = profile;
+    const protocol::StreamProfile capped_profile = CapStreamProfileTo60Fps(profile);
+    state->selected_profile = capped_profile;
     state->has_selected_profile = true;
     state->auto_resumed_profile = auto_resumed;
     state->suppress_video_window_auto_show = false;
     ResetRuntimeMetricsForStream(state);
 
+    state->renderer.SetNominalFrameRate(capped_profile.fps, capped_profile.adaptive_fps);
+
     if (state->decoder != nullptr) {
-        state->decoder->Configure(profile);
+        state->decoder->Configure(capped_profile);
+    }
+
+    if (state->audio_player != nullptr) {
+        if (capped_profile.audio_enabled &&
+            capped_profile.audio_sample_rate > 0 &&
+            capped_profile.audio_channels > 0) {
+            if (!state->audio_player->Start(capped_profile.audio_sample_rate, capped_profile.audio_channels)) {
+                QueueLog(state, L"\u97F3\u9891\u64AD\u653E\u521D\u59CB\u5316\u5931\u8D25\uFF0C\u672C\u6B21\u4ECD\u4FDD\u6301\u89C6\u9891\u94FE\u8DEF\u7EE7\u7EED\u5DE5\u4F5C\u3002");
+            }
+        } else {
+            state->audio_player->Stop();
+        }
     }
 
     ResizeVideoWindowToSelectedProfile(state);
@@ -1636,20 +4903,29 @@ void ApplyStreamProfile(AppState* state, const protocol::StreamProfile& profile,
     }
 }
 
-void SubmitCachedCodecConfig(AppState* state, uint32_t frame_id) {
+void SubmitCachedCodecConfig(AppState* state, const std::vector<uint8_t>& codec_config, uint32_t frame_id) {
     if (state == nullptr ||
         state->decoder == nullptr ||
+        codec_config.empty()) {
+        return;
+    }
+
+    AccessUnit cached_unit;
+    cached_unit.bytes = codec_config;
+    cached_unit.frame_id = frame_id;
+    cached_unit.pts_us = 0;
+    cached_unit.flags = static_cast<uint8_t>(protocol::kFlagCodecConfig | protocol::kFlagKeyframe);
+    state->decoder->SubmitAccessUnit(cached_unit);
+}
+
+void SubmitCachedCodecConfig(AppState* state, uint32_t frame_id) {
+    if (state == nullptr ||
         !state->has_cached_codec_config ||
         state->cached_codec_config.empty()) {
         return;
     }
 
-    AccessUnit cached_unit;
-    cached_unit.bytes = state->cached_codec_config;
-    cached_unit.frame_id = frame_id;
-    cached_unit.pts_us = 0;
-    cached_unit.flags = static_cast<uint8_t>(protocol::kFlagCodecConfig | protocol::kFlagKeyframe);
-    state->decoder->SubmitAccessUnit(cached_unit);
+    SubmitCachedCodecConfig(state, state->cached_codec_config, frame_id);
 }
 
 void WriteStatusSnapshot(
@@ -1682,14 +4958,30 @@ void WriteStatusSnapshot(
         return stream.str();
     };
 
+    const AudioStats audio_stats = state->audio_receiver != nullptr ? state->audio_receiver->GetStats() : AudioStats{};
+    const AudioPlaybackStats audio_playback_stats =
+        state->audio_player != nullptr ? state->audio_player->GetStats() : AudioPlaybackStats{};
+    const DanmakuController::Snapshot danmaku_snapshot =
+        state->danmaku_controller != nullptr ? state->danmaku_controller->GetSnapshot() : DanmakuController::Snapshot{};
+
     std::ostringstream json;
     json << "{\n";
-    json << "  \"frontendMode\": " << (g_frontend_mode ? "true" : "false") << ",\n";
+    json << "  \"buildLabel\": " << QuoteJsonWide(kAppBuildLabel) << ",\n";
     json << "  \"updatedAtUs\": " << NowSteadyUs() << ",\n";
     json << "  \"controlPort\": " << kControlPort << ",\n";
     json << "  \"videoPort\": " << kVideoPort << ",\n";
+    json << "  \"audioPort\": " << kAudioPort << ",\n";
     json << "  \"totalPackets\": " << stats.total_packets << ",\n";
     json << "  \"totalBytes\": " << stats.total_bytes << ",\n";
+    json << "  \"audioPackets\": " << audio_stats.total_packets << ",\n";
+    json << "  \"audioBytes\": " << audio_stats.total_bytes << ",\n";
+    json << "  \"audioFrames\": " << audio_stats.completed_frames << ",\n";
+    json << "  \"audioDroppedFrames\": " << audio_stats.dropped_frames << ",\n";
+    json << "  \"audioPlaybackSubmitted\": " << audio_playback_stats.submitted_frames << ",\n";
+    json << "  \"audioPlaybackPlayed\": " << audio_playback_stats.played_frames << ",\n";
+    json << "  \"audioPlaybackDropped\": " << audio_playback_stats.dropped_frames << ",\n";
+    json << "  \"audioPlaybackBuffered\": " << audio_playback_stats.buffered_frames << ",\n";
+    json << "  \"audioPlaybackBufferedMs\": " << audio_playback_stats.buffered_ms << ",\n";
     json << "  \"completedFrames\": " << stats.completed_frames << ",\n";
     json << "  \"decodedFrames\": " << decoded_frame_count << ",\n";
     json << "  \"displayedFrames\": " << displayed_frame_count << ",\n";
@@ -1721,7 +5013,70 @@ void WriteStatusSnapshot(
     json << "  \"nvdecMaxWidth\": " << state->nvdec_probe.max_width << ",\n";
     json << "  \"nvdecMaxHeight\": " << state->nvdec_probe.max_height << ",\n";
     json << "  \"nvdecStatus\": " << QuoteJsonWide(BuildNvdecStatusText(state)) << ",\n";
+    json << "  \"airPlayInstalled\": " << (state->airplay_controller.installed() ? "true" : "false") << ",\n";
+    json << "  \"airPlayRunning\": " << (state->airplay_controller.running() ? "true" : "false") << ",\n";
+    json << "  \"airPlayBonjourInstalled\": " << (state->airplay_controller.bonjour_installed() ? "true" : "false") << ",\n";
+    json << "  \"airPlayBonjourRunning\": " << (state->airplay_controller.bonjour_running() ? "true" : "false") << ",\n";
+    json << "  \"airPlayStatus\": " << QuoteJsonWide(BuildAirPlayStatusText(state)) << ",\n";
+    json << "  \"airPlayRuntimeRoot\": " << QuoteJsonWide(state->airplay_runtime_root_path) << ",\n";
+    json << "  \"airPlayBinaryPath\": " << QuoteJsonWide(state->airplay_controller.binary_path()) << ",\n";
+    json << "  \"airPlayLogPath\": " << QuoteJsonWide(state->airplay_log_path) << ",\n";
+    json << "  \"airPlayLastError\": " << QuoteJsonWide(state->airplay_controller.last_error()) << ",\n";
+    json << "  \"airPlayLastExitCode\": " << state->airplay_controller.last_exit_code() << ",\n";
+    json << "  \"virtualCameraInstalled\": " << (state->virtual_camera_controller.installed() ? "true" : "false") << ",\n";
+    json << "  \"virtualCameraStarting\": " << (state->virtual_camera_controller.starting() ? "true" : "false") << ",\n";
+    json << "  \"virtualCameraRunning\": " << (state->virtual_camera_controller.running() ? "true" : "false") << ",\n";
+    json << "  \"virtualCameraStatus\": " << QuoteJsonWide(BuildVirtualCameraStatusText(state)) << ",\n";
+    json << "  \"virtualCameraToolPath\": " << QuoteJsonWide(state->virtual_camera_tool_path) << ",\n";
+    json << "  \"virtualCameraMediaSourcePath\": " << QuoteJsonWide(state->virtual_camera_media_source_path) << ",\n";
+    json << "  \"virtualCameraInstalledPath\": " << QuoteJsonWide(state->virtual_camera_controller.installed_path()) << ",\n";
     json << "  \"videoWindowReady\": " << (state->video_window != nullptr ? "true" : "false") << ",\n";
+    json << "  \"voiceControlEnabled\": " << (state->voice_control_enabled ? "true" : "false") << ",\n";
+    json << "  \"voiceControlStatus\": " << QuoteJsonWide(BuildVoiceControlStatusText(state)) << ",\n";
+    json << "  \"voiceModelPath\": " << QuoteJsonWide(state->voice_model_path) << ",\n";
+    json << "  \"voiceMusicRootPath\": " << QuoteJsonWide(state->voice_music_root_path) << ",\n";
+    json << "  \"danmakuRegionReady\": " << (danmaku_snapshot.region_ready ? "true" : "false") << ",\n";
+    json << "  \"danmakuRunning\": " << (danmaku_snapshot.running ? "true" : "false") << ",\n";
+    json << "  \"danmakuUiProbeRunning\": " << (danmaku_snapshot.ui_probe_running ? "true" : "false") << ",\n";
+    json << "  \"danmakuReminderEnabled\": " << (danmaku_snapshot.reminder_enabled ? "true" : "false") << ",\n";
+    json << "  \"danmakuSpeechEnabled\": " << (danmaku_snapshot.speech_enabled ? "true" : "false") << ",\n";
+    json << "  \"danmakuSpeechVoiceCount\": " << danmaku_snapshot.speech_voice_count << ",\n";
+    json << "  \"danmakuStatus\": " << QuoteJsonWide(danmaku_snapshot.status_text) << ",\n";
+    json << "  \"danmakuRegionLabel\": " << QuoteJsonWide(danmaku_snapshot.region_label) << ",\n";
+    json << "  \"danmakuUiProbeStatus\": " << QuoteJsonWide(danmaku_snapshot.ui_probe_status) << ",\n";
+    json << "  \"danmakuUiProbeTargetTitle\": " << QuoteJsonWide(danmaku_snapshot.ui_probe_target_title) << ",\n";
+    json << "  \"danmakuSpeechVoiceName\": " << QuoteJsonWide(danmaku_snapshot.speech_voice_name) << ",\n";
+    json << "  \"danmakuLastText\": " << QuoteJsonWide(danmaku_snapshot.last_text) << ",\n";
+    json << "  \"danmakuLastCapturePath\": " << QuoteJsonWide(danmaku_snapshot.last_capture_path) << ",\n";
+    json << "  \"danmakuCaptureRootPath\": " << QuoteJsonWide(state->danmaku_capture_root_path) << ",\n";
+    json << "  \"localMusicPlaying\": "
+         << ((state->local_music_player != nullptr && state->local_music_player->running()) ? "true" : "false")
+         << ",\n";
+    json << "  \"localMusicCurrentFile\": "
+         << QuoteJsonWide(state->local_music_player != nullptr ? state->local_music_player->current_file() : std::wstring{})
+         << ",\n";
+    json << "  \"localMusicCurrentName\": "
+         << QuoteJsonWide(
+                state->local_music_player != nullptr
+                    ? ExtractFileName(state->local_music_player->current_file())
+                    : std::wstring{})
+         << ",\n";
+    json << "  \"danmakuRecentEvents\": [";
+    for (size_t index = 0; index < danmaku_snapshot.recent_events.size(); ++index) {
+        if (index > 0) {
+            json << ", ";
+        }
+        json << QuoteJsonWide(danmaku_snapshot.recent_events[index]);
+    }
+    json << "],\n";
+    json << "  \"danmakuUiProbeLines\": [";
+    for (size_t index = 0; index < danmaku_snapshot.recent_probe_lines.size(); ++index) {
+        if (index > 0) {
+            json << ", ";
+        }
+        json << QuoteJsonWide(danmaku_snapshot.recent_probe_lines[index]);
+    }
+    json << "],\n";
     json << "  \"logFilePath\": " << QuoteJsonWide(state->log_file_path) << ",\n";
     json << "  \"statusFilePath\": " << QuoteJsonWide(state->status_file_path) << ",\n";
     json << "  \"selectedProfile\": ";
@@ -1734,7 +5089,11 @@ void WriteStatusSnapshot(
              << "\"height\": " << state->selected_profile.height << ", "
              << "\"fps\": " << state->selected_profile.fps << ", "
              << "\"adaptiveFps\": " << (state->selected_profile.adaptive_fps ? "true" : "false") << ", "
-             << "\"bitrate\": " << state->selected_profile.bitrate
+             << "\"bitrate\": " << state->selected_profile.bitrate << ", "
+             << "\"audioEnabled\": " << (state->selected_profile.audio_enabled ? "true" : "false") << ", "
+             << "\"audioPort\": " << state->selected_profile.audio_port << ", "
+             << "\"audioSampleRate\": " << state->selected_profile.audio_sample_rate << ", "
+             << "\"audioChannels\": " << state->selected_profile.audio_channels
              << "}";
     } else {
         json << "null";
@@ -1744,12 +5103,45 @@ void WriteStatusSnapshot(
     WriteUtf8File(state->status_file_path, json.str());
 }
 
+std::string BuildEmbeddedWebUiSnapshotJson(AppState* state) {
+    if (state == nullptr) {
+        return {};
+    }
+
+    const std::string status_json = ReadUtf8File(state->status_file_path);
+
+    std::deque<std::wstring> recent_logs;
+    {
+        std::lock_guard<std::mutex> lock(state->log_mutex);
+        recent_logs = state->recent_logs;
+    }
+
+    std::ostringstream json;
+    json << "{";
+    json << "\"status\": " << (status_json.empty() ? "null" : status_json) << ", ";
+    json << "\"logs\": [";
+    bool first = true;
+    for (const auto& line : recent_logs) {
+        if (!first) {
+            json << ", ";
+        }
+        first = false;
+        json << QuoteJsonWide(line);
+    }
+    json << "]";
+    json << "}";
+    return json.str();
+}
+
 void UpdateStatusLabel(AppState* state) {
     if (state == nullptr || state->udp_receiver == nullptr) {
         return;
     }
 
     const VideoStats stats = state->udp_receiver->GetStats();
+    const AudioStats audio_stats = state->audio_receiver != nullptr ? state->audio_receiver->GetStats() : AudioStats{};
+    const AudioPlaybackStats audio_playback_stats =
+        state->audio_player != nullptr ? state->audio_player->GetStats() : AudioPlaybackStats{};
     const size_t decoder_queue_depth =
         state->decoder != nullptr ? state->decoder->GetPendingAccessUnitCount() : 0;
     bool has_clock_sync = false;
@@ -1844,25 +5236,16 @@ void UpdateStatusLabel(AppState* state) {
 
         std::wostringstream config_value;
         config_value << state->selected_profile.width << L"x" << state->selected_profile.height;
-        std::wostringstream config_note;
-        config_note << CodecName(state->selected_profile.codec)
-                    << L" / "
-                    << FormatProfileFrameRate(state->selected_profile)
-                    << L" / "
-                    << FormatBitrateValue(state->selected_profile.bitrate)
-                    << L" / "
-                    << PresentationModeLabel(state->presentation_mode);
-        state->dashboard.summary_cards[0] = {kTextCurrentConfig, config_value.str(), config_note.str()};
+        state->dashboard.summary_cards[0] = {
+            kTextCurrentConfig,
+            config_value.str(),
+            BuildProfileDetailBlock(&state->selected_profile, true, PresentationModeLabel(state->presentation_mode))};
     } else {
         state->dashboard.subtitle = kTextDashboardWaiting;
         state->dashboard.summary_cards[0] = {kTextCurrentConfig, kTextWaitingConnect, kTextProfilePending};
     }
 
-    std::wostringstream fps_note;
-    fps_note << L"\u91CD\u7EC4 " << FormatOptionalFps(receive_fps)
-             << L" / \u89E3\u7801 " << FormatOptionalFps(decode_fps)
-             << L" / \u663E\u793A " << FormatOptionalFps(display_fps);
-    state->dashboard.summary_cards[1] = {kTextRealtimeFps, FormatOptionalFps(content_fps), fps_note.str()};
+    state->dashboard.summary_cards[1] = {kTextRealtimeFps, FormatOptionalFps(content_fps), BuildRateDetailBlock(receive_fps, decode_fps, display_fps)};
 
     if (has_clock_sync && latency_sample_count > 0) {
         std::wostringstream latency_note;
@@ -1877,30 +5260,38 @@ void UpdateStatusLabel(AppState* state) {
         state->dashboard.summary_cards[2] = {kTextLatency, kTextWaitingSync, L"\u7B49\u5F85\u624B\u673A\u65F6\u949F\u540C\u6B65"};
     }
 
-    std::wostringstream queue_note;
-    queue_note << L"\u5F85\u89E3 " << decoder_queue_depth
-               << L" / \u5DF2\u6536 " << stats.completed_frames
-               << L" / \u5DF2\u89E3 " << decoded_frame_count
-               << L" / \u5DF2\u663E " << displayed_frame_count;
-    state->dashboard.summary_cards[3] = {kTextDecoderQueue, std::to_wstring(display_dropped_frames), queue_note.str()};
+    state->dashboard.summary_cards[3] = {
+        kTextDecoderQueue,
+        std::to_wstring(display_dropped_frames),
+        BuildFrameCounterBlock(stats, displayed_frame_count, decoded_frame_count)};
 
     std::wostringstream traffic_stream;
     traffic_stream << L"\u63A7\u5236\u901A\u9053\uFF1ATCP/" << kControlPort
                    << L"\r\n\u89C6\u9891\u901A\u9053\uFF1AUDP/" << kVideoPort
+                   << L"\r\n\u97F3\u9891\u901A\u9053\uFF1AUDP/" << kAudioPort
                    << L"\r\n\u6570\u636E\u5305\uFF1A" << stats.total_packets << L"    \u5B57\u8282\uFF1A" << FormatDataSize(stats.total_bytes)
+                   << L"\r\nPCM \u5E27\uFF1A" << audio_stats.completed_frames << L"    \u97F3\u9891\u5305\uFF1A" << audio_stats.total_packets
                    << L"\r\n\u5B8C\u6574\u5E27\uFF1A" << stats.completed_frames << L"    \u5173\u952E\u5E27\uFF1A" << stats.keyframes
                    << L"\r\n\u4E22\u5E27\uFF1A" << stats.dropped_frames << L"    \u6700\u540E\u5E27 ID\uFF1A" << stats.last_frame_id;
     state->dashboard.traffic_body = traffic_stream.str();
 
     const bool video_visible = state->video_window != nullptr && IsWindowVisible(state->video_window);
+    const std::wstring airplay_status = BuildAirPlayStatusText(state);
 
     std::wostringstream runtime_stream;
     runtime_stream << L"\u7F51\u7EDC\u91CD\u7EC4\u901F\u7387\uFF1A" << FormatOptionalFps(receive_fps)
                    << L"\r\n\u89E3\u7801\u8F93\u51FA\u901F\u7387\uFF1A" << FormatOptionalFps(decode_fps)
                    << L"\r\n\u6700\u7EC8\u663E\u793A\u901F\u7387\uFF1A" << FormatOptionalFps(display_fps)
                    << L"\r\n\u663E\u793A\u6A21\u5F0F\uFF1A" << PresentationModeLabel(state->presentation_mode)
+                   << L"\r\n\u97F3\u9891\u72B6\u6001\uFF1A" << BuildAudioRuntimeText(
+                       state->has_selected_profile ? &state->selected_profile : nullptr,
+                       state->has_selected_profile,
+                       audio_playback_stats)
+                   << L"\r\n\u82F9\u679C\u6295\u5C4F\uFF1A" << airplay_status
+                   << L"\r\n\u8BED\u97F3\u63A7\u5236\uFF1A" << BuildVoiceControlStatusText(state)
+                   << L"\r\n\u865A\u62DF\u6444\u50CF\u5934\uFF1A" << BuildVirtualCameraStatusText(state)
                    << L"\r\n\u6E32\u67D3\u663E\u5361\uFF1A"
-                   << (state->renderer.gpu_name().empty() ? L"\u672A\u8BC6\u522B" : ShortenMiddle(state->renderer.gpu_name(), 38))
+                   << (state->renderer.gpu_name().empty() ? L"\u672A\u8BC6\u522B" : state->renderer.gpu_name())
                    << L"\r\nNVIDIA NVDEC\uFF1A" << BuildNvdecStatusText(state)
                    << L"\r\n\u753B\u9762\u7A97\u53E3\uFF1A"
                    << (video_visible
@@ -1934,6 +5325,10 @@ void UpdateStatusLabel(AppState* state) {
         decode_fps,
         display_fps);
 
+    if (state->web_ui_bridge != nullptr) {
+        state->web_ui_bridge->PushSnapshot(false);
+    }
+
     if (state->status_window != nullptr) {
         std::wstring status_title = std::wstring(kStatusWindowTitle) + L" v" + kAppBuildLabel;
         if (state->has_selected_profile) {
@@ -1946,13 +5341,14 @@ void UpdateStatusLabel(AppState* state) {
                          << FormatProfileFrameRate(state->selected_profile);
             status_title += title_suffix.str();
         }
+        UpdateActionButtons(state);
         SetWindowTextW(state->status_window, status_title.c_str());
         InvalidateRect(state->status_window, nullptr, FALSE);
     }
 
     if (state->video_window != nullptr) {
         std::wostringstream title_stream;
-        title_stream << kVideoWindowTitle << L" v" << kAppBuildLabel;
+        title_stream << kTextVideoDisplayTitle << L" v" << kAppBuildLabel;
         if (state->has_selected_profile) {
             title_stream << L" - "
                          << state->selected_profile.width
@@ -1976,6 +5372,17 @@ void LayoutStatusWindow(AppState* state) {
     }
 
     const StatusWindowLayout layout = CalculateStatusWindowLayout(state);
+    for (size_t index = 0; index < state->nav_buttons.size(); ++index) {
+        if (state->nav_buttons[index] != nullptr) {
+            MoveWindow(
+                state->nav_buttons[index],
+                layout.nav_buttons[index].left,
+                layout.nav_buttons[index].top,
+                RectWidth(layout.nav_buttons[index]),
+                RectHeight(layout.nav_buttons[index]),
+                TRUE);
+        }
+    }
     if (state->focus_video_button != nullptr) {
         MoveWindow(
             state->focus_video_button,
@@ -2004,6 +5411,7 @@ void LayoutStatusWindow(AppState* state) {
             TRUE);
     }
     if (state->log_view != nullptr) {
+        ShowWindow(state->log_view, ShouldShowLogView(state->current_page) ? SW_SHOWNA : SW_HIDE);
         MoveWindow(
             state->log_view,
             layout.log_view.left,
@@ -2011,6 +5419,9 @@ void LayoutStatusWindow(AppState* state) {
             RectWidth(layout.log_view),
             RectHeight(layout.log_view),
             TRUE);
+    }
+    if (state->web_ui_bridge != nullptr) {
+        state->web_ui_bridge->ResizeToClient();
     }
     InvalidateRect(state->status_window, nullptr, TRUE);
 }
@@ -2052,6 +5463,9 @@ LRESULT CALLBACK VideoWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARAM
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
         if (state != nullptr) {
             state->video_window = hwnd;
+            if (state->danmaku_controller != nullptr) {
+                state->danmaku_controller->SetWindows(state->status_window, hwnd);
+            }
         }
     }
 
@@ -2091,6 +5505,9 @@ LRESULT CALLBACK VideoWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARAM
         if (state != nullptr) {
             state->video_window = nullptr;
             state->video_window_visible = false;
+            if (state->danmaku_controller != nullptr) {
+                state->danmaku_controller->SetWindows(state->status_window, nullptr);
+            }
         }
         return 0;
     default:
@@ -2108,11 +5525,24 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
         new_state->status_window = hwnd;
         new_state->log_file_path = BuildLogFilePath();
         new_state->status_file_path = BuildStatusFilePath();
+        new_state->web_ui_folder_path = BuildWebUiFolderPath();
+        new_state->web_ui_user_data_path = BuildWebUiUserDataPath();
         new_state->profile_cache_path = BuildProfileCachePath();
         new_state->codec_config_cache_path = BuildCodecConfigCachePath();
+        new_state->virtual_camera_tool_path = BuildVirtualCameraToolPath();
+        new_state->virtual_camera_media_source_path = BuildVirtualCameraMediaSourcePath();
+        new_state->virtual_camera_placeholder_path = BuildVirtualCameraPlaceholderPath();
+        new_state->airplay_runtime_root_path = BuildAirPlayRuntimeRootPath();
+        new_state->airplay_log_path = BuildAirPlayLogPath();
+        new_state->voice_runtime_root_path = BuildVoiceRuntimeRootPath();
+        new_state->voice_model_path = BuildVoiceModelPath();
+        new_state->voice_music_root_path = BuildVoiceMusicRootPath();
+        new_state->danmaku_capture_root_path = BuildDanmakuCaptureRootPath();
+        new_state->danmaku_region_file_path = BuildDanmakuRegionFilePath();
         ResetLogFile(new_state->log_file_path);
         ResetDashboardSnapshot(new_state);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(new_state));
+        EnsureVoiceMusicScaffold(new_state);
 
         protocol::StreamProfile cached_profile;
         if (LoadCachedSelectedProfile(new_state->profile_cache_path, &cached_profile) ||
@@ -2128,6 +5558,29 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
         ApplyWindowBackdrop(hwnd);
         RecreateUiFonts(new_state);
 
+        const std::array<std::pair<int, const wchar_t*>, 6> nav_definitions = {{
+            {kNavOverviewButtonId, kTextOverviewPage},
+            {kNavConnectButtonId, kTextConnectPage},
+            {kNavDisplayButtonId, kTextDisplayPage},
+            {kNavVoiceButtonId, kTextVoicePage},
+            {kNavDiagnosticsButtonId, kTextDiagnosticsPage},
+            {kNavLogsButtonId, kTextLogsPage},
+        }};
+        for (size_t index = 0; index < nav_definitions.size(); ++index) {
+            new_state->nav_buttons[index] = CreateWindowExW(
+                0,
+                L"BUTTON",
+                nav_definitions[index].second,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                0,
+                0,
+                100,
+                40,
+                hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(nav_definitions[index].first)),
+                create_struct->hInstance,
+                nullptr);
+        }
         new_state->focus_video_button = CreateWindowExW(
             0,
             L"BUTTON",
@@ -2180,8 +5633,21 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
             nullptr,
             create_struct->hInstance,
             nullptr);
+        new_state->airplay_controller.SetLogFn([new_state](const std::wstring& line) { QueueLog(new_state, line); });
+        new_state->airplay_controller.SetRuntimeRoot(new_state->airplay_runtime_root_path);
+        new_state->airplay_controller.SetLogFilePath(new_state->airplay_log_path);
+        new_state->virtual_camera_controller.SetLogFn([new_state](const std::wstring& line) { QueueLog(new_state, line); });
+        new_state->virtual_camera_controller.SetStateChangedFn([new_state]() {
+            if (new_state->status_window != nullptr) {
+                PostMessageW(new_state->status_window, kVirtualCameraStateMessage, 0, 0);
+            }
+        });
+        new_state->virtual_camera_bridge.SetLogFn([new_state](const std::wstring& line) { QueueLog(new_state, line); });
+        new_state->virtual_camera_bridge.SetPlaceholderImagePath(new_state->virtual_camera_placeholder_path);
         ApplyUiToControls(new_state);
-        UpdatePresentationModeButton(new_state);
+        RefreshAirPlayState(new_state);
+        RefreshVirtualCameraState(new_state);
+        UpdateActionButtons(new_state);
         new_state->nvdec_probe = ProbeNvidiaCuvidSupport();
 
         new_state->renderer.SetLogFn(
@@ -2197,11 +5663,10 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
                 }
                 UpdateLatencyEstimate(new_state, sender_pts_us);
             });
-
         new_state->video_window = CreateWindowExW(
             0,
             kVideoWindowClassName,
-            kVideoWindowTitle,
+            kTextVideoDisplayTitle,
             WS_OVERLAPPEDWINDOW,
             760,
             40,
@@ -2218,6 +5683,7 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
             DeleteFontHandle(new_state->subtitle_font);
             DeleteFontHandle(new_state->section_font);
             DeleteFontHandle(new_state->value_font);
+            DeleteFontHandle(new_state->spotlight_value_font);
             DeleteFontHandle(new_state->body_font);
             DeleteFontHandle(new_state->button_font);
             delete new_state;
@@ -2225,12 +5691,60 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
             return -1;
         }
 
+        new_state->danmaku_controller = std::make_unique<DanmakuController>(
+            new_state->danmaku_region_file_path,
+            new_state->danmaku_capture_root_path,
+            [new_state](const std::wstring& line) { QueueLog(new_state, line); });
+        new_state->danmaku_controller->SetWindows(new_state->status_window, new_state->video_window);
+
         new_state->decoder = std::make_unique<VideoDecoder>(
             [new_state](const std::wstring& line) { QueueLog(new_state, line); },
             [new_state](DecodedFrame frame) {
                 {
                     std::lock_guard<std::mutex> lock(new_state->metrics_mutex);
                     new_state->decoded_frame_count += 1;
+                }
+                bool drop_stale_frame = false;
+                if (frame.pts_us > 0) {
+                    const int64_t receiver_now_us = NowSteadyUs();
+                    std::lock_guard<std::mutex> lock(new_state->metrics_mutex);
+                    if (new_state->has_clock_sync) {
+                        const int64_t estimated_latency_us =
+                            receiver_now_us + new_state->sender_clock_offset_us - static_cast<int64_t>(frame.pts_us);
+                        if (estimated_latency_us > kVideoLateDropUs) {
+                            drop_stale_frame = true;
+                        }
+                    }
+                }
+                if (drop_stale_frame) {
+                    return;
+                }
+                if (new_state->virtual_camera_bridge.running() &&
+                    frame.width > 0 &&
+                    frame.height > 0 &&
+                    frame.format == DecodedFrameFormat::kBgra) {
+                    DecodedFrame virtual_camera_frame;
+                    virtual_camera_frame.width = frame.width;
+                    virtual_camera_frame.height = frame.height;
+                    virtual_camera_frame.pts_us = frame.pts_us;
+                    virtual_camera_frame.format = frame.format;
+                    virtual_camera_frame.stride0 = frame.stride0;
+                    virtual_camera_frame.stride1 = frame.stride1;
+                    virtual_camera_frame.plane1_offset = frame.plane1_offset;
+                    virtual_camera_frame.bytes = frame.bytes;
+                    virtual_camera_frame.d3d_subresource = frame.d3d_subresource;
+                    virtual_camera_frame.gpu_backed = frame.gpu_backed;
+                    virtual_camera_frame.direct_sample_safe = frame.direct_sample_safe;
+                    virtual_camera_frame.separate_textures = frame.separate_textures;
+                    if (frame.d3d_texture != nullptr) {
+                        virtual_camera_frame.d3d_texture = frame.d3d_texture;
+                        virtual_camera_frame.d3d_texture->AddRef();
+                    }
+                    if (frame.d3d_texture_plane1 != nullptr) {
+                        virtual_camera_frame.d3d_texture_plane1 = frame.d3d_texture_plane1;
+                        virtual_camera_frame.d3d_texture_plane1->AddRef();
+                    }
+                    new_state->virtual_camera_bridge.PublishFrame(virtual_camera_frame);
                 }
                 new_state->renderer.Present(std::move(frame));
             },
@@ -2242,18 +5756,43 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
         new_state->decoder->SetD3DDevice(new_state->renderer.d3d_device());
         new_state->decoder->SetSmoothMode(false);
         new_state->decoder->Start();
+        new_state->audio_player = std::make_unique<AudioPlayer>(
+            [new_state](const std::wstring& line) { QueueLog(new_state, line); });
+        new_state->local_music_player = std::make_unique<LocalMusicPlayer>(
+            [new_state](const std::wstring& line) { QueueLog(new_state, line); },
+            [new_state](bool running, const std::wstring& file_path) {
+                if (new_state == nullptr) {
+                    return;
+                }
+                if (running) {
+                    if (new_state->status_window != nullptr) {
+                        PostMessageW(new_state->status_window, kStatsMessage, 0, 0);
+                    }
+                    return;
+                }
+
+                if (!file_path.empty()) {
+                    new_state->voice_control_status =
+                        std::wstring(L"点歌已播放结束：") + ExtractFileName(file_path);
+                }
+                if (new_state->status_window != nullptr) {
+                    PostMessageW(new_state->status_window, kStatsMessage, 0, 0);
+                }
+            });
+        new_state->voice_music_library = std::make_unique<VoiceMusicLibrary>(new_state->voice_music_root_path);
+        new_state->voice_music_library->RefreshIndex();
+        RefreshVoiceRecognitionContext(new_state, false, false);
 
         new_state->control_server = std::make_unique<ControlServer>(
             [new_state](const std::wstring& line) { QueueLog(new_state, line); },
             [new_state](const protocol::StreamProfile& profile) {
-                new_state->cached_startup_profile = profile;
-                new_state->has_cached_startup_profile = true;
-                new_state->auto_resume_notice_logged = false;
-                WriteUtf8File(new_state->profile_cache_path, BuildProfileCacheJson(profile));
-                ApplyStreamProfile(new_state, profile, false);
+                PostApplyStreamProfileMessage(new_state, profile, false);
             },
             [new_state](int64_t offset_us, int64_t rtt_us) {
                 UpdateClockSync(new_state, offset_us, rtt_us);
+            },
+            [new_state](const std::wstring& sender_host, const std::wstring& device_name, bool connected) {
+                PostSessionUpdateMessage(new_state, sender_host, device_name, connected);
             });
 
         new_state->udp_receiver = std::make_unique<UdpVideoReceiver>(
@@ -2269,27 +5808,85 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
                 if (!new_state->has_selected_profile &&
                     new_state->has_cached_startup_profile &&
                     (new_state->has_cached_codec_config || is_codec_config)) {
-                    ApplyStreamProfile(new_state, new_state->cached_startup_profile, true);
-                    if (!is_codec_config) {
-                        SubmitCachedCodecConfig(new_state, unit.frame_id);
-                    }
-                    if (!new_state->auto_resume_notice_logged) {
-                        QueueLog(
+                    bool expected_pending = false;
+                    if (new_state->auto_resume_profile_message_pending.compare_exchange_strong(expected_pending, true)) {
+                        PostApplyStreamProfileMessage(
                             new_state,
-                            L"\u81EA\u52A8\u63A5\u7BA1: \u68C0\u6D4B\u5230\u624B\u673A\u7AEF\u5DF2\u5728\u6301\u7EED\u9001\u5E27\uFF0C\u5DF2\u4F7F\u7528\u4E0A\u6B21\u914D\u7F6E\u4E0E\u7F13\u5B58\u7684\u7801\u6D41\u53C2\u6570\u76F4\u63A5\u6062\u590D\u89E3\u7801\u3002");
-                        new_state->auto_resume_notice_logged = true;
+                            new_state->cached_startup_profile,
+                            true,
+                            !is_codec_config,
+                            unit.frame_id,
+                            !is_codec_config ? new_state->cached_codec_config : std::vector<uint8_t>{},
+                            !new_state->auto_resume_notice_logged);
                     }
                 }
                 if (new_state->decoder != nullptr) {
                     new_state->decoder->SubmitAccessUnit(unit);
                 }
             });
+        new_state->audio_receiver = std::make_unique<UdpAudioReceiver>(
+            [new_state](const std::wstring& line) { QueueLog(new_state, line); },
+            [new_state](const AccessUnit& unit) {
+                if (unit.bytes.empty() || new_state->audio_player == nullptr) {
+                    return;
+                }
 
-        new_state->control_server->Start(kControlPort, kVideoPort);
+                bool has_clock_sync = false;
+                int64_t sender_clock_offset_us = 0;
+                uint64_t last_present_sender_pts_us = 0;
+                {
+                    std::lock_guard<std::mutex> lock(new_state->metrics_mutex);
+                    has_clock_sync = new_state->has_clock_sync;
+                    sender_clock_offset_us = new_state->sender_clock_offset_us;
+                    last_present_sender_pts_us = new_state->last_present_sender_pts_us;
+                }
+
+                if (has_clock_sync &&
+                    unit.pts_us > 0 &&
+                    last_present_sender_pts_us > 0 &&
+                    last_present_sender_pts_us > unit.pts_us &&
+                    (last_present_sender_pts_us - unit.pts_us) > static_cast<uint64_t>(kAudioVideoLateDropUs)) {
+                    return;
+                }
+
+                new_state->audio_player->SubmitPcmFrame(
+                    unit.bytes.data(),
+                    unit.bytes.size(),
+                    unit.pts_us,
+                    has_clock_sync,
+                    sender_clock_offset_us);
+            });
+
+        new_state->control_server->Start(kControlPort, kVideoPort, kAudioPort);
         new_state->udp_receiver->Start(kVideoPort);
+        new_state->audio_receiver->Start(kAudioPort);
         SetTimer(hwnd, kStatsTimerId, kStatsIntervalMs, nullptr);
+        StartAirPlayReceiver(new_state, true);
         LayoutStatusWindow(new_state);
         UpdateStatusLabel(new_state);
+        new_state->web_ui_bridge = std::make_unique<EmbeddedWebUiBridge>(
+            [new_state]() { return BuildEmbeddedWebUiSnapshotJson(new_state); },
+            [new_state](const std::wstring& action, const std::wstring& value, const std::wstring& extra) {
+                ExecuteEmbeddedWebUiAction(new_state, action, value, extra);
+            },
+            [new_state](const std::wstring& line) { QueueLog(new_state, line); },
+            [new_state](bool ready) {
+                SetEmbeddedWebUiMode(new_state, ready);
+                LayoutStatusWindow(new_state);
+                if (new_state->status_window != nullptr) {
+                    PostMessageW(new_state->status_window, kStatsMessage, 0, 0);
+                }
+            });
+        if (!new_state->web_ui_bridge->Initialize(
+                hwnd,
+                new_state->web_ui_folder_path,
+                new_state->web_ui_user_data_path)) {
+            new_state->web_ui_bridge.reset();
+        } else {
+            DestroyNativeStatusControls(new_state);
+            SetEmbeddedWebUiMode(new_state, true);
+            LayoutStatusWindow(new_state);
+        }
         if (new_state->has_cached_startup_profile) {
             QueueLog(
                 new_state,
@@ -2304,6 +5901,8 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
         QueueLog(new_state, L"\u72B6\u6001\u7A97\u53E3\u5DF2\u5C31\u7EEA\u3002");
         QueueLog(new_state, L"\u753B\u9762\u7A97\u53E3\u5DF2\u521B\u5EFA\uFF0C\u6536\u5230\u753B\u9762\u540E\u518D\u663E\u793A\u3002");
         QueueLog(new_state, std::wstring(L"\u65E5\u5FD7\u6587\u4EF6\uFF1A") + new_state->log_file_path);
+        QueueLog(new_state, std::wstring(L"\u82F9\u679C\u6295\u5C4F\u65E5\u5FD7\uFF1A") + new_state->airplay_log_path);
+        QueueLog(new_state, std::wstring(L"\u8BED\u97F3\u70B9\u6B4C\u76EE\u5F55\uFF1A") + new_state->voice_music_root_path);
         return 0;
     }
     case WM_GETMINMAXINFO: {
@@ -2312,6 +5911,8 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
         minmax->ptMinTrackSize.y = ScaleByDpi(hwnd, kStatusWindowMinHeight);
         return 0;
     }
+    case WM_NCHITTEST:
+        return HitTestFramelessStatusWindow(hwnd, l_param);
     case WM_DPICHANGED:
         if (state != nullptr) {
             const RECT* suggested_rect = reinterpret_cast<const RECT*>(l_param);
@@ -2355,6 +5956,45 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
     case kStatsMessage:
         UpdateStatusLabel(state);
         return 0;
+    case kApplyStreamProfileMessage: {
+        auto* message = reinterpret_cast<PendingStreamProfileMessage*>(l_param);
+        if (state != nullptr && message != nullptr) {
+            if (message->auto_resumed && state->has_selected_profile) {
+                state->auto_resume_profile_message_pending.store(false);
+            } else if (!message->auto_resumed) {
+                state->cached_startup_profile = message->profile;
+                state->has_cached_startup_profile = true;
+                state->auto_resume_notice_logged = false;
+                WriteUtf8File(state->profile_cache_path, BuildProfileCacheJson(message->profile));
+                ApplyStreamProfile(state, message->profile, message->auto_resumed);
+            } else {
+                ApplyStreamProfile(state, message->profile, message->auto_resumed);
+                if (message->submit_cached_codec_config) {
+                    SubmitCachedCodecConfig(state, message->cached_codec_config, message->cached_codec_config_frame_id);
+                }
+                if (message->log_auto_resume_notice && !state->auto_resume_notice_logged) {
+                    QueueLog(
+                        state,
+                        L"\u81EA\u52A8\u63A5\u7BA1: \u68C0\u6D4B\u5230\u624B\u673A\u7AEF\u5DF2\u5728\u6301\u7EED\u9001\u5E27\uFF0C\u5DF2\u4F7F\u7528\u4E0A\u6B21\u914D\u7F6E\u4E0E\u7F13\u5B58\u7684\u7801\u6D41\u53C2\u6570\u76F4\u63A5\u6062\u590D\u89E3\u7801\u3002");
+                    state->auto_resume_notice_logged = true;
+                }
+                state->auto_resume_profile_message_pending.store(false);
+            }
+        }
+        delete message;
+        return 0;
+    }
+    case kSessionUpdateMessage: {
+        auto* message = reinterpret_cast<PendingSessionUpdateMessage*>(l_param);
+        if (state != nullptr && message != nullptr) {
+            UpdateSessionSnapshot(state, message->sender_host, message->device_name, message->connected);
+        }
+        delete message;
+        return 0;
+    }
+    case kVirtualCameraStateMessage:
+        HandleVirtualCameraControllerStateChanged(state);
+        return 0;
     case kShowVideoWindowMessage:
         if (state != nullptr && state->video_window != nullptr && !IsWindowVisible(state->video_window)) {
             ShowWindow(state->video_window, SW_SHOWNOACTIVATE);
@@ -2378,16 +6018,101 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
     case WM_COMMAND:
         if (HIWORD(w_param) == BN_CLICKED) {
             switch (LOWORD(w_param)) {
+            case kNavOverviewButtonId:
+            case kNavConnectButtonId:
+            case kNavDisplayButtonId:
+            case kNavVoiceButtonId:
+            case kNavDiagnosticsButtonId:
+            case kNavLogsButtonId:
+                NavigateToPage(state, PageFromNavigationButtonId(LOWORD(w_param)));
+                LayoutStatusWindow(state);
+                return 0;
             case kFocusVideoButtonId:
-                FocusVideoWindow(state);
+                if (state != nullptr) {
+                    switch (state->current_page) {
+                    case StatusPage::kDiagnostics:
+                        RequestKeyframe(state);
+                        break;
+                    case StatusPage::kVoiceControl:
+                        if (state->voice_control_enabled) {
+                            StopVoiceControl(state, true);
+                        } else {
+                            StartVoiceControl(state);
+                        }
+                        break;
+                    case StatusPage::kLogs:
+                        OpenLogFile(state);
+                        break;
+                    case StatusPage::kOverview:
+                    case StatusPage::kConnect:
+                    case StatusPage::kDisplay:
+                    default:
+                        FocusVideoWindow(state);
+                        break;
+                    }
+                }
                 return 0;
             case kPresentationModeButtonId:
                 if (state != nullptr) {
-                    ApplyPresentationMode(state, VideoRenderer::PresentationMode::kLowLatency, false);
+                    switch (state->current_page) {
+                    case StatusPage::kConnect:
+                        if (state->airplay_controller.running()) {
+                            StopAirPlayReceiver(state, true);
+                        } else {
+                            StartAirPlayReceiver(state, false);
+                        }
+                        break;
+                    case StatusPage::kLogs:
+                        OpenStatusSnapshotFile(state);
+                        break;
+                    case StatusPage::kDisplay:
+                        if (state->virtual_camera_controller.running()) {
+                            StopVirtualCamera(state, true);
+                        } else if (!state->virtual_camera_controller.installed()) {
+                            InstallVirtualCamera(state);
+                        } else {
+                            StartVirtualCamera(state);
+                        }
+                        break;
+                    case StatusPage::kDiagnostics:
+                        FocusVideoWindow(state);
+                        break;
+                    case StatusPage::kVoiceControl:
+                        OpenLogFile(state);
+                        break;
+                    case StatusPage::kOverview:
+                    default:
+                        NavigateToPage(state, StatusPage::kVoiceControl);
+                        LayoutStatusWindow(state);
+                        break;
+                    }
                 }
                 return 0;
             case kOpenLogButtonId:
-                OpenLogFile(state);
+                if (state != nullptr) {
+                    switch (state->current_page) {
+                    case StatusPage::kDisplay:
+                        ResizeVideoWindowToSelectedProfile(state);
+                        FocusVideoWindow(state);
+                        break;
+                    case StatusPage::kVoiceControl:
+                        OpenOutputDirectory(state);
+                        break;
+                    case StatusPage::kDiagnostics:
+                        OpenStatusSnapshotFile(state);
+                        break;
+                    case StatusPage::kLogs:
+                        OpenOutputDirectory(state);
+                        break;
+                    case StatusPage::kConnect:
+                        OpenStatusSnapshotFile(state);
+                        break;
+                    case StatusPage::kOverview:
+                    default:
+                        OpenLogFile(state);
+                        break;
+                    }
+                }
                 return 0;
             default:
                 break;
@@ -2402,6 +6127,9 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
         }
         break;
     }
+    case kVoiceCommandMessage:
+        HandleVoiceCommandMessage(state);
+        return 0;
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLOREDIT:
         if (state != nullptr && reinterpret_cast<HWND>(l_param) == state->log_view) {
@@ -2426,13 +6154,30 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
     case WM_DESTROY:
         if (state != nullptr) {
             KillTimer(hwnd, kStatsTimerId);
+            StopVoiceControl(state, false);
+            if (state->danmaku_controller != nullptr) {
+                state->danmaku_controller->Stop();
+            }
+            if (state->local_music_player != nullptr) {
+                state->local_music_player->Stop();
+            }
+            state->web_ui_bridge.reset();
+            state->danmaku_controller.reset();
+            state->airplay_controller.Stop();
+            state->virtual_camera_controller.SetStateChangedFn({});
+            state->virtual_camera_controller.SetLogFn({});
+            state->virtual_camera_controller.Stop();
+            state->virtual_camera_bridge.Stop();
             state->control_server.reset();
             state->udp_receiver.reset();
+            state->audio_receiver.reset();
             state->decoder.reset();
+            state->audio_player.reset();
             DeleteFontHandle(state->title_font);
             DeleteFontHandle(state->subtitle_font);
             DeleteFontHandle(state->section_font);
             DeleteFontHandle(state->value_font);
+            DeleteFontHandle(state->spotlight_value_font);
             DeleteFontHandle(state->body_font);
             DeleteFontHandle(state->button_font);
             DeleteBrushHandle(state->window_background_brush);
@@ -2451,22 +6196,30 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
 
 }  // namespace
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show_command) {
-    const std::wstring command_line_text = command_line != nullptr ? command_line : L"";
-    g_frontend_mode = command_line_text.find(L"--frontend-mode") != std::wstring::npos;
-
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     HANDLE instance_mutex = CreateMutexW(nullptr, TRUE, kInstanceMutexName);
     if (instance_mutex == nullptr) {
         MessageBoxW(nullptr, L"\u521B\u5EFA\u5355\u4F8B\u4E92\u65A5\u9501\u5931\u8D25\u3002", kStatusWindowTitle, MB_ICONERROR | MB_OK);
         return 1;
     }
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        MessageBoxW(nullptr, L"粥6y直播投屏助手已经在运行。", kStatusWindowTitle, MB_ICONINFORMATION | MB_OK);
+        if (HWND existing_window = FindWindowW(kStatusWindowClassName, nullptr); existing_window != nullptr) {
+            ShowWindow(existing_window, IsIconic(existing_window) ? SW_RESTORE : SW_SHOW);
+            BringWindowToTop(existing_window);
+            SetForegroundWindow(existing_window);
+        } else {
+            MessageBoxW(nullptr, L"\u76F4\u64AD\u6295\u5C4F\u52A9\u624B\u5DF2\u7ECF\u5728\u8FD0\u884C\u3002", kStatusWindowTitle, MB_ICONINFORMATION | MB_OK);
+        }
         CloseHandle(instance_mutex);
         return 0;
     }
 
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const HRESULT com_initialize_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(com_initialize_result)) {
+        CloseHandle(instance_mutex);
+        MessageBoxW(nullptr, L"\u63A5\u6536\u7AEF COM \u73AF\u5883\u521D\u59CB\u5316\u5931\u8D25\u3002", kStatusWindowTitle, MB_ICONERROR | MB_OK);
+        return 1;
+    }
     WSADATA wsadata{};
     if (WSAStartup(MAKEWORD(2, 2), &wsadata) != 0) {
         CloseHandle(instance_mutex);
@@ -2510,7 +6263,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show_
         0,
         kStatusWindowClassName,
         kStatusWindowTitle,
-        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | (g_frontend_mode ? 0 : WS_VISIBLE),
+        WS_POPUP | WS_CLIPCHILDREN | WS_VISIBLE,
         40,
         40,
         kStatusWindowWidth,
@@ -2529,10 +6282,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show_
         return 1;
     }
 
-    ShowWindow(status_window, g_frontend_mode ? SW_HIDE : show_command);
-    if (!g_frontend_mode) {
-        UpdateWindow(status_window);
-    }
+    ShowWindow(status_window, show_command == SW_HIDE ? SW_SHOWNORMAL : show_command);
+    UpdateWindow(status_window);
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {

@@ -15,23 +15,29 @@ public:
     using LogFn = std::function<void(const std::wstring&)>;
     using ProfileFn = std::function<void(const protocol::StreamProfile&)>;
     using TimeSyncFn = std::function<void(int64_t offset_us, int64_t rtt_us)>;
+    using SessionFn = std::function<void(const std::wstring&, const std::wstring&, bool)>;
 
-    ControlServer(LogFn log_fn, ProfileFn profile_fn, TimeSyncFn time_sync_fn = {});
+    ControlServer(
+        LogFn log_fn,
+        ProfileFn profile_fn,
+        TimeSyncFn time_sync_fn = {},
+        SessionFn session_fn = {});
     ~ControlServer();
 
-    bool Start(uint16_t control_port, uint16_t video_port);
+    bool Start(uint16_t control_port, uint16_t video_port, uint16_t audio_port);
     bool RequestIdr();
     bool RequestTimeSync();
     void Stop();
 
 private:
-    void ThreadMain(uint16_t control_port, uint16_t video_port);
-    void HandleClient(uintptr_t client_socket, uint16_t video_port);
+    void ThreadMain(uint16_t control_port, uint16_t video_port, uint16_t audio_port);
+    void HandleClient(uintptr_t client_socket, uint16_t video_port, uint16_t audio_port, const std::wstring& sender_host);
     protocol::StreamProfile ChooseProfile(const protocol::HelloMessage& hello) const;
 
     LogFn log_fn_;
     ProfileFn profile_fn_;
     TimeSyncFn time_sync_fn_;
+    SessionFn session_fn_;
     std::atomic<bool> running_{false};
     uintptr_t listen_socket_ = static_cast<uintptr_t>(-1);
     uintptr_t client_socket_ = static_cast<uintptr_t>(-1);

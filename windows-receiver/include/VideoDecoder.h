@@ -128,6 +128,7 @@ public:
     void SubmitAccessUnit(const AccessUnit& access_unit);
     void SetD3DDevice(ID3D11Device* device);
     void SetSmoothMode(bool enabled);
+    void SetPreferBgraOutput(bool enabled);
     size_t GetPendingAccessUnitCount();
 
 private:
@@ -153,6 +154,7 @@ private:
     bool soft_resync_requested_ = false;
     bool discontinuity_pending_ = false;
     bool smooth_mode_ = false;
+    bool prefer_bgra_output_ = false;
     size_t queue_resync_overload_hits_ = 0;
     int64_t queue_overload_started_us_ = 0;
     int64_t queue_hard_wait_started_us_ = 0;

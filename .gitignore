@@ -35,3 +35,38 @@ __pycache__/
 /build/*.jpg
 /build/*.jpeg
 /build/*.h264
+
+# Deliverables / local packaging
+成品/
+备份/
+.ref/
+
+# Local design previews
+design-preview/
+codex-screen.png
+phone-screen.png
+codex-ui.xml
+
+# Embedded web UI build artifacts
+pc-web-ui/node_modules/
+pc-web-ui/dist/
+
+# Local reference checkouts / temporary tooling
+tools/VCamSample-ref/
+tools/VideoProcessingFramework/
+tools/Windows-Camera-ref/
+tools/uxplay-windows/
+tools/vosk-model-small-cn-0.22/
+tools/vosk-tmp/
+tools/vosk-wheel/
+tools/wil-ref/
+tools/create_butterfly_icon.py
+
+# Local dependency archives / redundant extracted copies
+windows-receiver/assets/sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30.tar.bz2
+windows-receiver/assets/voice-model-sherpa/sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30/encoder.int8.onnx
+windows-receiver/third_party/ffmpeg-7.1.1/
+windows-receiver/third_party/ffmpeg-7.1.1-src/
+windows-receiver/third_party/ffmpeg-7.1.1-full_build-shared.zip
+windows-receiver/third_party/ffmpeg-7.1.1.tar.xz
+windows-receiver/third_party/sherpa-onnx-win-x64-shared-MD-Release-no-tts.tar.bz2

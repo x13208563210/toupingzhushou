@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_launcher_background">#1C1C1E</color>
+    <color name="brand_navy">#F5F5F7</color>
+    <color name="brand_blue">#0A84FF</color>
+    <color name="brand_blue_dark">#409CFF</color>
+    <color name="brand_teal">#0A84FF</color>
+    <color name="brand_red">#FF453A</color>
+    <color name="page_top">#000000</color>
+    <color name="page_bottom">#1C1C1E</color>
+    <color name="page_accent">#1C3A5F</color>
+    <color name="glass_card">#FF2C2C2E</color>
+    <color name="glass_card_strong">#FF3A3A3C</color>
+    <color name="glass_stroke">#FF3A3A3C</color>
+    <color name="input_fill">#FF2C2C2E</color>
+    <color name="text_primary">#FFFFFFFF</color>
+    <color name="text_secondary">#CCFFFFFF</color>
+    <color name="text_muted">#FF98989D</color>
+    <color name="pill_text">#FFFFFFFF</color>
+    <color name="hero_dark">#FFFFFFFF</color>
+    <color name="hero_dark_secondary">#CC1C1C1E</color>
+    <color name="surface_subtle">#FF2C2C2E</color>
+    <color name="surface_border_soft">#FF3A3A3C</color>
+    <color name="button_light_fill">#FF3A3A3C</color>
+    <color name="button_dark_fill">#FF0A84FF</color>
+    <color name="text_tertiary">#6698989D</color>
+    <color name="divider">#FF3A3A3C</color>
+    <color name="success">#30D158</color>
+    <color name="warning">#FF9F0A</color>
+    <color name="error">#FF453A</color>
+</resources>

@@ -1,171 +1,208 @@
 #include "VideoDecoder.h"
-#include "NvidiaCuvidDecoder.h"
 
 #include <Windows.h>
-#include <codecapi.h>
-#include <d3d11.h>
-#include <mfapi.h>
-#include <mferror.h>
-#include <mfidl.h>
-#include <mfobjects.h>
-#include <mftransform.h>
-#include <wmcodecdsp.h>
-#include <wrl/client.h>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/error.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/pixfmt.h>
+#include <libswscale/swscale.h>
+}
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
-#include <cstdlib>
+#include <cstdio>
+#include <cstring>
 #include <deque>
-#include <memory>
 #include <sstream>
 #include <string>
 #include <utility>
-
-using Microsoft::WRL::ComPtr;
+#include <vector>
 
 namespace {
 
-constexpr size_t kZeroCopySurfacePoolSize = 8;
+constexpr size_t kMaxQueuedAccessUnits = 96;
+constexpr size_t kQueueTrimTargetAccessUnits = 32;
 
-enum class DecoderBackend {
-    kNone,
-    kNvidiaCuvid,
-    kMediaFoundation,
-};
-
-struct DecoderContext {
-    DecoderBackend backend = DecoderBackend::kNone;
-    protocol::StreamProfile active_profile;
-    ComPtr<IMFTransform> transform;
-    ComPtr<IMFMediaType> output_type;
-    ComPtr<IMFDXGIDeviceManager> device_manager;
-    std::unique_ptr<NvidiaCuvidDecoder> nvidia_cuvid_decoder;
-    GUID output_subtype = GUID_NULL;
-    UINT32 coded_width = 0;
-    UINT32 coded_height = 0;
-    UINT32 display_width = 0;
-    UINT32 display_height = 0;
-    LONG stride = 0;
-    bool streaming_started = false;
-    bool using_d3d_manager = false;
-    bool mf_zero_copy_enabled = false;
-    uint64_t decoded_frame_count = 0;
-    size_t output_surface_index = 0;
-    std::vector<ComPtr<ID3D11Texture2D>> output_surfaces;
-};
-
-std::wstring HrToString(HRESULT hr) {
+std::wstring HrToString(DWORD value) {
     std::wostringstream stream;
-    stream << L"0x" << std::hex << std::uppercase << hr;
+    stream << L"0x" << std::hex << std::uppercase << value;
     return stream.str();
 }
 
-LONG GetDefaultStride(IMFMediaType* media_type, UINT32 width) {
-    LONG stride = 0;
-    if (media_type != nullptr &&
-        SUCCEEDED(media_type->GetUINT32(MF_MT_DEFAULT_STRIDE, reinterpret_cast<UINT32*>(&stride)))) {
-        return stride;
+std::wstring FormatLastErrorMessage(DWORD error_code) {
+    LPWSTR message_buffer = nullptr;
+    const DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER |
+                        FORMAT_MESSAGE_FROM_SYSTEM |
+                        FORMAT_MESSAGE_IGNORE_INSERTS;
+    const DWORD length = FormatMessageW(
+        flags,
+        nullptr,
+        error_code,
+        0,
+        reinterpret_cast<LPWSTR>(&message_buffer),
+        0,
+        nullptr);
+    std::wstring message;
+    if (length != 0 && message_buffer != nullptr) {
+        message.assign(message_buffer, message_buffer + length);
+        while (!message.empty() &&
+               (message.back() == L'\r' || message.back() == L'\n' || message.back() == L' ')) {
+            message.pop_back();
+        }
+    } else {
+        message = L"\u672a\u77e5\u9519\u8bef";
     }
-    return static_cast<LONG>(width);
+    if (message_buffer != nullptr) {
+        LocalFree(message_buffer);
+    }
+    return message;
 }
 
-const wchar_t* SubtypeName(const GUID& subtype) {
-    if (subtype == MFVideoFormat_RGB32) {
-        return L"RGB32";
+std::wstring Utf8ToWide(const char* text) {
+    if (text == nullptr || *text == '\0') {
+        return {};
     }
-    if (subtype == MFVideoFormat_NV12) {
-        return L"NV12";
+
+    const int required = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
+    if (required <= 1) {
+        std::wstring fallback;
+        while (*text != '\0') {
+            fallback.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*text)));
+            ++text;
+        }
+        return fallback;
     }
-    return L"UNKNOWN";
+
+    std::wstring wide(static_cast<size_t>(required - 1), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text, -1, wide.data(), required);
+    return wide;
 }
 
-void CloseHandleIfValid(HANDLE* handle) {
-    if (handle == nullptr || *handle == nullptr || *handle == INVALID_HANDLE_VALUE) {
-        return;
+std::wstring GetExecutableDirectory() {
+    std::wstring path(MAX_PATH, L'\0');
+    DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+    while (length >= path.size() - 1) {
+        path.resize(path.size() * 2);
+        length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
     }
-    CloseHandle(*handle);
-    *handle = nullptr;
+    path.resize(length);
+
+    const size_t separator = path.find_last_of(L"\\/");
+    if (separator == std::wstring::npos) {
+        return {};
+    }
+
+    path.resize(separator);
+    return path;
+}
+
+HMODULE LoadModuleFromExecutableDirectory(const wchar_t* file_name) {
+    if (file_name == nullptr || *file_name == L'\0') {
+        return nullptr;
+    }
+
+    const std::wstring directory = GetExecutableDirectory();
+    if (directory.empty()) {
+        return LoadLibraryW(file_name);
+    }
+
+    std::wstring full_path = directory;
+    full_path += L"\\";
+    full_path += file_name;
+
+    HMODULE module = LoadLibraryExW(
+        full_path.c_str(),
+        nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (module != nullptr) {
+        return module;
+    }
+
+    return LoadLibraryW(full_path.c_str());
 }
 
 void SetCurrentThreadPriorityBestEffort(int priority) {
     SetThreadPriority(GetCurrentThread(), priority);
 }
 
-int64_t NowSteadyUs() {
-    return std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
+std::wstring BuildDebugOutputPath(const wchar_t* file_name) {
+    if (file_name == nullptr || *file_name == L'\0') {
+        return {};
+    }
+
+    const std::wstring directory = GetExecutableDirectory();
+    if (directory.empty()) {
+        return file_name;
+    }
+
+    std::wstring path = directory;
+    path += L"\\";
+    path += file_name;
+    return path;
 }
 
-size_t QueueWarningThresholdForProfile(const protocol::StreamProfile& profile, bool smooth_mode) {
-    const int fps = std::max(0, profile.fps);
-    if (fps <= 0) {
-        return smooth_mode ? 18 : 16;
+bool WriteBinaryFile(const std::wstring& path, const uint8_t* data, size_t size) {
+    if (path.empty() || data == nullptr || size == 0) {
+        return false;
     }
-    if (smooth_mode) {
-        return static_cast<size_t>(std::clamp(fps / 3, 18, 40));
+
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path.c_str(), L"wb") != 0 || file == nullptr) {
+        return false;
     }
-    return static_cast<size_t>(std::clamp(fps / 5, 18, 28));
+
+    const size_t written = fwrite(data, 1, size, file);
+    fclose(file);
+    return written == size;
 }
 
-size_t QueueResyncThresholdForProfile(const protocol::StreamProfile& profile, bool smooth_mode) {
-    const int fps = std::max(0, profile.fps);
-    if (fps <= 0) {
-        return smooth_mode ? 36 : 24;
+bool SaveBgraBitmap(const std::wstring& path, const DecodedFrame& frame) {
+    if (path.empty() ||
+        frame.format != DecodedFrameFormat::kBgra ||
+        frame.width <= 0 ||
+        frame.height <= 0 ||
+        frame.stride0 < frame.width * 4 ||
+        frame.bytes.size() < static_cast<size_t>(frame.stride0) * static_cast<size_t>(frame.height)) {
+        return false;
     }
-    if (smooth_mode) {
-        return static_cast<size_t>(std::clamp(fps / 3, 30, 72));
-    }
-    return static_cast<size_t>(std::clamp(fps / 3, 30, 48));
-}
 
-size_t QueueHardWaitThresholdForProfile(const protocol::StreamProfile& profile, bool smooth_mode) {
-    const int fps = std::max(0, profile.fps);
-    if (fps <= 0) {
-        return smooth_mode ? 60 : 36;
+    std::vector<uint8_t> packed_pixels(static_cast<size_t>(frame.width) * static_cast<size_t>(frame.height) * 4);
+    for (int row = 0; row < frame.height; ++row) {
+        const uint8_t* source = frame.bytes.data() + static_cast<size_t>(row) * static_cast<size_t>(frame.stride0);
+        uint8_t* target =
+            packed_pixels.data() + static_cast<size_t>(row) * static_cast<size_t>(frame.width) * 4;
+        std::memcpy(target, source, static_cast<size_t>(frame.width) * 4);
     }
-    if (smooth_mode) {
-        return static_cast<size_t>(std::clamp((fps * 2) / 3, 48, 96));
-    }
-    return static_cast<size_t>(std::clamp((fps * 2) / 3, 48, 84));
-}
 
-size_t QueueResyncHitThresholdForProfile(const protocol::StreamProfile& profile, bool smooth_mode) {
-    const int fps = std::max(0, profile.fps);
-    if (fps <= 0) {
-        return smooth_mode ? 6 : 5;
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path.c_str(), L"wb") != 0 || file == nullptr) {
+        return false;
     }
-    if (smooth_mode) {
-        return static_cast<size_t>(std::clamp(fps / 20, 6, 10));
-    }
-    return static_cast<size_t>(std::clamp(fps / 24, 5, 8));
-}
 
-size_t QueueWarningResetThreshold(size_t warning_threshold) {
-    return std::max<size_t>(2, warning_threshold / 2);
-}
+    const DWORD pixel_bytes = static_cast<DWORD>(packed_pixels.size());
+    BITMAPFILEHEADER file_header{};
+    file_header.bfType = 0x4D42;
+    file_header.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+    file_header.bfSize = file_header.bfOffBits + pixel_bytes;
 
-int64_t QueueResyncGracePeriodUsForProfile(const protocol::StreamProfile& profile, bool smooth_mode) {
-    const int fps = std::max(0, profile.fps);
-    if (fps <= 0) {
-        return smooth_mode ? 320'000 : 220'000;
-    }
-    if (smooth_mode) {
-        return std::clamp<int64_t>((36ll * 1'000'000ll) / fps, 280'000ll, 500'000ll);
-    }
-    return std::clamp<int64_t>((24ll * 1'000'000ll) / fps, 180'000ll, 320'000ll);
-}
+    BITMAPINFOHEADER info_header{};
+    info_header.biSize = sizeof(BITMAPINFOHEADER);
+    info_header.biWidth = frame.width;
+    info_header.biHeight = -frame.height;
+    info_header.biPlanes = 1;
+    info_header.biBitCount = 32;
+    info_header.biCompression = BI_RGB;
+    info_header.biSizeImage = pixel_bytes;
 
-int64_t QueueHardWaitGracePeriodUsForProfile(const protocol::StreamProfile& profile, bool smooth_mode) {
-    const int fps = std::max(0, profile.fps);
-    if (fps <= 0) {
-        return smooth_mode ? 800'000 : 520'000;
-    }
-    if (smooth_mode) {
-        return std::clamp<int64_t>((72ll * 1'000'000ll) / fps, 650'000ll, 1'000'000ll);
-    }
-    return std::clamp<int64_t>((48ll * 1'000'000ll) / fps, 420'000ll, 800'000ll);
+    const bool success =
+        fwrite(&file_header, 1, sizeof(file_header), file) == sizeof(file_header) &&
+        fwrite(&info_header, 1, sizeof(info_header), file) == sizeof(info_header) &&
+        fwrite(packed_pixels.data(), 1, packed_pixels.size(), file) == packed_pixels.size();
+    fclose(file);
+    return success;
 }
 
 bool IsCodecConfigAccessUnit(const AccessUnit& access_unit) {
@@ -176,7 +213,7 @@ bool IsKeyframeAccessUnit(const AccessUnit& access_unit) {
     return (access_unit.flags & protocol::kFlagKeyframe) != 0;
 }
 
-bool KeepLatestDecodableQueueSpan(
+bool TrimQueueToLatestDecodableSpan(
     std::deque<AccessUnit>* queue,
     const AccessUnit& latest_codec_config,
     bool has_latest_codec_config) {
@@ -216,554 +253,658 @@ bool KeepLatestDecodableQueueSpan(
     return true;
 }
 
-bool ConfigureMediaFoundationTransform(
-    const protocol::StreamProfile& profile,
-    ID3D11Device* d3d_device,
-    DecoderContext* context,
-    const VideoDecoder::LogFn& log_fn);
-
-bool ConfigureDecoderBackend(
-    const protocol::StreamProfile& profile,
-    ID3D11Device* d3d_device,
-    DecoderContext* context,
-    const VideoDecoder::LogFn& log_fn,
-    const VideoDecoder::FrameFn& frame_fn);
-
-HRESULT CreateOutputSurfaceTexture(
-    ID3D11Device* d3d_device,
-    DecoderContext* context,
-    ID3D11Texture2D** texture_out) {
-    if (texture_out == nullptr) {
-        return E_POINTER;
-    }
-    *texture_out = nullptr;
-    if (d3d_device == nullptr || context == nullptr) {
-        return E_POINTER;
-    }
-
-    DXGI_FORMAT texture_format = DXGI_FORMAT_UNKNOWN;
-    UINT bind_flags = D3D11_BIND_SHADER_RESOURCE;
-    if (context->output_subtype == MFVideoFormat_NV12) {
-        texture_format = DXGI_FORMAT_NV12;
-        bind_flags |= D3D11_BIND_DECODER;
-    } else if (context->output_subtype == MFVideoFormat_RGB32) {
-        texture_format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    } else {
-        return MF_E_INVALIDMEDIATYPE;
-    }
-
-    D3D11_TEXTURE2D_DESC desc{};
-    desc.Width = std::max<UINT32>(1, context->coded_width);
-    desc.Height = std::max<UINT32>(1, context->coded_height);
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.Format = texture_format;
-    desc.SampleDesc.Count = 1;
-    desc.Usage = D3D11_USAGE_DEFAULT;
-    desc.BindFlags = bind_flags;
-    return d3d_device->CreateTexture2D(&desc, nullptr, texture_out);
-}
-
-bool IsSurfaceAvailable(ID3D11Texture2D* surface) {
-    if (surface == nullptr) {
-        return false;
-    }
-
-    const ULONG ref_count = surface->AddRef();
-    surface->Release();
-    return ref_count <= 2;
-}
-
-void ResetZeroCopyOutputSurfaces(DecoderContext* context) {
-    if (context == nullptr) {
-        return;
-    }
-    context->mf_zero_copy_enabled = false;
-    context->output_surface_index = 0;
-    context->output_surfaces.clear();
-}
-
-bool CreateZeroCopyOutputSurfaces(
-    ID3D11Device* d3d_device,
-    DecoderContext* context,
-    const VideoDecoder::LogFn& log_fn) {
-    ResetZeroCopyOutputSurfaces(context);
-    if (context == nullptr || d3d_device == nullptr || !context->using_d3d_manager) {
-        return false;
-    }
-
-    for (size_t index = 0; index < kZeroCopySurfacePoolSize; ++index) {
-        ComPtr<ID3D11Texture2D> surface;
-        const HRESULT hr = CreateOutputSurfaceTexture(d3d_device, context, surface.GetAddressOf());
-        if (FAILED(hr)) {
-            log_fn(L"视频解码: 创建零拷贝输出纹理失败，错误码 " + HrToString(hr));
-            ResetZeroCopyOutputSurfaces(context);
-            return false;
-        }
-        context->output_surfaces.push_back(std::move(surface));
-    }
-
-    context->mf_zero_copy_enabled = true;
-
-    std::wostringstream stream;
-    stream << L"视频解码: 已启用 D3D11 零拷贝输出，纹理池="
-           << context->output_surfaces.size()
-           << L"，格式="
-           << SubtypeName(context->output_subtype);
-    log_fn(stream.str());
-    return true;
-}
-
-HRESULT CreateDecoderOutputSample(
-    DecoderContext* context,
-    const MFT_OUTPUT_STREAM_INFO& stream_info,
-    const VideoDecoder::LogFn& log_fn,
-    ID3D11Device* d3d_device,
-    IMFSample** sample_out) {
-    if (sample_out == nullptr) {
-        return E_POINTER;
-    }
-    *sample_out = nullptr;
-
-    if ((stream_info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) != 0) {
-        return S_OK;
-    }
-
-    ComPtr<IMFSample> sample;
-    ComPtr<IMFMediaBuffer> buffer;
-    HRESULT hr = MFCreateSample(&sample);
-    if (FAILED(hr)) {
-        return hr;
-    }
-
-    if (context != nullptr && context->mf_zero_copy_enabled) {
-        ID3D11Texture2D* surface = nullptr;
-        for (size_t attempt = 0; attempt < context->output_surfaces.size(); ++attempt) {
-            ID3D11Texture2D* candidate =
-                context->output_surfaces[(context->output_surface_index + attempt) % context->output_surfaces.size()].Get();
-            if (IsSurfaceAvailable(candidate)) {
-                surface = candidate;
-                context->output_surface_index =
-                    (context->output_surface_index + attempt + 1) % context->output_surfaces.size();
-                break;
-            }
-        }
-
-        ComPtr<ID3D11Texture2D> transient_surface;
-        if (surface == nullptr) {
-            const HRESULT create_hr = CreateOutputSurfaceTexture(d3d_device, context, transient_surface.GetAddressOf());
-            if (FAILED(create_hr)) {
-                log_fn(L"视频解码: 纹理池已占满且临时纹理创建失败，错误码 " + HrToString(create_hr));
-                return create_hr;
-            }
-            surface = transient_surface.Get();
-        }
-
-        hr = MFCreateDXGISurfaceBuffer(
-            __uuidof(ID3D11Texture2D),
-            surface,
-            0,
-            FALSE,
-            &buffer);
-        if (SUCCEEDED(hr)) {
-            hr = sample->AddBuffer(buffer.Get());
-        }
-        if (SUCCEEDED(hr)) {
-            *sample_out = sample.Detach();
-            return S_OK;
-        }
-
-        log_fn(L"视频解码: 零拷贝输出样本创建失败，错误码 " + HrToString(hr));
-        ResetZeroCopyOutputSurfaces(context);
-    }
-
-    (void)stream_info;
-    (void)sample;
-    return MF_E_INVALIDREQUEST;
-}
-
-void StopDecoderBackend(DecoderContext* context) {
-    if (context == nullptr) {
-        return;
-    }
-    ResetZeroCopyOutputSurfaces(context);
-    context->nvidia_cuvid_decoder.reset();
-    context->output_type.Reset();
-    context->transform.Reset();
-    context->device_manager.Reset();
-    context->backend = DecoderBackend::kNone;
-    context->using_d3d_manager = false;
-    context->output_subtype = GUID_NULL;
-}
-
-void SoftResyncDecoder(
-    DecoderContext* context,
-    ID3D11Device* d3d_device,
-    const VideoDecoder::LogFn& log_fn,
-    const VideoDecoder::FrameFn& frame_fn) {
-    if (context == nullptr) {
-        return;
-    }
-
-    if (context->backend == DecoderBackend::kNvidiaCuvid) {
-        return;
-    }
-
-    if (context->backend == DecoderBackend::kMediaFoundation) {
-        log_fn(L"视频解码: 已执行软重同步，重新初始化 Media Foundation 解码器。");
-        ConfigureMediaFoundationTransform(context->active_profile, d3d_device, context, log_fn);
-        return;
-    }
-
-    if (context->active_profile.width > 0 && context->active_profile.height > 0) {
-        ConfigureDecoderBackend(context->active_profile, d3d_device, context, log_fn, frame_fn);
+AVCodecID CodecIdForProfile(const protocol::StreamProfile& profile) {
+    switch (profile.codec) {
+    case protocol::Codec::kAvc:
+        return AV_CODEC_ID_H264;
+    case protocol::Codec::kHevc:
+        return AV_CODEC_ID_HEVC;
+    case protocol::Codec::kUnknown:
+    default:
+        return AV_CODEC_ID_NONE;
     }
 }
 
-bool TrySetOutputType(IMFTransform* transform, IMFMediaType* type, DecoderContext* context) {
-    GUID subtype = GUID_NULL;
-    if (FAILED(type->GetGUID(MF_MT_SUBTYPE, &subtype))) {
-        return false;
-    }
-    if (FAILED(transform->SetOutputType(0, type, 0))) {
-        return false;
-    }
-
-    context->output_type = type;
-    context->output_subtype = subtype;
-    MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &context->coded_width, &context->coded_height);
-    context->stride = GetDefaultStride(type, context->coded_width);
-    return true;
+AVPixelFormat OutputPixelFormatForPreference(bool prefer_bgra_output) {
+    (void)prefer_bgra_output;
+    // Keep the first scrcpy-style replacement conservative:
+    // route FFmpeg software decode through BGRA output by default to
+    // bypass the current NV12 upload/render path while we stabilize it.
+    return AV_PIX_FMT_BGRA;
 }
 
-bool SelectOutputType(IMFTransform* transform, DecoderContext* context) {
-    ComPtr<IMFMediaType> rgb32_type;
-    ComPtr<IMFMediaType> nv12_type;
+struct FfmpegApi {
+    HMODULE avcodec_module = nullptr;
+    HMODULE avutil_module = nullptr;
+    HMODULE swresample_module = nullptr;
+    HMODULE swscale_module = nullptr;
 
-    for (DWORD index = 0;; ++index) {
-        ComPtr<IMFMediaType> type;
-        const HRESULT hr = transform->GetOutputAvailableType(0, index, &type);
-        if (hr == MF_E_NO_MORE_TYPES) {
-            break;
-        }
-        if (FAILED(hr)) {
-            return false;
-        }
+    decltype(&::avcodec_find_decoder) avcodec_find_decoder = nullptr;
+    decltype(&::avcodec_alloc_context3) avcodec_alloc_context3 = nullptr;
+    decltype(&::avcodec_open2) avcodec_open2 = nullptr;
+    decltype(&::avcodec_free_context) avcodec_free_context = nullptr;
+    decltype(&::av_parser_init) av_parser_init = nullptr;
+    decltype(&::av_parser_parse2) av_parser_parse2 = nullptr;
+    decltype(&::av_parser_close) av_parser_close = nullptr;
+    decltype(&::avcodec_send_packet) avcodec_send_packet = nullptr;
+    decltype(&::avcodec_receive_frame) avcodec_receive_frame = nullptr;
+    decltype(&::avcodec_flush_buffers) avcodec_flush_buffers = nullptr;
 
-        GUID subtype = GUID_NULL;
-        if (FAILED(type->GetGUID(MF_MT_SUBTYPE, &subtype))) {
-            continue;
-        }
-        if (subtype == MFVideoFormat_RGB32 && rgb32_type == nullptr) {
-            rgb32_type = type;
-        } else if (subtype == MFVideoFormat_NV12 && nv12_type == nullptr) {
-            nv12_type = type;
-        }
-    }
+    decltype(&::av_frame_alloc) av_frame_alloc = nullptr;
+    decltype(&::av_frame_free) av_frame_free = nullptr;
+    decltype(&::av_frame_unref) av_frame_unref = nullptr;
+    decltype(&::av_strerror) av_strerror = nullptr;
+    decltype(&::av_image_get_buffer_size) av_image_get_buffer_size = nullptr;
+    decltype(&::av_image_fill_arrays) av_image_fill_arrays = nullptr;
+    decltype(&::av_version_info) av_version_info = nullptr;
 
-    if (nv12_type != nullptr && TrySetOutputType(transform, nv12_type.Get(), context)) {
-        return true;
-    }
-    if (rgb32_type != nullptr && TrySetOutputType(transform, rgb32_type.Get(), context)) {
-        return true;
-    }
-    return false;
-}
+    decltype(&::sws_getCachedContext) sws_getCachedContext = nullptr;
+    decltype(&::sws_scale) sws_scale = nullptr;
+    decltype(&::sws_freeContext) sws_freeContext = nullptr;
 
-bool ConfigureMediaFoundationTransform(
-    const protocol::StreamProfile& profile,
-    ID3D11Device* d3d_device,
-    DecoderContext* context,
-    const VideoDecoder::LogFn& log_fn) {
-    context->active_profile = profile;
-    context->transform.Reset();
-    context->output_type.Reset();
-    context->device_manager.Reset();
-    context->output_subtype = GUID_NULL;
-    context->coded_width = static_cast<UINT32>(profile.width);
-    context->coded_height = static_cast<UINT32>(profile.height);
-    context->display_width = static_cast<UINT32>(profile.width);
-    context->display_height = static_cast<UINT32>(profile.height);
-    context->stride = static_cast<LONG>(profile.width);
-    context->streaming_started = false;
-    context->using_d3d_manager = false;
-    context->mf_zero_copy_enabled = false;
-    context->decoded_frame_count = 0;
-    ResetZeroCopyOutputSurfaces(context);
+    bool loaded = false;
 
-    if (profile.codec != protocol::Codec::kAvc) {
-        log_fn(L"视频解码: 当前阶段只实现了 AVC。");
-        return false;
-    }
-
-    HRESULT hr = CoCreateInstance(
-        CLSID_CMSH264DecoderMFT,
-        nullptr,
-        CLSCTX_INPROC_SERVER,
-        IID_PPV_ARGS(&context->transform));
-    if (FAILED(hr)) {
-        log_fn(L"视频解码: CoCreateInstance 失败，错误码 " + HrToString(hr));
-        return false;
-    }
-
-    ComPtr<IMFAttributes> transform_attributes;
-    if (SUCCEEDED(context->transform->GetAttributes(&transform_attributes)) && transform_attributes != nullptr) {
-        transform_attributes->SetUINT32(MF_LOW_LATENCY, TRUE);
-        transform_attributes->SetUINT32(MF_SA_D3D11_AWARE, TRUE);
-        transform_attributes->SetUINT32(MF_SA_D3D_AWARE, TRUE);
-    }
-
-    if (d3d_device != nullptr) {
-        UINT reset_token = 0;
-        hr = MFCreateDXGIDeviceManager(&reset_token, &context->device_manager);
-        if (SUCCEEDED(hr)) {
-            hr = context->device_manager->ResetDevice(d3d_device, reset_token);
-        }
-        if (SUCCEEDED(hr)) {
-            hr = context->transform->ProcessMessage(
-                MFT_MESSAGE_SET_D3D_MANAGER,
-                reinterpret_cast<ULONG_PTR>(context->device_manager.Get()));
-        }
-        if (SUCCEEDED(hr)) {
-            context->using_d3d_manager = true;
-            log_fn(L"视频解码: 已绑定 D3D11 设备管理器，优先使用 GPU 解码。");
-        } else {
-            log_fn(L"视频解码: 绑定 D3D11 设备管理器失败，错误码 " + HrToString(hr));
-            context->device_manager.Reset();
-        }
-    }
-
-    ComPtr<ICodecAPI> codec_api;
-    if (SUCCEEDED(context->transform.As(&codec_api))) {
-        VARIANT variant{};
-        variant.vt = VT_UI4;
-        variant.ulVal = TRUE;
-        codec_api->SetValue(&CODECAPI_AVLowLatencyMode, &variant);
-        codec_api->SetValue(&CODECAPI_AVDecVideoAcceleration_H264, &variant);
-        variant.ulVal = 1;
-        codec_api->SetValue(&CODECAPI_AVDecNumWorkerThreads, &variant);
-    }
-
-    ComPtr<IMFMediaType> input_type;
-    hr = MFCreateMediaType(&input_type);
-    if (FAILED(hr)) {
-        log_fn(L"视频解码: MFCreateMediaType 失败，错误码 " + HrToString(hr));
-        return false;
-    }
-
-    input_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    input_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264_ES);
-    MFSetAttributeSize(input_type.Get(), MF_MT_FRAME_SIZE, profile.width, profile.height);
-    MFSetAttributeRatio(input_type.Get(), MF_MT_FRAME_RATE, profile.fps, 1);
-    MFSetAttributeRatio(input_type.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-    input_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    input_type->SetUINT32(MF_MT_AVG_BITRATE, profile.bitrate);
-
-    hr = context->transform->SetInputType(0, input_type.Get(), 0);
-    if (FAILED(hr)) {
-        log_fn(L"视频解码: SetInputType 失败，错误码 " + HrToString(hr));
-        return false;
-    }
-
-    if (!SelectOutputType(context->transform.Get(), context)) {
-        log_fn(L"视频解码: 选择输出格式失败。");
-        return false;
-    }
-
-    if (!CreateZeroCopyOutputSurfaces(d3d_device, context, log_fn)) {
-        log_fn(L"视频解码: 零拷贝输出初始化失败，已停止继续配置旧链路。");
-        return false;
-    }
-
-    context->transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-    context->transform->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-    context->transform->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
-    context->streaming_started = true;
-    context->backend = DecoderBackend::kMediaFoundation;
-
-    std::wostringstream stream;
-    stream << L"视频解码: 已切到 Media Foundation 后备解码 "
-           << profile.width << L"x" << profile.height
-           << L" @" << (profile.adaptive_fps ? L"\u81EA\u9002\u5E94\u5237\u65B0\u7387" : (std::to_wstring(profile.fps) + L"fps"))
-           << L" 输出=" << SubtypeName(context->output_subtype)
-           << L" 硬件解码=" << (context->using_d3d_manager ? L"已请求" : L"未请求")
-           << L" 零拷贝=" << (context->mf_zero_copy_enabled ? L"已启用" : L"未启用");
-    log_fn(stream.str());
-    return true;
-}
-
-bool ConfigureDecoderBackend(
-    const protocol::StreamProfile& profile,
-    ID3D11Device* d3d_device,
-    DecoderContext* context,
-    const VideoDecoder::LogFn& log_fn,
-    const VideoDecoder::FrameFn& frame_fn) {
-    StopDecoderBackend(context);
-
-    if (profile.codec == protocol::Codec::kAvc) {
-        auto nvidia_decoder = std::make_unique<NvidiaCuvidDecoder>(log_fn, frame_fn);
-        if (nvidia_decoder->Configure(profile, d3d_device)) {
-            context->active_profile = profile;
-            context->backend = DecoderBackend::kNvidiaCuvid;
-            context->nvidia_cuvid_decoder = std::move(nvidia_decoder);
-            context->decoded_frame_count = 0;
+    bool Load(const VideoDecoder::LogFn& log_fn) {
+        if (loaded) {
             return true;
         }
 
-        if (log_fn) {
-            log_fn(L"视频解码: NVIDIA CUVID 后端未能接管，回退到 Media Foundation。");
+        avutil_module = LoadModuleFromExecutableDirectory(L"avutil-59.dll");
+        swresample_module = LoadModuleFromExecutableDirectory(L"swresample-5.dll");
+        swscale_module = LoadModuleFromExecutableDirectory(L"swscale-8.dll");
+        avcodec_module = LoadModuleFromExecutableDirectory(L"avcodec-61.dll");
+        if (avcodec_module == nullptr ||
+            avutil_module == nullptr ||
+            swresample_module == nullptr ||
+            swscale_module == nullptr) {
+            const DWORD error = GetLastError();
+            if (log_fn != nullptr) {
+                std::wstring line =
+                    L"\u89c6\u9891\u89e3\u7801: FFmpeg \u8fd0\u884c\u65f6 DLL \u52a0\u8f7d\u5931\u8d25\uff0c"
+                    L"\u9519\u8bef=" +
+                    HrToString(error) + L"\uff0c" + FormatLastErrorMessage(error);
+                log_fn(line);
+            }
+            Unload();
+            return false;
         }
+
+#define ANDROID_CAST_LOAD_PROC(module, proc_name)                                                     \
+    do {                                                                                              \
+        proc_name = reinterpret_cast<decltype(proc_name)>(GetProcAddress(module, #proc_name));        \
+        if (proc_name == nullptr) {                                                                   \
+            if (log_fn != nullptr) {                                                                  \
+                log_fn(std::wstring(L"\u89c6\u9891\u89e3\u7801: FFmpeg \u7f3a\u5c11\u7b26\u53f7 ") +  \
+                       L#proc_name + L"\u3002");                                                     \
+            }                                                                                         \
+            Unload();                                                                                 \
+            return false;                                                                             \
+        }                                                                                             \
+    } while (false)
+
+        ANDROID_CAST_LOAD_PROC(avcodec_module, avcodec_find_decoder);
+        ANDROID_CAST_LOAD_PROC(avcodec_module, avcodec_alloc_context3);
+        ANDROID_CAST_LOAD_PROC(avcodec_module, avcodec_open2);
+        ANDROID_CAST_LOAD_PROC(avcodec_module, avcodec_free_context);
+        ANDROID_CAST_LOAD_PROC(avcodec_module, av_parser_init);
+        ANDROID_CAST_LOAD_PROC(avcodec_module, av_parser_parse2);
+        ANDROID_CAST_LOAD_PROC(avcodec_module, av_parser_close);
+        ANDROID_CAST_LOAD_PROC(avcodec_module, avcodec_send_packet);
+        ANDROID_CAST_LOAD_PROC(avcodec_module, avcodec_receive_frame);
+        ANDROID_CAST_LOAD_PROC(avcodec_module, avcodec_flush_buffers);
+
+        ANDROID_CAST_LOAD_PROC(avutil_module, av_frame_alloc);
+        ANDROID_CAST_LOAD_PROC(avutil_module, av_frame_free);
+        ANDROID_CAST_LOAD_PROC(avutil_module, av_frame_unref);
+        ANDROID_CAST_LOAD_PROC(avutil_module, av_strerror);
+        ANDROID_CAST_LOAD_PROC(avutil_module, av_image_get_buffer_size);
+        ANDROID_CAST_LOAD_PROC(avutil_module, av_image_fill_arrays);
+        ANDROID_CAST_LOAD_PROC(avutil_module, av_version_info);
+
+        ANDROID_CAST_LOAD_PROC(swscale_module, sws_getCachedContext);
+        ANDROID_CAST_LOAD_PROC(swscale_module, sws_scale);
+        ANDROID_CAST_LOAD_PROC(swscale_module, sws_freeContext);
+
+#undef ANDROID_CAST_LOAD_PROC
+
+        loaded = true;
+        if (log_fn != nullptr && av_version_info != nullptr) {
+            log_fn(std::wstring(L"\u89c6\u9891\u89e3\u7801: \u5df2\u542f\u7528 FFmpeg ") +
+                   Utf8ToWide(av_version_info()) +
+                   L"\uFF0C\u4F7F\u7528 scrcpy \u98CE\u683C\u7684\u4F4E\u7F13\u51B2\u89E3\u7801\u4E3B\u94FE\u3002");
+        }
+        return true;
     }
 
-    return ConfigureMediaFoundationTransform(profile, d3d_device, context, log_fn);
+    void Unload() {
+        if (swresample_module != nullptr) {
+            FreeLibrary(swresample_module);
+            swresample_module = nullptr;
+        }
+        if (swscale_module != nullptr) {
+            FreeLibrary(swscale_module);
+            swscale_module = nullptr;
+        }
+        if (avutil_module != nullptr) {
+            FreeLibrary(avutil_module);
+            avutil_module = nullptr;
+        }
+        if (avcodec_module != nullptr) {
+            FreeLibrary(avcodec_module);
+            avcodec_module = nullptr;
+        }
+
+        avcodec_find_decoder = nullptr;
+        avcodec_alloc_context3 = nullptr;
+        avcodec_open2 = nullptr;
+        avcodec_free_context = nullptr;
+        av_parser_init = nullptr;
+        av_parser_parse2 = nullptr;
+        av_parser_close = nullptr;
+        avcodec_send_packet = nullptr;
+        avcodec_receive_frame = nullptr;
+        avcodec_flush_buffers = nullptr;
+
+        av_frame_alloc = nullptr;
+        av_frame_free = nullptr;
+        av_frame_unref = nullptr;
+        av_strerror = nullptr;
+        av_image_get_buffer_size = nullptr;
+        av_image_fill_arrays = nullptr;
+        av_version_info = nullptr;
+
+        sws_getCachedContext = nullptr;
+        sws_scale = nullptr;
+        sws_freeContext = nullptr;
+
+        loaded = false;
+    }
+
+    std::wstring FormatAvError(int error_code) const {
+        if (av_strerror == nullptr) {
+            return HrToString(static_cast<DWORD>(error_code));
+        }
+
+        std::array<char, AV_ERROR_MAX_STRING_SIZE> buffer{};
+        buffer.fill('\0');
+        if (av_strerror(error_code, buffer.data(), buffer.size()) == 0) {
+            return Utf8ToWide(buffer.data());
+        }
+
+        return HrToString(static_cast<DWORD>(error_code));
+    }
+};
+
+struct DecoderRuntime {
+    FfmpegApi api;
+    protocol::StreamProfile active_profile{};
+    AVCodecContext* codec_context = nullptr;
+    AVCodecParserContext* parser_context = nullptr;
+    AVFrame* decoded_frame = nullptr;
+    SwsContext* sws_context = nullptr;
+    AVPixelFormat sws_output_format = AV_PIX_FMT_NONE;
+    int sws_width = 0;
+    int sws_height = 0;
+    bool logged_first_output_frame = false;
+    bool dumped_first_bgra_bitmap = false;
+    bool dumped_first_startup_stream = false;
+};
+
+void ResetSwsContext(DecoderRuntime* runtime) {
+    if (runtime == nullptr || runtime->sws_context == nullptr || runtime->api.sws_freeContext == nullptr) {
+        return;
+    }
+    runtime->api.sws_freeContext(runtime->sws_context);
+    runtime->sws_context = nullptr;
+    runtime->sws_output_format = AV_PIX_FMT_NONE;
+    runtime->sws_width = 0;
+    runtime->sws_height = 0;
 }
 
-DecodedFrame CopySampleToFrame(IMFSample* sample, DecoderContext* context, const VideoDecoder::LogFn& log_fn) {
-    DecodedFrame frame;
-    if (sample == nullptr) {
-        return frame;
-    }
-
-    ComPtr<IMFMediaBuffer> buffer;
-    HRESULT hr = sample->GetBufferByIndex(0, &buffer);
-    if (FAILED(hr)) {
-        log_fn(L"视频解码: 读取输出 Buffer 失败，错误码 " + HrToString(hr));
-        return frame;
-    }
-
-    frame.width = static_cast<int>(context->display_width);
-    frame.height = static_cast<int>(context->display_height);
-    LONGLONG sample_time_100ns = 0;
-    if (SUCCEEDED(sample->GetSampleTime(&sample_time_100ns)) && sample_time_100ns > 0) {
-        frame.pts_us = static_cast<uint64_t>(sample_time_100ns / 10);
-    }
-
-    ComPtr<IMFDXGIBuffer> dxgi_buffer;
-    if (SUCCEEDED(buffer.As(&dxgi_buffer))) {
-        ComPtr<ID3D11Texture2D> texture;
-        UINT subresource = 0;
-        if (SUCCEEDED(dxgi_buffer->GetResource(IID_PPV_ARGS(&texture))) &&
-            SUCCEEDED(dxgi_buffer->GetSubresourceIndex(&subresource)) &&
-            texture != nullptr) {
-            D3D11_TEXTURE2D_DESC texture_desc{};
-            texture->GetDesc(&texture_desc);
-
-            if (texture_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || context->output_subtype == MFVideoFormat_RGB32) {
-                frame.format = DecodedFrameFormat::kBgra;
-                frame.stride0 = static_cast<int>(context->display_width * 4);
-                frame.stride1 = 0;
-                frame.plane1_offset = 0;
-            } else if (texture_desc.Format == DXGI_FORMAT_NV12 || context->output_subtype == MFVideoFormat_NV12) {
-                frame.format = DecodedFrameFormat::kNv12;
-                frame.stride0 = static_cast<int>(context->display_width);
-                frame.stride1 = static_cast<int>(context->display_width);
-                frame.plane1_offset =
-                    static_cast<size_t>(context->display_width) * static_cast<size_t>(context->display_height);
-            }
-
-            if (frame.format != DecodedFrameFormat::kUnknown) {
-                frame.gpu_backed = true;
-                frame.d3d_texture = texture.Detach();
-                frame.d3d_subresource = subresource;
-
-                const uint64_t frame_index = context->decoded_frame_count + 1;
-                if (frame_index == 1 || (frame_index % 120) == 0) {
-                    std::wostringstream stream;
-                    stream << L"视频解码: 已输出 GPU 纹理帧 "
-                           << frame_index
-                           << L"，格式=" << SubtypeName(context->output_subtype)
-                           << L"，尺寸=" << frame.width << L"x" << frame.height;
-                    log_fn(stream.str());
-                }
-                return frame;
-            }
-        }
-    }
-    log_fn(L"视频解码: 当前样本未返回 GPU 纹理，已按零拷贝模式丢弃该帧。");
-    return frame;
-}
-
-void DrainOutput(
-    DecoderContext* context,
-    ID3D11Device* d3d_device,
-    const VideoDecoder::LogFn& log_fn,
-    const VideoDecoder::FrameFn& frame_fn) {
-    if (context->transform == nullptr) {
+void CloseDecoderRuntime(DecoderRuntime* runtime) {
+    if (runtime == nullptr) {
         return;
     }
 
-    MFT_OUTPUT_STREAM_INFO stream_info{};
-    if (FAILED(context->transform->GetOutputStreamInfo(0, &stream_info))) {
-        return;
+    ResetSwsContext(runtime);
+
+    if (runtime->parser_context != nullptr && runtime->api.av_parser_close != nullptr) {
+        runtime->api.av_parser_close(runtime->parser_context);
+        runtime->parser_context = nullptr;
+    }
+    if (runtime->decoded_frame != nullptr && runtime->api.av_frame_free != nullptr) {
+        runtime->api.av_frame_free(&runtime->decoded_frame);
+        runtime->decoded_frame = nullptr;
+    }
+    if (runtime->codec_context != nullptr && runtime->api.avcodec_free_context != nullptr) {
+        runtime->api.avcodec_free_context(&runtime->codec_context);
+        runtime->codec_context = nullptr;
+    }
+}
+
+bool OpenDecoderRuntime(
+    DecoderRuntime* runtime,
+    const protocol::StreamProfile& profile,
+    const VideoDecoder::LogFn& log_fn) {
+    if (runtime == nullptr) {
+        return false;
+    }
+
+    CloseDecoderRuntime(runtime);
+
+    if (!runtime->api.Load(log_fn)) {
+        return false;
+    }
+
+    const AVCodecID codec_id = CodecIdForProfile(profile);
+    if (codec_id == AV_CODEC_ID_NONE) {
+        if (log_fn != nullptr) {
+            log_fn(L"\u89c6\u9891\u89e3\u7801: \u5f53\u524d\u89c4\u683c\u4e0d\u652f\u6301\u7684\u89c6\u9891\u7f16\u7801\u3002");
+        }
+        return false;
+    }
+
+    const AVCodec* codec = runtime->api.avcodec_find_decoder(codec_id);
+    if (codec == nullptr) {
+        if (log_fn != nullptr) {
+            log_fn(L"\u89c6\u9891\u89e3\u7801: FFmpeg \u672a\u627e\u5230\u53ef\u7528\u89e3\u7801\u5668\u3002");
+        }
+        return false;
+    }
+
+    runtime->codec_context = runtime->api.avcodec_alloc_context3(codec);
+    if (runtime->codec_context == nullptr) {
+        if (log_fn != nullptr) {
+            log_fn(L"\u89c6\u9891\u89e3\u7801: \u521b\u5efa FFmpeg \u89e3\u7801\u4e0a\u4e0b\u6587\u5931\u8d25\u3002");
+        }
+        return false;
+    }
+
+    runtime->codec_context->thread_count = 1;
+    runtime->codec_context->thread_type = FF_THREAD_SLICE;
+    runtime->codec_context->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    runtime->codec_context->flags2 |= AV_CODEC_FLAG2_FAST;
+    runtime->codec_context->width = profile.width;
+    runtime->codec_context->height = profile.height;
+
+    const int open_result = runtime->api.avcodec_open2(runtime->codec_context, codec, nullptr);
+    if (open_result < 0) {
+        if (log_fn != nullptr) {
+            log_fn(
+                std::wstring(L"\u89c6\u9891\u89e3\u7801: \u6253\u5f00 FFmpeg \u89e3\u7801\u5668\u5931\u8d25\uff0c") +
+                runtime->api.FormatAvError(open_result));
+        }
+        CloseDecoderRuntime(runtime);
+        return false;
+    }
+
+    runtime->decoded_frame = runtime->api.av_frame_alloc();
+    if (runtime->decoded_frame == nullptr) {
+        if (log_fn != nullptr) {
+            log_fn(L"\u89c6\u9891\u89e3\u7801: \u521b\u5efa FFmpeg \u89e3\u7801\u5e27\u5931\u8d25\u3002");
+        }
+        CloseDecoderRuntime(runtime);
+        return false;
+    }
+
+    runtime->parser_context = runtime->api.av_parser_init(codec_id);
+    if (runtime->parser_context == nullptr) {
+        if (log_fn != nullptr) {
+            log_fn(L"\u89c6\u9891\u89e3\u7801: \u521b\u5efa FFmpeg \u7801\u6d41 parser \u5931\u8d25\u3002");
+        }
+        CloseDecoderRuntime(runtime);
+        return false;
+    }
+
+    runtime->active_profile = profile;
+    runtime->logged_first_output_frame = false;
+    runtime->dumped_first_bgra_bitmap = false;
+    runtime->dumped_first_startup_stream = false;
+
+    if (log_fn != nullptr) {
+        std::wostringstream stream;
+        stream << L"\u89c6\u9891\u89e3\u7801: \u5df2\u5207\u5230 FFmpeg \u8f6f\u89e3\u4f4e\u5ef6\u8fdf\u94fe\u8def "
+               << profile.width << L"x" << profile.height
+               << L" @"
+               << (profile.adaptive_fps ? L"\u81ea\u9002\u5e94\u5237\u65b0\u7387" : (std::to_wstring(profile.fps) + L"fps"))
+               << L"\uFF0C\u9ED8\u8BA4\u8F93\u51FA=BGRA";
+        log_fn(stream.str());
+    }
+
+    return true;
+}
+
+bool ConvertDecodedFrame(
+    DecoderRuntime* runtime,
+    const AVFrame* source_frame,
+    bool prefer_bgra_output,
+    uint64_t fallback_pts_us,
+    DecodedFrame* output_frame,
+    const VideoDecoder::LogFn& log_fn) {
+    if (runtime == nullptr ||
+        source_frame == nullptr ||
+        output_frame == nullptr ||
+        runtime->codec_context == nullptr) {
+        return false;
+    }
+
+    if (source_frame->width <= 0 ||
+        source_frame->height <= 0 ||
+        source_frame->format == AV_PIX_FMT_NONE) {
+        return false;
+    }
+
+    const AVPixelFormat destination_format = OutputPixelFormatForPreference(prefer_bgra_output);
+    runtime->sws_context = runtime->api.sws_getCachedContext(
+        runtime->sws_context,
+        source_frame->width,
+        source_frame->height,
+        static_cast<AVPixelFormat>(source_frame->format),
+        source_frame->width,
+        source_frame->height,
+        destination_format,
+        SWS_FAST_BILINEAR,
+        nullptr,
+        nullptr,
+        nullptr);
+    if (runtime->sws_context == nullptr) {
+        if (log_fn != nullptr) {
+            log_fn(L"\u89c6\u9891\u89e3\u7801: \u521b\u5efa swscale \u8f6c\u6362\u4e0a\u4e0b\u6587\u5931\u8d25\u3002");
+        }
+        return false;
+    }
+
+    runtime->sws_output_format = destination_format;
+    runtime->sws_width = source_frame->width;
+    runtime->sws_height = source_frame->height;
+
+    const int buffer_size = runtime->api.av_image_get_buffer_size(
+        destination_format,
+        source_frame->width,
+        source_frame->height,
+        1);
+    if (buffer_size <= 0) {
+        if (log_fn != nullptr) {
+            log_fn(L"\u89c6\u9891\u89e3\u7801: \u8ba1\u7b97\u8f93\u51fa\u5e27\u7f13\u51b2\u5927\u5c0f\u5931\u8d25\u3002");
+        }
+        return false;
+    }
+
+    std::vector<uint8_t> bytes(static_cast<size_t>(buffer_size));
+    std::array<uint8_t*, 4> destination_planes{};
+    std::array<int, 4> destination_linesizes{};
+    if (runtime->api.av_image_fill_arrays(
+            destination_planes.data(),
+            destination_linesizes.data(),
+            bytes.data(),
+            destination_format,
+            source_frame->width,
+            source_frame->height,
+            1) < 0) {
+        if (log_fn != nullptr) {
+            log_fn(L"\u89c6\u9891\u89e3\u7801: \u521d\u59cb\u5316\u8f93\u51fa\u5e27\u5e73\u9762\u5931\u8d25\u3002");
+        }
+        return false;
+    }
+
+    const int scaled_height = runtime->api.sws_scale(
+        runtime->sws_context,
+        source_frame->data,
+        source_frame->linesize,
+        0,
+        source_frame->height,
+        destination_planes.data(),
+        destination_linesizes.data());
+    if (scaled_height != source_frame->height) {
+        if (log_fn != nullptr) {
+            log_fn(L"\u89c6\u9891\u89e3\u7801: swscale \u8f6c\u6362\u5931\u8d25\u3002");
+        }
+        return false;
+    }
+
+    output_frame->Reset();
+    output_frame->width = source_frame->width;
+    output_frame->height = source_frame->height;
+    if (source_frame->best_effort_timestamp != AV_NOPTS_VALUE &&
+        source_frame->best_effort_timestamp > 0) {
+        output_frame->pts_us = static_cast<uint64_t>(source_frame->best_effort_timestamp);
+    } else if (source_frame->pts != AV_NOPTS_VALUE && source_frame->pts > 0) {
+        output_frame->pts_us = static_cast<uint64_t>(source_frame->pts);
+    } else {
+        output_frame->pts_us = fallback_pts_us;
+    }
+    output_frame->bytes = std::move(bytes);
+    output_frame->gpu_backed = false;
+    output_frame->direct_sample_safe = false;
+    output_frame->separate_textures = false;
+    output_frame->d3d_texture = nullptr;
+    output_frame->d3d_texture_plane1 = nullptr;
+    output_frame->d3d_subresource = 0;
+
+    if (destination_format == AV_PIX_FMT_BGRA) {
+        output_frame->format = DecodedFrameFormat::kBgra;
+        output_frame->stride0 = destination_linesizes[0];
+        output_frame->stride1 = 0;
+        output_frame->plane1_offset = 0;
+    } else {
+        output_frame->format = DecodedFrameFormat::kNv12;
+        output_frame->stride0 = destination_linesizes[0];
+        output_frame->stride1 = destination_linesizes[1];
+        output_frame->plane1_offset = static_cast<size_t>(destination_planes[1] - destination_planes[0]);
+    }
+
+    if (!runtime->logged_first_output_frame && log_fn != nullptr) {
+        std::wostringstream stream;
+        stream << L"\u89c6\u9891\u89e3\u7801: \u9996\u4E2A\u8F93\u51FA\u5E27\u5DF2\u786E\u8BA4\uFF0C"
+               << L"\u683C\u5F0F=" << (output_frame->format == DecodedFrameFormat::kBgra ? L"BGRA" : L"NV12")
+               << L"\uFF0Cstride0=" << output_frame->stride0
+               << L"\uFF0Cstride1=" << output_frame->stride1
+               << L"\uFF0Cwidth=" << output_frame->width
+               << L"\uFF0Cheight=" << output_frame->height;
+        log_fn(stream.str());
+        runtime->logged_first_output_frame = true;
+    }
+
+    if (!runtime->dumped_first_bgra_bitmap && output_frame->format == DecodedFrameFormat::kBgra) {
+        const std::wstring bitmap_path = BuildDebugOutputPath(L"receiver-debug-first-decoded-frame.bmp");
+        if (SaveBgraBitmap(bitmap_path, *output_frame)) {
+            if (log_fn != nullptr) {
+                log_fn(L"\u89c6\u9891\u89e3\u7801: \u5df2\u5199\u51fa\u9996\u4e2a\u89e3\u7801 BGRA \u5e27\u8c03\u8bd5\u56fe\u50cf -> " + bitmap_path);
+            }
+            runtime->dumped_first_bgra_bitmap = true;
+        } else if (log_fn != nullptr) {
+            log_fn(L"\u89c6\u9891\u89e3\u7801: \u5199\u51fa\u9996\u4e2a\u89e3\u7801 BGRA \u5e27\u8c03\u8bd5\u56fe\u50cf\u5931\u8d25\u3002");
+        }
+    }
+
+    return true;
+}
+
+bool ReceiveFrames(
+    DecoderRuntime* runtime,
+    bool prefer_bgra_output,
+    uint64_t fallback_pts_us,
+    const VideoDecoder::FrameFn& frame_fn,
+    const VideoDecoder::LogFn& log_fn) {
+    if (runtime == nullptr || runtime->codec_context == nullptr || runtime->decoded_frame == nullptr) {
+        return false;
     }
 
     while (true) {
-        ComPtr<IMFSample> sample;
-        IMFSample* output_sample_input = nullptr;
-        const HRESULT sample_hr = CreateDecoderOutputSample(
-            context,
-            stream_info,
-            log_fn,
-            d3d_device,
-            &output_sample_input);
-        if (FAILED(sample_hr)) {
-            log_fn(L"视频解码: 创建输出样本失败，错误码 " + HrToString(sample_hr));
-            return;
+        const int receive_result =
+            runtime->api.avcodec_receive_frame(runtime->codec_context, runtime->decoded_frame);
+        if (receive_result == AVERROR(EAGAIN) || receive_result == AVERROR_EOF) {
+            return true;
         }
-        if (output_sample_input != nullptr) {
-            sample.Attach(output_sample_input);
-        }
-
-        MFT_OUTPUT_DATA_BUFFER output{};
-        output.dwStreamID = 0;
-        output.pSample = sample.Get();
-        DWORD status = 0;
-
-        const HRESULT hr = context->transform->ProcessOutput(0, 1, &output, &status);
-        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
-            break;
-        }
-        if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
-            if (!SelectOutputType(context->transform.Get(), context)) {
-                log_fn(L"视频解码: 处理流格式变化失败。");
-            } else {
-                if (!CreateZeroCopyOutputSurfaces(d3d_device, context, log_fn)) {
-                    log_fn(L"视频解码: 流格式变化后无法继续建立零拷贝输出。");
-                    break;
-                }
+        if (receive_result < 0) {
+            if (log_fn != nullptr) {
+                log_fn(
+                    std::wstring(L"\u89c6\u9891\u89e3\u7801: \u63d0\u53d6\u89e3\u7801\u5e27\u5931\u8d25\uff0c") +
+                    runtime->api.FormatAvError(receive_result));
             }
-            continue;
-        }
-        if (FAILED(hr)) {
-            log_fn(L"视频解码: ProcessOutput 失败，错误码 " + HrToString(hr));
-            break;
+            runtime->api.av_frame_unref(runtime->decoded_frame);
+            return false;
         }
 
-        IMFSample* output_sample = output.pSample;
-        if (output_sample != nullptr) {
-            DecodedFrame frame = CopySampleToFrame(output_sample, context, log_fn);
-            if (frame.gpu_backed || !frame.bytes.empty()) {
-                ++context->decoded_frame_count;
-                if (context->decoded_frame_count == 1 || (context->decoded_frame_count % 120) == 0) {
-                    std::wostringstream stream;
-                    stream << L"视频解码: 已输出 "
-                           << context->decoded_frame_count
-                           << L" 帧，尺寸="
-                           << frame.width << L"x" << frame.height
-                           << L"，路径=" << (frame.gpu_backed ? L"GPU 直出" : L"CPU 回拷");
-                    log_fn(stream.str());
-                }
-                frame_fn(std::move(frame));
-            }
+        DecodedFrame output_frame;
+        const bool converted = ConvertDecodedFrame(
+            runtime,
+            runtime->decoded_frame,
+            prefer_bgra_output,
+            fallback_pts_us,
+            &output_frame,
+            log_fn);
+        runtime->api.av_frame_unref(runtime->decoded_frame);
+        if (!converted) {
+            return false;
         }
-        if (output.pSample != nullptr && output.pSample != sample.Get()) {
-            output.pSample->Release();
-            output.pSample = nullptr;
-        }
-        if (output.pEvents != nullptr) {
-            output.pEvents->Release();
+
+        if (frame_fn != nullptr) {
+            frame_fn(std::move(output_frame));
         }
     }
+}
+
+bool SubmitPacket(
+    DecoderRuntime* runtime,
+    const AccessUnit& access_unit,
+    bool prefer_bgra_output,
+    const VideoDecoder::FrameFn& frame_fn,
+    const VideoDecoder::LogFn& log_fn) {
+    if (runtime == nullptr || runtime->codec_context == nullptr || access_unit.bytes.empty()) {
+        return false;
+    }
+
+    AVPacket packet{};
+    packet.data = const_cast<uint8_t*>(access_unit.bytes.data());
+    packet.size = static_cast<int>(access_unit.bytes.size());
+    packet.pts = access_unit.pts_us > 0 ? static_cast<int64_t>(access_unit.pts_us) : AV_NOPTS_VALUE;
+    packet.dts = packet.pts;
+    packet.duration = 0;
+    if (IsKeyframeAccessUnit(access_unit)) {
+        packet.flags |= AV_PKT_FLAG_KEY;
+    }
+
+    int send_result = runtime->api.avcodec_send_packet(runtime->codec_context, &packet);
+    if (send_result == AVERROR(EAGAIN)) {
+        if (!ReceiveFrames(runtime, prefer_bgra_output, access_unit.pts_us, frame_fn, log_fn)) {
+            return false;
+        }
+        send_result = runtime->api.avcodec_send_packet(runtime->codec_context, &packet);
+    }
+
+    if (send_result < 0) {
+        if (log_fn != nullptr) {
+            log_fn(
+                std::wstring(L"\u89c6\u9891\u89e3\u7801: \u63d0\u4ea4\u8bbf\u95ee\u5355\u5143\u5931\u8d25\uff0c") +
+                runtime->api.FormatAvError(send_result));
+        }
+        return false;
+    }
+
+    return ReceiveFrames(runtime, prefer_bgra_output, access_unit.pts_us, frame_fn, log_fn);
+}
+
+void ResetCodecAndParserState(
+    DecoderRuntime* runtime,
+    const VideoDecoder::LogFn& log_fn) {
+    if (runtime == nullptr) {
+        return;
+    }
+
+    if (runtime->codec_context != nullptr && runtime->api.avcodec_flush_buffers != nullptr) {
+        runtime->api.avcodec_flush_buffers(runtime->codec_context);
+    }
+
+    if (runtime->api.av_parser_close != nullptr && runtime->parser_context != nullptr) {
+        runtime->api.av_parser_close(runtime->parser_context);
+        runtime->parser_context = nullptr;
+    }
+
+    const AVCodecID codec_id = CodecIdForProfile(runtime->active_profile);
+    if (codec_id == AV_CODEC_ID_NONE || runtime->api.av_parser_init == nullptr) {
+        return;
+    }
+
+    runtime->parser_context = runtime->api.av_parser_init(codec_id);
+    if (runtime->parser_context == nullptr && log_fn != nullptr) {
+        log_fn(L"\u89c6\u9891\u89e3\u7801: \u91cd\u7f6e FFmpeg parser \u5931\u8d25\u3002");
+    }
+}
+
+bool SubmitEncodedChunk(
+    DecoderRuntime* runtime,
+    const AccessUnit& access_unit,
+    bool prefer_bgra_output,
+    const VideoDecoder::FrameFn& frame_fn,
+    const VideoDecoder::LogFn& log_fn) {
+    if (runtime == nullptr || runtime->codec_context == nullptr || access_unit.bytes.empty()) {
+        return false;
+    }
+
+    if (runtime->parser_context == nullptr || runtime->api.av_parser_parse2 == nullptr) {
+        return SubmitPacket(runtime, access_unit, prefer_bgra_output, frame_fn, log_fn);
+    }
+
+    const uint8_t* input = access_unit.bytes.data();
+    int remaining = static_cast<int>(access_unit.bytes.size());
+    int64_t next_pts = access_unit.pts_us > 0 ? static_cast<int64_t>(access_unit.pts_us) : AV_NOPTS_VALUE;
+
+    while (remaining > 0) {
+        uint8_t* packet_data = nullptr;
+        int packet_size = 0;
+        const int consumed =
+            runtime->api.av_parser_parse2(
+                runtime->parser_context,
+                runtime->codec_context,
+                &packet_data,
+                &packet_size,
+                input,
+                remaining,
+                next_pts,
+                next_pts,
+                0);
+        if (consumed < 0) {
+            if (log_fn != nullptr) {
+                log_fn(
+                    std::wstring(L"\u89c6\u9891\u89e3\u7801: \u89e3\u6790\u7801\u6d41 chunk \u5931\u8d25\uff0c") +
+                    runtime->api.FormatAvError(consumed));
+            }
+            return false;
+        }
+        if (consumed == 0 && packet_size == 0) {
+            break;
+        }
+
+        input += consumed;
+        remaining -= consumed;
+
+        if (packet_size <= 0 || packet_data == nullptr) {
+            next_pts = AV_NOPTS_VALUE;
+            continue;
+        }
+
+        AccessUnit parsed_unit = access_unit;
+        parsed_unit.bytes.assign(packet_data, packet_data + packet_size);
+
+        const int64_t parser_pts =
+            runtime->parser_context->pts != AV_NOPTS_VALUE
+                ? runtime->parser_context->pts
+                : runtime->parser_context->dts;
+        if (parser_pts > 0) {
+            parsed_unit.pts_us = static_cast<uint64_t>(parser_pts);
+        }
+        if (runtime->parser_context->key_frame == 1) {
+            parsed_unit.flags |= protocol::kFlagKeyframe;
+        }
+
+        if (!SubmitPacket(runtime, parsed_unit, prefer_bgra_output, frame_fn, log_fn)) {
+            return false;
+        }
+        next_pts = AV_NOPTS_VALUE;
+    }
+
+    return true;
 }
 
 }  // namespace
@@ -775,10 +916,6 @@ VideoDecoder::VideoDecoder(LogFn log_fn, FrameFn frame_fn, RequestKeyframeFn req
 
 VideoDecoder::~VideoDecoder() {
     Stop();
-    if (d3d_device_ != nullptr) {
-        d3d_device_->Release();
-        d3d_device_ = nullptr;
-    }
 }
 
 void VideoDecoder::Start() {
@@ -786,8 +923,11 @@ void VideoDecoder::Start() {
     if (running_) {
         return;
     }
+
     running_ = true;
-    thread_ = std::thread([this] { ThreadMain(); });
+    thread_ = std::thread([this] {
+        ThreadMain();
+    });
 }
 
 void VideoDecoder::Stop() {
@@ -802,6 +942,12 @@ void VideoDecoder::Stop() {
     if (thread_.joinable()) {
         thread_.join();
     }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    queue_.clear();
+    waiting_for_keyframe_ = false;
+    proactive_keyframe_requested_ = false;
+    queue_warning_active_ = false;
 }
 
 void VideoDecoder::Configure(const protocol::StreamProfile& profile) {
@@ -809,64 +955,89 @@ void VideoDecoder::Configure(const protocol::StreamProfile& profile) {
         std::lock_guard<std::mutex> lock(mutex_);
         pending_profile_ = profile;
         active_profile_ = profile;
-        has_active_profile_ = true;
         profile_dirty_ = true;
+        has_active_profile_ = true;
         queue_.clear();
         latest_codec_config_ = AccessUnit{};
         has_latest_codec_config_ = false;
-        waiting_for_keyframe_ = false;
-        pending_keyframe_resync_ = false;
-        queue_warning_active_ = false;
+        waiting_for_keyframe_ = true;
         proactive_keyframe_requested_ = false;
-        queue_resync_overload_hits_ = 0;
-        queue_overload_started_us_ = 0;
-        queue_hard_wait_started_us_ = 0;
-        backend_reset_requested_ = false;
-        soft_resync_requested_ = false;
-        discontinuity_pending_ = true;
+        queue_warning_active_ = false;
     }
+    cv_.notify_all();
+}
+
+void VideoDecoder::SubmitAccessUnit(const AccessUnit& access_unit) {
+    bool trimmed_queue = false;
+    bool dropped_old_units = false;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (IsCodecConfigAccessUnit(access_unit)) {
+            latest_codec_config_ = access_unit;
+            has_latest_codec_config_ = true;
+
+            for (auto it = queue_.begin(); it != queue_.end();) {
+                if (IsCodecConfigAccessUnit(*it)) {
+                    it = queue_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        queue_.push_back(access_unit);
+
+        if (queue_.size() > kMaxQueuedAccessUnits) {
+            trimmed_queue = TrimQueueToLatestDecodableSpan(&queue_, latest_codec_config_, has_latest_codec_config_);
+            while (queue_.size() > kQueueTrimTargetAccessUnits) {
+                if (trimmed_queue && IsKeyframeAccessUnit(queue_.front())) {
+                    break;
+                }
+                if (queue_.size() <= 1) {
+                    break;
+                }
+                if (!trimmed_queue || !IsCodecConfigAccessUnit(queue_.front())) {
+                    queue_.pop_front();
+                    dropped_old_units = true;
+                } else {
+                    queue_.pop_front();
+                }
+            }
+        }
+
+        if (queue_.size() <= 2) {
+            queue_warning_active_ = false;
+            proactive_keyframe_requested_ = false;
+        }
+    }
+
+    if (trimmed_queue && log_fn_ != nullptr) {
+        log_fn_(
+            L"\u89c6\u9891\u89e3\u7801: \u5df2\u6309 scrcpy \u98ce\u683c\u4e22\u5f03\u65e7\u89c6\u9891\u5355\u5143\uff0c"
+            L"\u53ea\u4fdd\u7559\u6700\u65b0\u53ef\u89e3\u7801 span\u3002");
+    }
+    if (dropped_old_units && log_fn_ != nullptr) {
+        log_fn_(
+            L"\u89c6\u9891\u89e3\u7801: \u961f\u5217\u8fc7\u6df1\uff0c\u5df2\u4e22\u5f03\u6700\u65e7\u7f16\u7801\u5757\u4ee5\u8ffd\u5b9e\u65f6\u3002");
+    }
+
     cv_.notify_all();
 }
 
 void VideoDecoder::SetD3DDevice(ID3D11Device* device) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (d3d_device_ == device) {
-        return;
-    }
-    if (d3d_device_ != nullptr) {
-        d3d_device_->Release();
-    }
     d3d_device_ = device;
-    if (d3d_device_ != nullptr) {
-        d3d_device_->AddRef();
-    }
 }
 
 void VideoDecoder::SetSmoothMode(bool enabled) {
-    enabled = false;
-    bool changed = false;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (smooth_mode_ == enabled) {
-            return;
-        }
+    std::lock_guard<std::mutex> lock(mutex_);
+    smooth_mode_ = enabled;
+}
 
-        smooth_mode_ = enabled;
-        waiting_for_keyframe_ = false;
-        pending_keyframe_resync_ = false;
-        queue_warning_active_ = false;
-        proactive_keyframe_requested_ = false;
-        queue_resync_overload_hits_ = 0;
-        queue_overload_started_us_ = 0;
-        queue_hard_wait_started_us_ = 0;
-        changed = true;
-    }
-
-    if (changed && log_fn_) {
-        log_fn_(enabled
-            ? L"视频解码: 已切换到顺滑观感策略，队列抖动时会优先保住连续性。"
-            : L"视频解码: 已切换到竞技低延迟策略，队列积压时会更快回到最新画面。");
-    }
+void VideoDecoder::SetPreferBgraOutput(bool enabled) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    prefer_bgra_output_ = enabled;
 }
 
 size_t VideoDecoder::GetPendingAccessUnitCount() {
@@ -874,302 +1045,25 @@ size_t VideoDecoder::GetPendingAccessUnitCount() {
     return queue_.size();
 }
 
-void VideoDecoder::SubmitAccessUnit(const AccessUnit& access_unit) {
-    bool should_request_keyframe = false;
-    std::wstring deferred_log;
-
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!running_) {
-            return;
-        }
-
-        const bool is_codec_config = (access_unit.flags & protocol::kFlagCodecConfig) != 0;
-        const bool is_keyframe = (access_unit.flags & protocol::kFlagKeyframe) != 0;
-        const protocol::StreamProfile threshold_profile =
-            has_active_profile_ ? active_profile_ : pending_profile_;
-        const bool smooth_mode = smooth_mode_;
-        const size_t warning_threshold = QueueWarningThresholdForProfile(threshold_profile, smooth_mode);
-        const size_t resync_threshold = QueueResyncThresholdForProfile(threshold_profile, smooth_mode);
-        const size_t hard_wait_threshold = QueueHardWaitThresholdForProfile(threshold_profile, smooth_mode);
-        const size_t resync_hit_threshold = QueueResyncHitThresholdForProfile(threshold_profile, smooth_mode);
-        const size_t warning_reset_threshold = QueueWarningResetThreshold(warning_threshold);
-        const int64_t resync_grace_period_us = QueueResyncGracePeriodUsForProfile(threshold_profile, smooth_mode);
-        const int64_t hard_wait_grace_period_us = QueueHardWaitGracePeriodUsForProfile(threshold_profile, smooth_mode);
-        const int64_t now_us = NowSteadyUs();
-
-        if (is_codec_config) {
-            latest_codec_config_ = access_unit;
-            has_latest_codec_config_ = true;
-        }
-        if (is_keyframe) {
-            proactive_keyframe_requested_ = false;
-        }
-
-        if (waiting_for_keyframe_) {
-            if (is_codec_config) {
-                return;
-            }
-            if (!is_keyframe) {
-                return;
-            }
-
-            waiting_for_keyframe_ = false;
-            pending_keyframe_resync_ = false;
-            proactive_keyframe_requested_ = false;
-            queue_.clear();
-            queue_warning_active_ = false;
-            queue_resync_overload_hits_ = 0;
-            queue_overload_started_us_ = 0;
-            queue_hard_wait_started_us_ = 0;
-            if (has_latest_codec_config_) {
-                queue_.push_back(latest_codec_config_);
-            }
-            queue_.push_back(access_unit);
-            soft_resync_requested_ = true;
-            discontinuity_pending_ = true;
-            deferred_log = L"解码队列: 已收到新的关键帧，恢复低延迟解码。";
-        } else if (pending_keyframe_resync_ && is_keyframe) {
-            waiting_for_keyframe_ = false;
-            pending_keyframe_resync_ = false;
-            proactive_keyframe_requested_ = false;
-            queue_.clear();
-            queue_warning_active_ = false;
-            queue_resync_overload_hits_ = 0;
-            queue_overload_started_us_ = 0;
-            queue_hard_wait_started_us_ = 0;
-            if (has_latest_codec_config_) {
-                queue_.push_back(latest_codec_config_);
-            }
-            queue_.push_back(access_unit);
-            soft_resync_requested_ = true;
-            discontinuity_pending_ = true;
-            deferred_log =
-                L"\u89e3\u7801\u961f\u5217: \u5df2\u6536\u5230\u8865\u6551\u5173\u952e\u5e27\uff0c\u76f4\u63a5\u5207\u56de\u6700\u65b0\u753b\u9762\u3002";
-        } else {
-            queue_.push_back(access_unit);
-            const size_t queue_depth = queue_.size();
-
-            if (queue_depth >= warning_threshold && !queue_warning_active_) {
-                std::wostringstream stream;
-                stream << L"解码队列: 待解码访问单元已积压到 "
-                       << queue_depth
-                       << L" 帧，如继续上升将主动重同步。";
-                deferred_log = stream.str();
-                queue_warning_active_ = true;
-            } else if (queue_depth <= warning_reset_threshold) {
-                queue_warning_active_ = false;
-                proactive_keyframe_requested_ = false;
-                pending_keyframe_resync_ = false;
-            }
-
-            if (queue_depth >= resync_threshold && false) {
-                ++queue_resync_overload_hits_;
-                if (queue_resync_overload_hits_ >= resync_hit_threshold) {
-                    queue_warning_active_ = false;
-                    queue_resync_overload_hits_ = 0;
-                    if (is_keyframe) {
-                        waiting_for_keyframe_ = false;
-                        pending_keyframe_resync_ = false;
-                        proactive_keyframe_requested_ = false;
-                        queue_.clear();
-                        soft_resync_requested_ = true;
-                        discontinuity_pending_ = true;
-                        if (has_latest_codec_config_) {
-                            queue_.push_back(latest_codec_config_);
-                        }
-                        queue_.push_back(access_unit);
-                        deferred_log = L"解码队列: 积压过多，已丢弃旧帧并从最新关键帧继续。";
-                    } else if (!smooth_mode) {
-                        const bool kept_latest_span =
-                            KeepLatestDecodableQueueSpan(&queue_, latest_codec_config_, has_latest_codec_config_);
-                        const size_t trimmed_depth = queue_.size();
-
-                        soft_resync_requested_ = true;
-                        discontinuity_pending_ = true;
-                        pending_keyframe_resync_ = false;
-                        proactive_keyframe_requested_ = false;
-                        waiting_for_keyframe_ = false;
-
-                        if (kept_latest_span && trimmed_depth <= hard_wait_threshold) {
-                            deferred_log =
-                                L"\u89e3\u7801\u961f\u5217: \u4f4e\u5ef6\u8fdf\u6a21\u5f0f\u5df2\u81ea\u52a8\u91ca\u653e\u79ef\u538b\u65e7\u5e27\uff0c\u53ea\u4fdd\u7559\u6700\u65b0\u5173\u952e\u5e27\u540e\u7684\u753b\u9762\u3002";
-                        } else {
-                            queue_.clear();
-                            waiting_for_keyframe_ = true;
-                            should_request_keyframe = true;
-                            deferred_log =
-                                L"\u89e3\u7801\u961f\u5217: \u4f4e\u5ef6\u8fdf\u6a21\u5f0f\u5df2\u81ea\u52a8\u91ca\u653e\u79ef\u538b\u65e7\u5e27\uff0c\u7b49\u5f85\u4e0b\u4e00\u5f20\u5173\u952e\u5e27\u76f4\u63a5\u8ffd\u4e0a\u6700\u65b0\u753b\u9762\u3002";
-                        }
-                    } else if (!pending_keyframe_resync_) {
-                        pending_keyframe_resync_ = true;
-                        should_request_keyframe = true;
-                        deferred_log =
-                            L"解码队列: 顺滑模式下检测到持续积压，已继续消化排队帧，并请求新的关键帧切回最新画面。";
-                    } else if (queue_depth >= hard_wait_threshold) {
-                        queue_.clear();
-                        soft_resync_requested_ = true;
-                        discontinuity_pending_ = true;
-                        waiting_for_keyframe_ = true;
-                        pending_keyframe_resync_ = false;
-                        proactive_keyframe_requested_ = true;
-                        should_request_keyframe = true;
-                        deferred_log = L"解码队列: 积压过多，已丢弃旧帧并等待新的关键帧重同步。";
-                    }
-                }
-            } else {
-                queue_resync_overload_hits_ = 0;
-            }
-
-            if (queue_depth >= resync_threshold) {
-                if (queue_overload_started_us_ == 0) {
-                    queue_overload_started_us_ = now_us;
-                }
-            } else {
-                queue_overload_started_us_ = 0;
-                queue_hard_wait_started_us_ = 0;
-                if (queue_depth <= warning_threshold) {
-                    pending_keyframe_resync_ = false;
-                }
-            }
-
-            if (queue_depth >= hard_wait_threshold) {
-                if (queue_hard_wait_started_us_ == 0) {
-                    queue_hard_wait_started_us_ = now_us;
-                }
-            } else {
-                queue_hard_wait_started_us_ = 0;
-            }
-
-            const bool overload_sustained =
-                queue_overload_started_us_ != 0 &&
-                (now_us - queue_overload_started_us_) >= resync_grace_period_us;
-            const bool hard_wait_sustained =
-                queue_hard_wait_started_us_ != 0 &&
-                (now_us - queue_hard_wait_started_us_) >= hard_wait_grace_period_us;
-
-            if (queue_depth >= resync_threshold && overload_sustained) {
-                const int64_t overload_duration_ms =
-                    queue_overload_started_us_ != 0 ? (now_us - queue_overload_started_us_) / 1000 : 0;
-
-                if (is_keyframe) {
-                    waiting_for_keyframe_ = false;
-                    pending_keyframe_resync_ = false;
-                    proactive_keyframe_requested_ = false;
-                    queue_.clear();
-                    soft_resync_requested_ = true;
-                    discontinuity_pending_ = true;
-                    queue_overload_started_us_ = 0;
-                    queue_hard_wait_started_us_ = 0;
-                    if (has_latest_codec_config_) {
-                        queue_.push_back(latest_codec_config_);
-                    }
-                    queue_.push_back(access_unit);
-                    deferred_log =
-                        L"\u89e3\u7801\u961f\u5217: \u6301\u7eed\u79ef\u538b\u65f6\u76f4\u63a5\u6536\u5230\u65b0\u5173\u952e\u5e27\uff0c\u5df2\u4ece\u6700\u65b0\u753b\u9762\u7ee7\u7eed\u89e3\u7801\u3002";
-                } else if (!smooth_mode) {
-                    const bool kept_latest_span =
-                        KeepLatestDecodableQueueSpan(&queue_, latest_codec_config_, has_latest_codec_config_);
-                    const size_t trimmed_depth = queue_.size();
-
-                    if (kept_latest_span && trimmed_depth <= hard_wait_threshold) {
-                        soft_resync_requested_ = true;
-                        discontinuity_pending_ = true;
-                        pending_keyframe_resync_ = false;
-                        proactive_keyframe_requested_ = false;
-                        waiting_for_keyframe_ = false;
-                        queue_overload_started_us_ = 0;
-                        queue_hard_wait_started_us_ = 0;
-
-                        std::wostringstream stream;
-                        stream << L"\u89e3\u7801\u961f\u5217: \u4f4e\u5ef6\u8fdf\u6a21\u5f0f\u68c0\u6d4b\u5230\u6301\u7eed "
-                               << overload_duration_ms
-                               << L" ms \u79ef\u538b\uff0c\u5df2\u53ea\u4fdd\u7559\u6700\u65b0\u53ef\u89e3\u7801 span\uff0c\u4f46\u4e0d\u518d\u76f4\u63a5\u6e05\u7a7a\u4e2d\u95f4\u753b\u9762\u3002";
-                        deferred_log = stream.str();
-                    } else if (!pending_keyframe_resync_) {
-                        pending_keyframe_resync_ = true;
-                        if (!proactive_keyframe_requested_) {
-                            proactive_keyframe_requested_ = true;
-                            should_request_keyframe = true;
-                        }
-
-                        std::wostringstream stream;
-                        stream << L"\u89e3\u7801\u961f\u5217: \u4f4e\u5ef6\u8fdf\u6a21\u5f0f\u68c0\u6d4b\u5230\u6301\u7eed "
-                               << overload_duration_ms
-                               << L" ms \u79ef\u538b\uff0c\u5df2\u7ee7\u7eed\u6d88\u5316\u5f53\u524d\u961f\u5217\u5e76\u8bf7\u6c42\u8865\u6551\u5173\u952e\u5e27\uff0c\u6682\u4e0d\u4e22\u6389\u4e2d\u95f4\u753b\u9762\u3002";
-                        deferred_log = stream.str();
-                    } else if (hard_wait_sustained) {
-                        const int64_t hard_wait_duration_ms =
-                            queue_hard_wait_started_us_ != 0 ? (now_us - queue_hard_wait_started_us_) / 1000 : 0;
-                        queue_.clear();
-                        soft_resync_requested_ = true;
-                        discontinuity_pending_ = true;
-                        waiting_for_keyframe_ = true;
-                        pending_keyframe_resync_ = false;
-                        proactive_keyframe_requested_ = true;
-                        should_request_keyframe = true;
-                        queue_overload_started_us_ = 0;
-                        queue_hard_wait_started_us_ = 0;
-
-                        std::wostringstream stream;
-                        stream << L"\u89e3\u7801\u961f\u5217: \u79ef\u538b\u5df2\u8fde\u7eed "
-                               << hard_wait_duration_ms
-                               << L" ms \u4ecd\u65e0\u6cd5\u56de\u843d\uff0c\u624d\u88ab\u8feb\u6e05\u7406\u65e7\u5e27\u5e76\u7b49\u5f85\u65b0\u5173\u952e\u5e27\u3002";
-                        deferred_log = stream.str();
-                    }
-                } else if (!pending_keyframe_resync_) {
-                    pending_keyframe_resync_ = true;
-                    if (!proactive_keyframe_requested_) {
-                        proactive_keyframe_requested_ = true;
-                        should_request_keyframe = true;
-                    }
-                    deferred_log =
-                        L"\u89e3\u7801\u961f\u5217: \u68c0\u6d4b\u5230\u6301\u7eed\u79ef\u538b\uff0c\u5df2\u7ee7\u7eed\u6d88\u5316\u961f\u5217\u5e76\u8bf7\u6c42\u65b0\u5173\u952e\u5e27\u3002";
-                } else if (hard_wait_sustained) {
-                    queue_.clear();
-                    soft_resync_requested_ = true;
-                    discontinuity_pending_ = true;
-                    waiting_for_keyframe_ = true;
-                    pending_keyframe_resync_ = false;
-                    proactive_keyframe_requested_ = true;
-                    should_request_keyframe = true;
-                    queue_overload_started_us_ = 0;
-                    queue_hard_wait_started_us_ = 0;
-                    deferred_log =
-                        L"\u89e3\u7801\u961f\u5217: \u6301\u7eed\u79ef\u538b\u8d85\u8fc7\u5bbd\u9650\u65f6\u95f4\uff0c\u5df2\u6e05\u7406\u65e7\u5e27\u5e76\u7b49\u5f85\u65b0\u5173\u952e\u5e27\u91cd\u540c\u6b65\u3002";
-                }
-            }
-        }
-    }
-
-    if (!deferred_log.empty()) {
-        log_fn_(deferred_log);
-    }
-    if (should_request_keyframe && request_keyframe_fn_) {
-        request_keyframe_fn_();
-    }
-    cv_.notify_all();
-}
-
 void VideoDecoder::ThreadMain() {
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     SetCurrentThreadPriorityBestEffort(THREAD_PRIORITY_HIGHEST);
 
-    DecoderContext context;
+    DecoderRuntime runtime;
 
     while (true) {
         AccessUnit access_unit;
+        AccessUnit latest_codec_config_snapshot;
         bool has_item = false;
+        bool has_latest_codec_config_snapshot = false;
         bool should_exit = false;
         bool profile_dirty = false;
-        bool soft_resync = false;
-        bool mark_discontinuity = false;
-        protocol::StreamProfile profile;
+        bool prefer_bgra_output = false;
+        protocol::StreamProfile profile{};
 
         {
             std::unique_lock<std::mutex> lock(mutex_);
             cv_.wait(lock, [this] {
-                return !running_ || profile_dirty_ || soft_resync_requested_ || !queue_.empty();
+                return !running_ || profile_dirty_ || !queue_.empty();
             });
 
             should_exit = !running_;
@@ -1177,104 +1071,137 @@ void VideoDecoder::ThreadMain() {
                 profile = pending_profile_;
                 profile_dirty_ = false;
                 profile_dirty = true;
-            } else if (soft_resync_requested_) {
-                soft_resync_requested_ = false;
-                soft_resync = true;
             }
+            prefer_bgra_output = prefer_bgra_output_;
 
             if (!queue_.empty()) {
                 access_unit = std::move(queue_.front());
                 queue_.pop_front();
                 has_item = true;
-                mark_discontinuity = discontinuity_pending_;
+                if (has_latest_codec_config_) {
+                    latest_codec_config_snapshot = latest_codec_config_;
+                    has_latest_codec_config_snapshot = true;
+                }
             }
         }
 
         if (profile_dirty) {
-            ConfigureDecoderBackend(profile, d3d_device_, &context, log_fn_, frame_fn_);
+            if (!OpenDecoderRuntime(&runtime, profile, log_fn_)) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                waiting_for_keyframe_ = true;
+            }
         }
-        if (soft_resync) {
-            SoftResyncDecoder(&context, d3d_device_, log_fn_, frame_fn_);
-        }
+
         if (should_exit) {
             break;
         }
-        if (!has_item || context.backend == DecoderBackend::kNone) {
+        if (!has_item || runtime.codec_context == nullptr) {
             continue;
         }
 
-        if (context.backend == DecoderBackend::kNvidiaCuvid) {
-            const bool submitted =
-                context.nvidia_cuvid_decoder != nullptr &&
-                context.nvidia_cuvid_decoder->SubmitAccessUnit(access_unit, mark_discontinuity);
-            if (submitted) {
-                if (mark_discontinuity) {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    discontinuity_pending_ = false;
-                }
-            } else if (log_fn_) {
-                log_fn_(L"视频解码: NVIDIA CUVID 提交访问单元失败，当前帧已丢弃。");
+        if (IsCodecConfigAccessUnit(access_unit)) {
+            if (!SubmitEncodedChunk(&runtime, access_unit, prefer_bgra_output, frame_fn_, log_fn_)) {
+                ResetCodecAndParserState(&runtime, log_fn_);
             }
             continue;
         }
 
-        ComPtr<IMFMediaBuffer> buffer;
-        ComPtr<IMFSample> sample;
-        const DWORD length = static_cast<DWORD>(access_unit.bytes.size());
-        if (FAILED(MFCreateMemoryBuffer(length, &buffer)) ||
-            FAILED(MFCreateSample(&sample))) {
-            continue;
-        }
+        if (access_unit.discontinuity) {
+            ResetCodecAndParserState(&runtime, log_fn_);
 
-        uint8_t* destination = nullptr;
-        DWORD max_length = 0;
-        if (FAILED(buffer->Lock(&destination, &max_length, nullptr))) {
-            continue;
-        }
-        memcpy(destination, access_unit.bytes.data(), access_unit.bytes.size());
-        buffer->Unlock();
-        buffer->SetCurrentLength(length);
-        sample->AddBuffer(buffer.Get());
-        sample->SetSampleTime(static_cast<LONGLONG>(access_unit.pts_us) * 10);
-        if (context.active_profile.fps > 0) {
-            sample->SetSampleDuration(10'000'000LL / static_cast<LONGLONG>(context.active_profile.fps));
-        }
-        if ((access_unit.flags & protocol::kFlagKeyframe) != 0) {
-            sample->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
-        }
-        if (mark_discontinuity) {
-            sample->SetUINT32(MFSampleExtension_Discontinuity, TRUE);
-        }
+            const bool current_is_keyframe = IsKeyframeAccessUnit(access_unit);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                queue_.clear();
+                waiting_for_keyframe_ = !current_is_keyframe;
+                proactive_keyframe_requested_ = !current_is_keyframe;
+                queue_warning_active_ = false;
+            }
 
-        bool submitted = false;
-        for (int attempt = 0; attempt < 4; ++attempt) {
-            const HRESULT input_hr = context.transform->ProcessInput(0, sample.Get(), 0);
-            if (input_hr == MF_E_NOTACCEPTING) {
-                if (attempt == 0) {
-                    log_fn_(L"视频解码: 解码器暂时不接收新输入，正在优先排空输出队列。");
+            if (log_fn_ != nullptr) {
+                log_fn_(
+                    current_is_keyframe
+                        ? L"\u89c6\u9891\u89e3\u7801: \u68c0\u6d4b\u5230\u4e2d\u9014\u65ad\u5e27\uff0c\u5df2\u5148\u5237\u65b0\u89e3\u7801\u5668\u72b6\u6001\u540e\u76f4\u63a5\u63a5\u5165\u5f53\u524d\u5173\u952e\u5e27\u3002"
+                        : L"\u89c6\u9891\u89e3\u7801: \u68c0\u6d4b\u5230\u4e2d\u9014\u65ad\u5e27\uff0c\u5df2\u6e05\u7a7a\u65e7\u89e3\u7801\u72b6\u6001\u5e76\u7b49\u5f85\u65b0\u5173\u952e\u5e27\u3002");
+            }
+
+            if (!current_is_keyframe) {
+                if (request_keyframe_fn_ != nullptr) {
+                    request_keyframe_fn_();
                 }
-                DrainOutput(&context, d3d_device_, log_fn_, frame_fn_);
                 continue;
             }
-            if (FAILED(input_hr)) {
-                log_fn_(L"视频解码: ProcessInput 失败，错误码 " + HrToString(input_hr));
-                break;
-            }
 
-            submitted = true;
-            if (mark_discontinuity) {
-                std::lock_guard<std::mutex> lock(mutex_);
-                discontinuity_pending_ = false;
+            if (has_latest_codec_config_snapshot && !latest_codec_config_snapshot.bytes.empty()) {
+                if (!SubmitEncodedChunk(
+                        &runtime,
+                        latest_codec_config_snapshot,
+                        prefer_bgra_output,
+                        frame_fn_,
+                        log_fn_)) {
+                    if (log_fn_ != nullptr) {
+                        log_fn_(L"\u89c6\u9891\u89e3\u7801: \u65ad\u5e27\u540e\u91cd\u63d0\u4ea4 codec config \u5931\u8d25\u3002");
+                    }
+                }
             }
-            DrainOutput(&context, d3d_device_, log_fn_, frame_fn_);
-            break;
         }
 
-        if (!submitted) {
-            log_fn_(L"视频解码: 当前访问单元提交失败，已丢弃以保持低延迟。");
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (waiting_for_keyframe_ && !IsKeyframeAccessUnit(access_unit)) {
+                continue;
+            }
+            if (IsKeyframeAccessUnit(access_unit)) {
+                waiting_for_keyframe_ = false;
+                proactive_keyframe_requested_ = false;
+            }
+        }
+
+        if (!runtime.dumped_first_startup_stream && IsKeyframeAccessUnit(access_unit)) {
+            std::vector<uint8_t> startup_stream;
+            if (has_latest_codec_config_snapshot && !latest_codec_config_snapshot.bytes.empty()) {
+                startup_stream.insert(
+                    startup_stream.end(),
+                    latest_codec_config_snapshot.bytes.begin(),
+                    latest_codec_config_snapshot.bytes.end());
+            }
+            startup_stream.insert(startup_stream.end(), access_unit.bytes.begin(), access_unit.bytes.end());
+            const std::wstring stream_path = BuildDebugOutputPath(L"receiver-debug-first-startup-stream.h264");
+            if (WriteBinaryFile(stream_path, startup_stream.data(), startup_stream.size())) {
+                if (log_fn_ != nullptr) {
+                    log_fn_(L"\u89c6\u9891\u89e3\u7801: \u5df2\u5199\u51fa\u9996\u4e2a startup \u7801\u6d41\u8c03\u8bd5\u6587\u4ef6 -> " + stream_path);
+                }
+                runtime.dumped_first_startup_stream = true;
+            } else if (log_fn_ != nullptr) {
+                log_fn_(L"\u89c6\u9891\u89e3\u7801: \u5199\u51fa startup \u7801\u6d41\u8c03\u8bd5\u6587\u4ef6\u5931\u8d25\u3002");
+            }
+        }
+
+        if (!SubmitEncodedChunk(&runtime, access_unit, prefer_bgra_output, frame_fn_, log_fn_)) {
+            ResetCodecAndParserState(&runtime, log_fn_);
+
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                queue_.clear();
+                if (has_latest_codec_config_) {
+                    queue_.push_back(latest_codec_config_);
+                }
+                waiting_for_keyframe_ = true;
+                proactive_keyframe_requested_ = true;
+                queue_warning_active_ = false;
+            }
+
+            if (log_fn_ != nullptr) {
+                log_fn_(
+                    L"\u89c6\u9891\u89e3\u7801: \u5f53\u524d\u8bbf\u95ee\u5355\u5143\u89e3\u7801\u5931\u8d25\uff0c"
+                    L"\u5df2\u6e05\u7a7a\u65e7\u961f\u5217\u5e76\u7b49\u5f85\u65b0\u5173\u952e\u5e27\u3002");
+            }
+            if (request_keyframe_fn_ != nullptr) {
+                request_keyframe_fn_();
+            }
         }
     }
 
-    StopDecoderBackend(&context);
-    CoUninitialize();
+    CloseDecoderRuntime(&runtime);
+    runtime.api.Unload();
 }

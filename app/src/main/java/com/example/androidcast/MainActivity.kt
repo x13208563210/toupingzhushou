@@ -1,10 +1,12 @@
 package com.example.androidcast
 
+import android.Manifest
 import android.app.Activity
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import android.view.MotionEvent
@@ -23,6 +25,7 @@ import com.example.androidcast.projection.ProjectionForegroundService
 import com.example.androidcast.projection.ProjectionStatusBridge
 import com.example.androidcast.settings.SenderStreamSettings
 import com.example.androidcast.settings.StreamSettingsStore
+import androidx.appcompat.widget.SwitchCompat
 
 class MainActivity : AppCompatActivity() {
     companion object {
@@ -43,6 +46,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var resolutionInput: AutoCompleteTextView
     private lateinit var fpsInput: EditText
     private lateinit var bitrateInput: EditText
+    private lateinit var audioSwitch: SwitchCompat
     private lateinit var statusText: TextView
     private lateinit var versionText: TextView
     private lateinit var streamSettingsSummaryText: TextView
@@ -101,6 +105,15 @@ class MainActivity : AppCompatActivity() {
             updateStatus(ProjectionStatusBridge.starting())
         }
 
+    private val audioPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) {
+                launchProjectionPermissionRequest()
+            } else {
+                updateStatus(getString(R.string.status_audio_permission_denied))
+            }
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
@@ -113,6 +126,7 @@ class MainActivity : AppCompatActivity() {
         resolutionInput = findViewById(R.id.resolutionInput)
         fpsInput = findViewById(R.id.fpsInput)
         bitrateInput = findViewById(R.id.bitrateInput)
+        audioSwitch = findViewById(R.id.audioSwitch)
         statusText = findViewById(R.id.statusText)
         versionText = findViewById(R.id.versionText)
         streamSettingsSummaryText = findViewById(R.id.streamSettingsSummaryText)
@@ -141,8 +155,12 @@ class MainActivity : AppCompatActivity() {
                 updateStatus(ProjectionStatusBridge.invalidStreamSettings())
                 return@setOnClickListener
             }
-            updateStatus(ProjectionStatusBridge.requestingPermission())
-            projectionLauncher.launch(projectionManager.createScreenCaptureIntent())
+            if (audioSwitch.isChecked && !hasRecordAudioPermission()) {
+                updateStatus(getString(R.string.status_requesting_audio_permission))
+                audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                return@setOnClickListener
+            }
+            launchProjectionPermissionRequest()
         }
 
         findViewById<Button>(R.id.stopButton).setOnClickListener {
@@ -208,6 +226,7 @@ class MainActivity : AppCompatActivity() {
         resolutionInput.setText(selectedResolution.label, false)
         updateFrameRateDisplay()
         bitrateInput.setText(savedSettings.bitrateMbps.toString())
+        audioSwitch.isChecked = savedSettings.captureAudio
         updateStreamSettingsSummary()
 
         resolutionInput.setOnItemClickListener { _, _, position, _ ->
@@ -217,6 +236,9 @@ class MainActivity : AppCompatActivity() {
             updateStreamSettingsSummary()
         }
         bitrateInput.doAfterTextChanged {
+            updateStreamSettingsSummary()
+        }
+        audioSwitch.setOnCheckedChangeListener { _, _ ->
             updateStreamSettingsSummary()
         }
     }
@@ -254,7 +276,12 @@ class MainActivity : AppCompatActivity() {
 
         streamSettingsSummaryText.text =
             getString(R.string.stream_settings_summary_prefix) +
-                "${settings.width}x${settings.height} / ${formatFrameRateSummary()} / ${settings.bitrateMbps} Mbps"
+                "${settings.width}x${settings.height} / ${formatFrameRateSummary()} / ${settings.bitrateMbps} Mbps / " +
+                if (settings.captureAudio) {
+                    getString(R.string.audio_enabled_short)
+                } else {
+                    getString(R.string.audio_disabled_short)
+                }
     }
 
     private fun persistStreamSettingsFromUi(showError: Boolean): SenderStreamSettings? {
@@ -298,9 +325,18 @@ class MainActivity : AppCompatActivity() {
             fpsUpperBound = matchedProfile.fps,
             bitrateMbps = bitrateMbps,
             adaptiveFps = true,
+            captureAudio = audioSwitch.isChecked,
         )
     }
 
     private fun formatFrameRateSummary(): String =
         ADAPTIVE_FRAME_RATE_LABEL
+
+    private fun launchProjectionPermissionRequest() {
+        updateStatus(ProjectionStatusBridge.requestingPermission())
+        projectionLauncher.launch(projectionManager.createScreenCaptureIntent())
+    }
+
+    private fun hasRecordAudioPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
 }

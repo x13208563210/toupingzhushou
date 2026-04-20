@@ -64,6 +64,10 @@ ReassemblerStats FrameReassembler::GetStats() const {
     return stats;
 }
 
+void FrameReassembler::Reset() {
+    frames_.clear();
+}
+
 void FrameReassembler::DropOlderFrames(uint32_t latest_frame_id) {
     constexpr uint32_t kMaxFrameWindow = 32;
     for (auto it = frames_.begin(); it != frames_.end();) {

@@ -21,6 +21,10 @@ data class StreamProfile(
     val bitrate: Int,
     val videoPort: Int,
     val adaptiveFps: Boolean = false,
+    val audioEnabled: Boolean = false,
+    val audioPort: Int = 0,
+    val audioSampleRate: Int = 0,
+    val audioChannels: Int = 0,
 ) {
     val codecWireName: String
         get() = codec.wireName

@@ -135,6 +135,20 @@ int64_t SelectSmoothPacingIntervalUs(int64_t source_delta_us) {
     return 0;
 }
 
+int64_t SelectNominalPresentIntervalUs(int fps, bool adaptive_fps) {
+    if (fps <= 0) {
+        return 0;
+    }
+
+    // For the current 60fps-capped sender, a stable 60Hz display cadence
+    // looks noticeably less "jelly" than immediate uneven submits.
+    if (fps >= 55 || (adaptive_fps && fps >= 50)) {
+        return 1'000'000 / 60;
+    }
+
+    return 0;
+}
+
 const wchar_t* PresentationModeName(VideoRenderer::PresentationMode mode) {
     switch (mode) {
     case VideoRenderer::PresentationMode::kSmooth:
@@ -187,6 +201,46 @@ void VideoRenderer::SetLogFn(LogFn log_fn) {
 
 void VideoRenderer::SetPresentFn(PresentFn present_fn) {
     present_fn_ = std::move(present_fn);
+}
+
+void VideoRenderer::SetCaptureFn(CaptureFn capture_fn) {
+    capture_fn_ = std::move(capture_fn);
+}
+
+void VideoRenderer::SetNominalFrameRate(int fps, bool adaptive_fps) {
+    const int64_t interval_us = SelectNominalPresentIntervalUs(fps, adaptive_fps);
+    bool changed = false;
+
+    {
+        std::lock_guard<std::mutex> lock(render_mutex_);
+        if (nominal_present_interval_us_ == interval_us) {
+            return;
+        }
+
+        nominal_present_interval_us_ = interval_us;
+        if (interval_us <= 0) {
+            last_frame_arrival_deadline_ = std::chrono::steady_clock::time_point{};
+        }
+        smooth_pacing_deadline_initialized_ = false;
+        render_requested_ = render_thread_running_;
+        changed = true;
+    }
+
+    if (changed && log_fn_ != nullptr) {
+        if (interval_us > 0) {
+            std::wostringstream stream;
+            stream.setf(std::ios::fixed);
+            stream.precision(1);
+            stream << L"\u89c6\u9891\u6e32\u67d3: \u5df2\u542f\u7528 60Hz \u7a33\u5b9a\u663e\u793a\u8282\u594f\uff0c\u4f18\u5148\u51cf\u5c11\u6295\u5c4f\u679c\u51bb\u611f\u3002";
+            log_fn_(stream.str());
+        } else {
+            log_fn_(L"\u89c6\u9891\u6e32\u67d3: \u5df2\u5173\u95ed\u56fa\u5b9a\u663e\u793a\u8282\u594f\uff0c\u56de\u5230\u6309\u5e27\u76f4\u63a5\u63d0\u4ea4\u3002");
+        }
+    }
+
+    if (changed) {
+        render_cv_.notify_all();
+    }
 }
 
 void VideoRenderer::SetPresentationMode(PresentationMode mode) {
@@ -266,6 +320,7 @@ void VideoRenderer::Present(DecodedFrame frame) {
     }
     {
         std::lock_guard<std::mutex> lock(render_mutex_);
+        last_frame_arrival_deadline_ = std::chrono::steady_clock::now();
         UpdateSmoothPacingLocked(frame_pts_us);
     }
     RequestRender(false);
@@ -415,18 +470,27 @@ void VideoRenderer::RenderThreadMain() {
 
     while (true) {
         bool should_resize = false;
-        bool smooth_pacing = false;
-        int64_t smooth_interval_us = 0;
-        std::chrono::steady_clock::time_point smooth_deadline{};
+        bool cadence_pacing = false;
+        int64_t cadence_interval_us = 0;
+        std::chrono::steady_clock::time_point cadence_deadline{};
 
         {
             std::unique_lock<std::mutex> lock(render_mutex_);
             while (render_thread_running_) {
-                smooth_pacing =
+                const auto now = std::chrono::steady_clock::now();
+                const bool smooth_pacing =
                     presentation_mode_ == PresentationMode::kSmooth &&
                     smooth_pacing_enabled_ &&
                     smooth_pacing_interval_us_ > 0;
-                if (!smooth_pacing) {
+                const bool nominal_pacing =
+                    nominal_present_interval_us_ > 0 &&
+                    last_frame_arrival_deadline_ != std::chrono::steady_clock::time_point{} &&
+                    now - last_frame_arrival_deadline_ <= std::chrono::milliseconds(120);
+
+                cadence_pacing = smooth_pacing || nominal_pacing;
+                cadence_interval_us = smooth_pacing ? smooth_pacing_interval_us_ : nominal_present_interval_us_;
+
+                if (!cadence_pacing) {
                     smooth_pacing_deadline_initialized_ = false;
                     if (render_requested_ || resize_requested_) {
                         break;
@@ -436,20 +500,17 @@ void VideoRenderer::RenderThreadMain() {
                 }
 
                 if (!smooth_pacing_deadline_initialized_) {
-                    next_smooth_present_deadline_ = std::chrono::steady_clock::now();
+                    next_smooth_present_deadline_ = now;
                     smooth_pacing_deadline_initialized_ = true;
                 }
 
                 if (resize_requested_) {
-                    smooth_deadline = next_smooth_present_deadline_;
-                    smooth_interval_us = smooth_pacing_interval_us_;
+                    cadence_deadline = next_smooth_present_deadline_;
                     break;
                 }
 
-                const auto now = std::chrono::steady_clock::now();
                 if (now >= next_smooth_present_deadline_) {
-                    smooth_deadline = next_smooth_present_deadline_;
-                    smooth_interval_us = smooth_pacing_interval_us_;
+                    cadence_deadline = next_smooth_present_deadline_;
                     break;
                 }
 
@@ -465,8 +526,8 @@ void VideoRenderer::RenderThreadMain() {
             render_requested_ = false;
         }
 
-        if (smooth_pacing && smooth_interval_us > 0) {
-            WaitUntilSteadyDeadline(smooth_deadline);
+        if (cadence_pacing && cadence_interval_us > 0) {
+            WaitUntilSteadyDeadline(cadence_deadline);
         }
 
         if (should_resize) {
@@ -474,10 +535,21 @@ void VideoRenderer::RenderThreadMain() {
         }
         Render();
 
-        if (smooth_pacing && smooth_interval_us > 0) {
+        if (cadence_pacing && cadence_interval_us > 0) {
             std::lock_guard<std::mutex> lock(render_mutex_);
-            if (smooth_pacing_enabled_ && smooth_pacing_interval_us_ > 0) {
-                const auto interval = std::chrono::microseconds(smooth_pacing_interval_us_);
+            const auto now = std::chrono::steady_clock::now();
+            const bool smooth_pacing =
+                presentation_mode_ == PresentationMode::kSmooth &&
+                smooth_pacing_enabled_ &&
+                smooth_pacing_interval_us_ > 0;
+            const bool nominal_pacing =
+                nominal_present_interval_us_ > 0 &&
+                last_frame_arrival_deadline_ != std::chrono::steady_clock::time_point{} &&
+                now - last_frame_arrival_deadline_ <= std::chrono::milliseconds(120);
+            const int64_t active_interval_us =
+                smooth_pacing ? smooth_pacing_interval_us_ : (nominal_pacing ? nominal_present_interval_us_ : 0);
+            if (active_interval_us > 0) {
+                const auto interval = std::chrono::microseconds(active_interval_us);
                 const auto now = std::chrono::steady_clock::now();
                 do {
                     next_smooth_present_deadline_ += interval;
@@ -588,7 +660,10 @@ bool VideoRenderer::InitializeDeviceResources() {
         }
 
         if (SUCCEEDED(factory1->QueryInterface(IID_PPV_ARGS(&dxgi_factory5_)))) {
-            allow_tearing_ = CheckTearingSupport();
+            tearing_supported_ = CheckTearingSupport();
+            // Prefer stable scan-out over ultra-low-latency tearing; the user
+            // reported visible "jelly" artifacts after the 60fps clamp.
+            allow_tearing_ = false;
         }
     }
 
@@ -684,6 +759,9 @@ bool VideoRenderer::InitializeDeviceResources() {
                << L"，flip model=" << L"已启用"
                << L"，tearing=" << (allow_tearing_ ? L"已启用" : L"不可用");
         log_fn_(stream.str());
+        if (tearing_supported_ && !allow_tearing_) {
+            log_fn_(L"\u89c6\u9891\u6e32\u67d3: \u5f53\u524d\u7248\u672c\u5df2\u9ed8\u8ba4\u5173\u95ed tearing \u63d0\u4ea4\uff0c\u4f18\u5148\u907f\u514d\u679c\u51bb\u5c4f\u548c\u64d5\u88c2\u611f\u3002");
+        }
     }
 
     ID3DBlob* vertex_blob = nullptr;
@@ -1269,6 +1347,9 @@ void VideoRenderer::Render() {
     if (has_new_frame &&
         frame_to_upload.width > 0 &&
         frame_to_upload.height > 0) {
+        if (frame_to_upload.pts_us != 0) {
+            last_rendered_pts_us_ = frame_to_upload.pts_us;
+        }
         if (frame_to_upload.gpu_backed && frame_to_upload.d3d_texture != nullptr) {
             if (frame_to_upload.d3d_texture != nullptr) {
                 if (UseGpuCopiedTextureFrame(frame_to_upload)) {
@@ -1286,6 +1367,14 @@ void VideoRenderer::Render() {
             if (UseCpuUploadedTextureFrame(frame_to_upload)) {
                 if (!logged_cpu_upload_path_ && log_fn_ != nullptr) {
                     log_fn_(L"视频渲染: 已启用 CPU 上传纹理显示路径，用于承接 NVIDIA CUVID 输出的 NV12 帧。");
+                    const wchar_t* format_name =
+                        frame_to_upload.format == DecodedFrameFormat::kBgra ? L"BGRA" :
+                        (frame_to_upload.format == DecodedFrameFormat::kNv12 ? L"NV12" : L"UNKNOWN");
+                    std::wstring line =
+                        L"\u89c6\u9891\u6e32\u67d3: \u5b9e\u9645 CPU \u4e0a\u4f20\u7684\u5f53\u524d\u5e27\u683c\u5f0f=";
+                    line += format_name;
+                    line += L"\u3002";
+                    log_fn_(line);
                     logged_cpu_upload_path_ = true;
                 }
             } else if (log_fn_ != nullptr) {
@@ -1360,21 +1449,49 @@ void VideoRenderer::Render() {
         }
     }
 
-    bool smooth_pacing_active = false;
+    if (capture_fn_ != nullptr && (can_draw_bgra || can_draw_nv12)) {
+        ID3D11Resource* render_resource = nullptr;
+        render_target_view_->GetResource(&render_resource);
+        if (render_resource != nullptr) {
+            ID3D11Texture2D* render_texture = nullptr;
+            if (SUCCEEDED(render_resource->QueryInterface(IID_PPV_ARGS(&render_texture))) &&
+                render_texture != nullptr) {
+                D3D11_TEXTURE2D_DESC render_desc{};
+                render_texture->GetDesc(&render_desc);
+                capture_fn_(
+                    render_texture,
+                    static_cast<int>(render_desc.Width),
+                    static_cast<int>(render_desc.Height),
+                    last_rendered_pts_us_);
+                render_texture->Release();
+            }
+            render_resource->Release();
+        }
+    }
+
+    bool cadence_pacing_active = false;
     {
         std::lock_guard<std::mutex> lock(render_mutex_);
-        smooth_pacing_active =
+        const bool smooth_pacing_active =
             presentation_mode_ == PresentationMode::kSmooth &&
             smooth_pacing_enabled_ &&
             smooth_pacing_interval_us_ > 0;
+        const bool nominal_pacing_active =
+            nominal_present_interval_us_ > 0 &&
+            last_frame_arrival_deadline_ != std::chrono::steady_clock::time_point{} &&
+            std::chrono::steady_clock::now() - last_frame_arrival_deadline_ <= std::chrono::milliseconds(120);
+        cadence_pacing_active = smooth_pacing_active || nominal_pacing_active;
     }
 
+    const UINT sync_interval = cadence_pacing_active ? 1u : 0u;
+    const bool use_tearing_present = allow_tearing_ && sync_interval == 0;
+
     UINT present_flags = 0;
-    if (allow_tearing_ && !smooth_pacing_active) {
+    if (use_tearing_present) {
         present_flags |= DXGI_PRESENT_ALLOW_TEARING;
     }
 
-    HRESULT present_hr = swap_chain_->Present(0, present_flags);
+    HRESULT present_hr = swap_chain_->Present(sync_interval, present_flags);
     if (FAILED(present_hr) && present_flags != 0) {
         present_hr = swap_chain_->Present(0, 0);
     }
@@ -1425,5 +1542,6 @@ void VideoRenderer::CleanupDeviceResources() {
     context_ = nullptr;
     SafeRelease(device_);
     device_ = nullptr;
+    tearing_supported_ = false;
     allow_tearing_ = false;
 }

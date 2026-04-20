@@ -9,6 +9,7 @@
     <ScrollView
         android:layout_width="match_parent"
         android:layout_height="match_parent"
+        android:clipToPadding="false"
         android:fillViewport="true"
         android:fitsSystemWindows="true"
         android:overScrollMode="never">
@@ -18,87 +19,75 @@
             android:layout_height="wrap_content"
             android:orientation="vertical"
             android:paddingStart="20dp"
-            android:paddingTop="140dp"
+            android:paddingTop="24dp"
             android:paddingEnd="20dp"
-            android:paddingBottom="24dp">
+            android:paddingBottom="28dp">
 
-            <com.google.android.material.card.MaterialCardView
+            <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginBottom="16dp"
-                app:cardBackgroundColor="@color/glass_card_strong"
-                app:cardCornerRadius="30dp"
-                app:cardElevation="8dp"
-                app:strokeColor="@color/glass_stroke"
-                app:strokeWidth="1dp">
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingTop="8dp"
+                android:paddingBottom="16dp">
+
+                <FrameLayout
+                    android:layout_width="52dp"
+                    android:layout_height="52dp"
+                    android:background="@drawable/bg_brand_panel"
+                    android:padding="10dp">
+
+                    <ImageView
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent"
+                        android:contentDescription="@string/app_name"
+                        android:src="@drawable/ic_brand_mark" />
+                </FrameLayout>
 
                 <LinearLayout
-                    android:layout_width="match_parent"
+                    android:layout_width="0dp"
                     android:layout_height="wrap_content"
-                    android:orientation="horizontal"
-                    android:padding="20dp">
+                    android:layout_marginStart="14dp"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
 
-                    <FrameLayout
-                        android:layout_width="88dp"
-                        android:layout_height="88dp"
-                        android:background="@drawable/bg_brand_panel"
-                        android:elevation="4dp"
-                        android:padding="16dp">
-
-                        <ImageView
-                            android:layout_width="match_parent"
-                            android:layout_height="match_parent"
-                            android:contentDescription="@string/app_name"
-                            android:src="@drawable/ic_brand_mark" />
-                    </FrameLayout>
-
-                    <LinearLayout
-                        android:layout_width="0dp"
+                    <TextView
+                        android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:layout_marginStart="16dp"
-                        android:layout_weight="1"
-                        android:orientation="vertical">
+                        android:text="@string/title_mvp"
+                        android:textColor="@color/text_primary"
+                        android:textSize="20sp"
+                        android:textStyle="bold" />
 
-                        <TextView
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:text="@string/title_mvp"
-                            android:textColor="@color/text_primary"
-                            android:textSize="26sp"
-                            android:textStyle="bold" />
-
-                        <TextView
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:layout_marginTop="4dp"
-                            android:text="@string/title_sender"
-                            android:textColor="@color/text_secondary"
-                            android:textSize="14sp" />
-
-                        <TextView
-                            android:id="@+id/versionText"
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:layout_marginTop="10dp"
-                            android:background="@drawable/bg_badge_pill"
-                            android:paddingStart="12dp"
-                            android:paddingTop="6dp"
-                            android:paddingEnd="12dp"
-                            android:paddingBottom="6dp"
-                            android:textColor="@color/text_primary"
-                            android:textSize="12sp"
-                            android:textStyle="bold" />
-                    </LinearLayout>
+                    <TextView
+                        android:id="@+id/versionText"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:textColor="@color/text_muted"
+                        android:textSize="12sp" />
                 </LinearLayout>
-            </com.google.android.material.card.MaterialCardView>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:background="@drawable/bg_badge_pill"
+                    android:paddingStart="10dp"
+                    android:paddingTop="5dp"
+                    android:paddingEnd="10dp"
+                    android:paddingBottom="5dp"
+                    android:text="@string/hero_badge"
+                    android:textColor="@color/brand_blue"
+                    android:textSize="10sp" />
+            </LinearLayout>
 
             <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginBottom="16dp"
+                android:layout_marginBottom="14dp"
                 app:cardBackgroundColor="@color/glass_card"
-                app:cardCornerRadius="28dp"
-                app:cardElevation="6dp"
+                app:cardCornerRadius="26dp"
+                app:cardElevation="2dp"
                 app:strokeColor="@color/glass_stroke"
                 app:strokeWidth="1dp">
 
@@ -106,22 +95,22 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:orientation="vertical"
-                    android:padding="20dp">
+                    android:padding="22dp">
 
                     <TextView
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:text="@string/section_target_title"
                         android:textColor="@color/text_primary"
-                        android:textSize="18sp"
+                        android:textSize="20sp"
                         android:textStyle="bold" />
 
                     <TextView
-                        android:layout_width="wrap_content"
+                        android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="6dp"
                         android:text="@string/section_target_desc"
-                        android:textColor="@color/text_secondary"
+                        android:textColor="@color/text_muted"
                         android:textSize="13sp" />
 
                     <com.google.android.material.textfield.TextInputLayout
@@ -130,12 +119,14 @@
                         android:layout_marginTop="18dp"
                         app:boxBackgroundColor="@color/input_fill"
                         app:boxBackgroundMode="filled"
-                        app:boxCornerRadiusBottomEnd="24dp"
-                        app:boxCornerRadiusBottomStart="24dp"
-                        app:boxCornerRadiusTopEnd="24dp"
-                        app:boxCornerRadiusTopStart="24dp"
+                        app:boxCornerRadiusBottomEnd="18dp"
+                        app:boxCornerRadiusBottomStart="18dp"
+                        app:boxCornerRadiusTopEnd="18dp"
+                        app:boxCornerRadiusTopStart="18dp"
                         app:boxStrokeColor="@color/brand_blue"
-                        app:hintTextColor="@color/text_secondary">
+                        app:boxStrokeWidth="1dp"
+                        app:boxStrokeWidthFocused="2dp"
+                        app:hintTextColor="@color/text_muted">
 
                         <com.google.android.material.textfield.TextInputEditText
                             android:id="@+id/receiverIpInput"
@@ -154,12 +145,14 @@
                         android:layout_marginTop="12dp"
                         app:boxBackgroundColor="@color/input_fill"
                         app:boxBackgroundMode="filled"
-                        app:boxCornerRadiusBottomEnd="24dp"
-                        app:boxCornerRadiusBottomStart="24dp"
-                        app:boxCornerRadiusTopEnd="24dp"
-                        app:boxCornerRadiusTopStart="24dp"
+                        app:boxCornerRadiusBottomEnd="18dp"
+                        app:boxCornerRadiusBottomStart="18dp"
+                        app:boxCornerRadiusTopEnd="18dp"
+                        app:boxCornerRadiusTopStart="18dp"
                         app:boxStrokeColor="@color/brand_blue"
-                        app:hintTextColor="@color/text_secondary">
+                        app:boxStrokeWidth="1dp"
+                        app:boxStrokeWidthFocused="2dp"
+                        app:hintTextColor="@color/text_muted">
 
                         <com.google.android.material.textfield.TextInputEditText
                             android:id="@+id/controlPortInput"
@@ -177,7 +170,7 @@
                         android:layout_height="wrap_content"
                         android:layout_marginTop="12dp"
                         android:text="@string/target_tip"
-                        android:textColor="@color/text_secondary"
+                        android:textColor="@color/text_muted"
                         android:textSize="12sp" />
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
@@ -185,10 +178,10 @@
             <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginBottom="16dp"
+                android:layout_marginBottom="14dp"
                 app:cardBackgroundColor="@color/glass_card"
-                app:cardCornerRadius="28dp"
-                app:cardElevation="6dp"
+                app:cardCornerRadius="26dp"
+                app:cardElevation="2dp"
                 app:strokeColor="@color/glass_stroke"
                 app:strokeWidth="1dp">
 
@@ -196,22 +189,22 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:orientation="vertical"
-                    android:padding="20dp">
+                    android:padding="22dp">
 
                     <TextView
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:text="@string/section_stream_title"
                         android:textColor="@color/text_primary"
-                        android:textSize="18sp"
+                        android:textSize="20sp"
                         android:textStyle="bold" />
 
                     <TextView
-                        android:layout_width="wrap_content"
+                        android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="6dp"
                         android:text="@string/section_stream_desc"
-                        android:textColor="@color/text_secondary"
+                        android:textColor="@color/text_muted"
                         android:textSize="13sp" />
 
                     <com.google.android.material.textfield.TextInputLayout
@@ -221,13 +214,15 @@
                         android:layout_marginTop="18dp"
                         app:boxBackgroundColor="@color/input_fill"
                         app:boxBackgroundMode="filled"
-                        app:boxCornerRadiusBottomEnd="24dp"
-                        app:boxCornerRadiusBottomStart="24dp"
-                        app:boxCornerRadiusTopEnd="24dp"
-                        app:boxCornerRadiusTopStart="24dp"
+                        app:boxCornerRadiusBottomEnd="18dp"
+                        app:boxCornerRadiusBottomStart="18dp"
+                        app:boxCornerRadiusTopEnd="18dp"
+                        app:boxCornerRadiusTopStart="18dp"
                         app:boxStrokeColor="@color/brand_blue"
+                        app:boxStrokeWidth="1dp"
+                        app:boxStrokeWidthFocused="2dp"
                         app:endIconMode="dropdown_menu"
-                        app:hintTextColor="@color/text_secondary">
+                        app:hintTextColor="@color/text_muted">
 
                         <com.google.android.material.textfield.MaterialAutoCompleteTextView
                             android:id="@+id/resolutionInput"
@@ -240,9 +235,9 @@
                             android:hint="@string/hint_stream_resolution"
                             android:inputType="none"
                             android:longClickable="false"
-                            android:textIsSelectable="false"
                             android:textColor="@color/text_primary"
-                            android:textColorHint="@color/text_muted" />
+                            android:textColorHint="@color/text_muted"
+                            android:textIsSelectable="false" />
                     </com.google.android.material.textfield.TextInputLayout>
 
                     <com.google.android.material.textfield.TextInputLayout
@@ -251,12 +246,14 @@
                         android:layout_marginTop="12dp"
                         app:boxBackgroundColor="@color/input_fill"
                         app:boxBackgroundMode="filled"
-                        app:boxCornerRadiusBottomEnd="24dp"
-                        app:boxCornerRadiusBottomStart="24dp"
-                        app:boxCornerRadiusTopEnd="24dp"
-                        app:boxCornerRadiusTopStart="24dp"
+                        app:boxCornerRadiusBottomEnd="18dp"
+                        app:boxCornerRadiusBottomStart="18dp"
+                        app:boxCornerRadiusTopEnd="18dp"
+                        app:boxCornerRadiusTopStart="18dp"
                         app:boxStrokeColor="@color/brand_blue"
-                        app:hintTextColor="@color/text_secondary">
+                        app:boxStrokeWidth="1dp"
+                        app:boxStrokeWidthFocused="2dp"
+                        app:hintTextColor="@color/text_muted">
 
                         <com.google.android.material.textfield.TextInputEditText
                             android:id="@+id/fpsInput"
@@ -280,12 +277,14 @@
                         android:layout_marginTop="12dp"
                         app:boxBackgroundColor="@color/input_fill"
                         app:boxBackgroundMode="filled"
-                        app:boxCornerRadiusBottomEnd="24dp"
-                        app:boxCornerRadiusBottomStart="24dp"
-                        app:boxCornerRadiusTopEnd="24dp"
-                        app:boxCornerRadiusTopStart="24dp"
+                        app:boxCornerRadiusBottomEnd="18dp"
+                        app:boxCornerRadiusBottomStart="18dp"
+                        app:boxCornerRadiusTopEnd="18dp"
+                        app:boxCornerRadiusTopStart="18dp"
                         app:boxStrokeColor="@color/brand_blue"
-                        app:hintTextColor="@color/text_secondary">
+                        app:boxStrokeWidth="1dp"
+                        app:boxStrokeWidthFocused="2dp"
+                        app:hintTextColor="@color/text_muted">
 
                         <com.google.android.material.textfield.TextInputEditText
                             android:id="@+id/bitrateInput"
@@ -302,8 +301,8 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="14dp"
-                        android:background="@drawable/bg_badge_pill"
-                        android:padding="14dp"
+                        android:background="@drawable/bg_status_surface"
+                        android:padding="16dp"
                         android:textColor="@color/text_primary"
                         android:textSize="14sp"
                         android:textStyle="bold" />
@@ -313,8 +312,47 @@
                         android:layout_height="wrap_content"
                         android:layout_marginTop="12dp"
                         android:text="@string/stream_bitrate_tip"
-                        android:textColor="@color/text_secondary"
+                        android:textColor="@color/text_muted"
                         android:textSize="12sp" />
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="14dp"
+                        android:background="@drawable/bg_status_surface"
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal"
+                        android:padding="16dp">
+
+                        <LinearLayout
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:orientation="vertical">
+
+                            <TextView
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:text="@string/audio_toggle_title"
+                                android:textColor="@color/text_primary"
+                                android:textSize="15sp"
+                                android:textStyle="bold" />
+
+                            <TextView
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:layout_marginTop="4dp"
+                                android:text="@string/audio_toggle_desc"
+                                android:textColor="@color/text_muted"
+                                android:textSize="12sp" />
+                        </LinearLayout>
+
+                        <androidx.appcompat.widget.SwitchCompat
+                            android:id="@+id/audioSwitch"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginStart="12dp" />
+                    </LinearLayout>
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 
@@ -322,41 +360,38 @@
                 android:id="@+id/startButton"
                 style="@style/Widget.MaterialComponents.Button"
                 android:layout_width="match_parent"
-                android:layout_height="56dp"
-                android:layout_marginBottom="12dp"
+                android:layout_height="52dp"
+                android:layout_marginBottom="10dp"
                 android:text="@string/action_start"
                 android:textAllCaps="false"
                 android:textSize="16sp"
-                android:textStyle="bold"
                 app:backgroundTint="@color/brand_blue"
-                app:cornerRadius="28dp"
-                app:elevation="6dp"
+                app:cornerRadius="26dp"
+                app:elevation="0dp"
                 app:rippleColor="@color/page_accent" />
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/stopButton"
                 style="@style/Widget.MaterialComponents.Button"
                 android:layout_width="match_parent"
-                android:layout_height="56dp"
+                android:layout_height="52dp"
                 android:layout_marginBottom="16dp"
                 android:text="@string/action_stop"
                 android:textAllCaps="false"
-                android:textColor="@color/text_primary"
+                android:textColor="@android:color/white"
                 android:textSize="16sp"
-                android:textStyle="bold"
-                app:backgroundTint="@color/glass_card_strong"
-                app:cornerRadius="28dp"
-                app:elevation="2dp"
-                app:rippleColor="@color/page_accent"
-                app:strokeColor="@color/glass_stroke"
-                app:strokeWidth="1dp" />
+                app:backgroundTint="@color/button_dark_fill"
+                app:cornerRadius="26dp"
+                app:elevation="0dp"
+                app:rippleColor="@color/page_accent" />
 
             <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
+                android:layout_marginBottom="16dp"
                 app:cardBackgroundColor="@color/glass_card"
-                app:cardCornerRadius="28dp"
-                app:cardElevation="6dp"
+                app:cardCornerRadius="26dp"
+                app:cardElevation="2dp"
                 app:strokeColor="@color/glass_stroke"
                 app:strokeWidth="1dp">
 
@@ -364,14 +399,14 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:orientation="vertical"
-                    android:padding="20dp">
+                    android:padding="22dp">
 
                     <TextView
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:text="@string/status_card_title"
                         android:textColor="@color/text_primary"
-                        android:textSize="18sp"
+                        android:textSize="20sp"
                         android:textStyle="bold" />
 
                     <TextView
@@ -379,7 +414,7 @@
                         android:layout_height="wrap_content"
                         android:layout_marginTop="6dp"
                         android:text="@string/status_card_desc"
-                        android:textColor="@color/text_secondary"
+                        android:textColor="@color/text_muted"
                         android:textSize="13sp" />
 
                     <TextView
@@ -387,7 +422,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="16dp"
-                        android:background="@drawable/bg_badge_pill"
+                        android:background="@drawable/bg_status_surface"
                         android:padding="16dp"
                         android:text="@string/status_idle"
                         android:textColor="@color/text_primary"
@@ -399,11 +434,63 @@
                         android:layout_height="wrap_content"
                         android:layout_marginTop="12dp"
                         android:text="@string/status_extra_hint"
-                        android:textColor="@color/text_secondary"
+                        android:textColor="@color/text_muted"
                         android:textSize="12sp" />
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 
+            <com.google.android.material.card.MaterialCardView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                app:cardBackgroundColor="@color/glass_card"
+                app:cardCornerRadius="26dp"
+                app:cardElevation="2dp"
+                app:strokeColor="@color/glass_stroke"
+                app:strokeWidth="1dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:padding="22dp">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="@string/section_intro_title"
+                        android:textColor="@color/text_primary"
+                        android:textSize="20sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="6dp"
+                        android:text="@string/section_intro_desc"
+                        android:textColor="@color/text_muted"
+                        android:textSize="13sp" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="14dp"
+                        android:background="@drawable/bg_status_surface"
+                        android:padding="16dp"
+                        android:text="@string/section_intro_groups"
+                        android:textColor="@color/text_primary"
+                        android:textSize="14sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="12dp"
+                        android:text="@string/label_author"
+                        android:textColor="@color/text_muted"
+                        android:textSize="13sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
         </LinearLayout>
     </ScrollView>
 

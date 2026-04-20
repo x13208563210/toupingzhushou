@@ -13,6 +13,7 @@ struct AccessUnit {
     uint32_t frame_id = 0;
     uint64_t pts_us = 0;
     uint8_t flags = 0;
+    bool discontinuity = false;
 };
 
 struct ReassemblerStats {
@@ -28,6 +29,7 @@ public:
         size_t payload_size);
 
     ReassemblerStats GetStats() const;
+    void Reset();
 
 private:
     struct PartialFrame {

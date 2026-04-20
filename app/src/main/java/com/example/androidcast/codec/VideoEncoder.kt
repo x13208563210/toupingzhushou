@@ -20,6 +20,7 @@ class VideoEncoder(
     companion object {
         private const val DEFAULT_I_FRAME_INTERVAL_SECONDS = 1
         private const val LOW_LATENCY_I_FRAME_INTERVAL_SECONDS = 0.35f
+        private const val MAX_STREAM_FPS = 60
         private const val TAG = "VideoEncoder"
         private const val STATS_LOG_INTERVAL_FRAMES = 30L
     }
@@ -56,6 +57,7 @@ class VideoEncoder(
     private var repeatedCodecPtsCount = 0L
     private var repeatedSenderPtsCount = 0L
     private var firstFrameLogged = false
+    private val targetFps = profile.fps.coerceIn(1, MAX_STREAM_FPS)
 
     fun start() {
         val mediaCodec = MediaCodec.createEncoderByType(profile.codec.mimeType)
@@ -63,8 +65,8 @@ class VideoEncoder(
         val format = MediaFormat.createVideoFormat(profile.codec.mimeType, profile.width, profile.height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, profile.bitrate)
-            setInteger(MediaFormat.KEY_FRAME_RATE, profile.fps)
-            runCatching { setFloat(MediaFormat.KEY_CAPTURE_RATE, profile.fps.toFloat()) }
+            setInteger(MediaFormat.KEY_FRAME_RATE, targetFps)
+            runCatching { setFloat(MediaFormat.KEY_CAPTURE_RATE, targetFps.toFloat()) }
             val preciseIFrameApplied =
                 runCatching {
                     setFloat(MediaFormat.KEY_I_FRAME_INTERVAL, LOW_LATENCY_I_FRAME_INTERVAL_SECONDS)
@@ -403,12 +405,7 @@ class VideoEncoder(
 
     private fun applyLowLatencyHints(format: MediaFormat) {
         runCatching { format.setInteger(MediaFormat.KEY_PRIORITY, 0) }
-        val operatingRate =
-            when {
-                profile.fps >= 120 -> 240f
-                profile.fps >= 90 -> 180f
-                else -> profile.fps.toFloat()
-            }
+        val operatingRate = targetFps.toFloat()
         runCatching { format.setFloat(MediaFormat.KEY_OPERATING_RATE, operatingRate) }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             runCatching { format.setInteger("vendor.qti-ext-enc-low-latency.enable", 1) }

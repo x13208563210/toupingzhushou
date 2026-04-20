@@ -17,6 +17,9 @@ class ControlClient(
     private val controlPort: Int,
     private val deviceName: String,
     private val supportedProfiles: List<StreamProfile>,
+    private val audioEnabled: Boolean,
+    private val audioSampleRate: Int,
+    private val audioChannels: Int,
 ) {
     private var socket: Socket? = null
     private var reader: BufferedReader? = null
@@ -29,30 +32,48 @@ class ControlClient(
     ): StreamProfile {
         require(supportedProfiles.isNotEmpty()) { "At least one stream profile is required." }
 
-        val currentSocket = Socket(receiverHost, controlPort).apply {
-            tcpNoDelay = true
-            keepAlive = true
-        }
+        val currentSocket =
+            Socket(receiverHost, controlPort).apply {
+                tcpNoDelay = true
+                keepAlive = true
+            }
         val currentReader = BufferedReader(InputStreamReader(currentSocket.getInputStream()))
         val currentWriter = BufferedWriter(OutputStreamWriter(currentSocket.getOutputStream()))
         socket = currentSocket
         reader = currentReader
         writer = currentWriter
 
-        writeJson(ControlMessage.buildHello(deviceName, supportedProfiles))
+        writeJson(
+            ControlMessage.buildHello(
+                deviceName = deviceName,
+                profiles = supportedProfiles,
+                audioEnabled = audioEnabled,
+                audioSampleRate = audioSampleRate,
+                audioChannels = audioChannels,
+            ),
+        )
         val response = currentReader.readLine() ?: error("Receiver closed control channel during setup.")
-        val selected = ControlMessage.parseSelectedProfile(JSONObject(response))
-            ?: error("Receiver did not send SELECT_PROFILE.")
+        val selected =
+            ControlMessage.parseSelectedProfile(JSONObject(response))
+                ?: error("Receiver did not send SELECT_PROFILE.")
 
-        val matched = supportedProfiles.firstOrNull { it.isSameCoreFormat(selected) }
-            ?: error("Receiver selected an unsupported stream profile: $selected")
+        val matched =
+            supportedProfiles.firstOrNull { it.isSameCoreFormat(selected) }
+                ?: error("Receiver selected an unsupported stream profile: $selected")
 
         SenderDiagnostics.i(
             TAG,
-            "控制通道已连接: host=$receiverHost:$controlPort, selected=${matched.width}x${matched.height}@${matched.fps}, bitrate=${selected.bitrate}, videoPort=${selected.videoPort}",
+            "控制通道已连接: host=$receiverHost:$controlPort, selected=${matched.width}x${matched.height}@${matched.fps}, bitrate=${selected.bitrate}, videoPort=${selected.videoPort}, audioEnabled=${selected.audioEnabled}, audioPort=${selected.audioPort}",
         )
         startListener(onRequestIdr)
-        return matched.copy(videoPort = selected.videoPort, bitrate = selected.bitrate)
+        return matched.copy(
+            videoPort = selected.videoPort,
+            bitrate = selected.bitrate,
+            audioEnabled = selected.audioEnabled,
+            audioPort = selected.audioPort,
+            audioSampleRate = selected.audioSampleRate,
+            audioChannels = selected.audioChannels,
+        )
     }
 
     fun sendStop(reason: String) {
@@ -79,23 +100,25 @@ class ControlClient(
 
     private fun startListener(onRequestIdr: () -> Unit) {
         running.set(true)
-        listenerThread = Thread {
-            while (running.get()) {
-                val line = runCatching { reader?.readLine() }.getOrNull() ?: break
-                val json = runCatching { JSONObject(line) }.getOrNull() ?: continue
-                when (json.optString("type")) {
-                    ControlMessage.TYPE_REQUEST_IDR -> {
-                        SenderDiagnostics.d(TAG, "收到关键帧请求")
-                        onRequestIdr()
+        listenerThread =
+            Thread {
+                while (running.get()) {
+                    val line = runCatching { reader?.readLine() }.getOrNull() ?: break
+                    val json = runCatching { JSONObject(line) }.getOrNull() ?: continue
+                    when (json.optString("type")) {
+                        ControlMessage.TYPE_REQUEST_IDR -> {
+                            SenderDiagnostics.d(TAG, "收到关键帧请求")
+                            onRequestIdr()
+                        }
+
+                        ControlMessage.TYPE_TIME_SYNC_REQUEST -> handleTimeSyncRequest(json)
                     }
-                    ControlMessage.TYPE_TIME_SYNC_REQUEST -> handleTimeSyncRequest(json)
                 }
+                running.set(false)
+            }.apply {
+                name = "control-listener"
+                start()
             }
-            running.set(false)
-        }.apply {
-            name = "control-listener"
-            start()
-        }
     }
 
     @Synchronized
@@ -115,12 +138,13 @@ class ControlClient(
         }
 
         val senderReceiveUs = SystemClock.elapsedRealtimeNanos() / 1_000L
-        val response = ControlMessage.buildTimeSyncResponse(
-            syncId = syncId,
-            receiverSendUs = receiverSendUs,
-            senderReceiveUs = senderReceiveUs,
-            senderSendUs = SystemClock.elapsedRealtimeNanos() / 1_000L,
-        )
+        val response =
+            ControlMessage.buildTimeSyncResponse(
+                syncId = syncId,
+                receiverSendUs = receiverSendUs,
+                senderReceiveUs = senderReceiveUs,
+                senderSendUs = SystemClock.elapsedRealtimeNanos() / 1_000L,
+            )
         runCatching { writeJson(response) }
     }
 

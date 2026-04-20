@@ -3,8 +3,8 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-val appVersionCode = 30
-val appVersionName = "0.3.16-end-to-end-recovery-2026-04-05"
+val appVersionCode = 59
+val appVersionName = "0.3.49-latency-queue-stabilize-2026-04-16"
 
 android {
     namespace = "com.example.androidcast"
@@ -55,7 +55,7 @@ dependencies {
 val copyVersionedDebugApk by tasks.registering(Copy::class) {
     from(layout.buildDirectory.file("outputs/apk/debug/app-debug.apk"))
     into(layout.buildDirectory.dir("outputs/versioned-apk/debug"))
-    rename { "z6y-live-cast-assistant-${appVersionName}-debug.apk" }
+    rename { "live-cast-assistant-${appVersionName}-debug.apk" }
     onlyIf { layout.buildDirectory.file("outputs/apk/debug/app-debug.apk").get().asFile.exists() }
 }
 

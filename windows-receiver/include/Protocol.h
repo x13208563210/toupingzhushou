@@ -20,11 +20,18 @@ struct StreamProfile {
     bool adaptive_fps = false;
     int bitrate = 0;
     int video_port = 0;
+    bool audio_enabled = false;
+    int audio_port = 0;
+    int audio_sample_rate = 0;
+    int audio_channels = 0;
 };
 
 struct HelloMessage {
     std::wstring device_name;
     std::vector<StreamProfile> profiles;
+    bool audio_enabled = false;
+    int audio_sample_rate = 0;
+    int audio_channels = 0;
 };
 
 struct PacketHeader {

@@ -7,7 +7,8 @@ import com.example.androidcast.model.StreamProfile
 
 class CapabilityProbe {
     companion object {
-        const val BUILD_LABEL = "0.3.16-end-to-end-recovery-2026-04-05"
+        const val BUILD_LABEL = "0.3.49-latency-queue-stabilize-2026-04-16"
+        const val MAX_STREAM_FPS = 60
         private const val FORCE_2K_TEST_MODE = true
     }
 
@@ -24,13 +25,8 @@ class CapabilityProbe {
 
     private fun candidateProfiles(): List<StreamProfile> =
         listOf(
-            createProfile(2560, 1440, 120, 52_000_000),
-            createProfile(2560, 1440, 90, 46_000_000),
             createProfile(2560, 1440, 60, 40_000_000),
             createProfile(2560, 1440, 30, 18_000_000),
-            createProfile(1920, 1080, 144, 50_000_000),
-            createProfile(1920, 1080, 120, 45_000_000),
-            createProfile(1920, 1080, 90, 38_000_000),
             createProfile(1920, 1080, 60, 32_000_000),
             createProfile(1920, 1080, 30, 16_000_000),
             createProfile(1280, 720, 60, 12_000_000),

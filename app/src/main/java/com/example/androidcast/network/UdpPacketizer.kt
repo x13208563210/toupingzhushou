@@ -2,11 +2,10 @@ package com.example.androidcast.network
 
 import android.os.Process
 import com.example.androidcast.diagnostics.SenderDiagnostics
-import java.net.DatagramPacket
-import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.min
 
 class UdpPacketizer(
     host: String,
@@ -22,11 +21,15 @@ class UdpPacketizer(
     )
 
     private val address = InetAddress.getByName(host)
-    private val socket = DatagramSocket().apply {
-        connect(address, port)
-        sendBufferSize = 8 shl 20
-        runCatching { trafficClass = 0x10 }
-    }
+    private val socket =
+        Socket().apply {
+            tcpNoDelay = true
+            keepAlive = true
+            connect(InetSocketAddress(address, port), CONNECT_TIMEOUT_MS)
+            sendBufferSize = 16 shl 20
+            runCatching { trafficClass = 0x10 }
+        }
+    private val outputStream = socket.getOutputStream()
     private val running = AtomicBoolean(true)
     private val queueLock = Object()
     private val pendingVideoQueue = ArrayDeque<PendingAccessUnit>()
@@ -40,9 +43,20 @@ class UdpPacketizer(
             runCatching {
                 Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
             }
-            sendLoop()
+            runCatching {
+                sendLoop()
+            }.onFailure { error ->
+                if (running.get()) {
+                    SenderDiagnostics.e(TAG, "TCP video sender failed: ${error.message}", error)
+                }
+                running.set(false)
+                runCatching { socket.close() }
+                synchronized(queueLock) {
+                    queueLock.notifyAll()
+                }
+            }
         }.apply {
-            name = "udp-video-sender"
+            name = "tcp-video-sender"
             start()
         }
 
@@ -92,11 +106,6 @@ class UdpPacketizer(
 
                 pendingVideoQueue.addLast(pendingAccessUnit)
 
-                if (pendingVideoQueue.size >= WARNING_PENDING_ACCESS_UNITS && !proactiveKeyFrameRequested) {
-                    proactiveKeyFrameRequested = true
-                    shouldRequestKeyFrame = true
-                }
-
                 if (pendingVideoQueue.size > MAX_PENDING_ACCESS_UNITS) {
                     overflowCount += 1
                     val keptLatestSpan = trimToLatestKeyFrameLocked()
@@ -140,8 +149,9 @@ class UdpPacketizer(
             proactiveKeyFrameRequested = false
             queueLock.notifyAll()
         }
+        runCatching { outputStream.flush() }
+        runCatching { socket.close() }
         runCatching { senderThread.join(500) }
-        socket.close()
     }
 
     private fun trimToLatestKeyFrameLocked(): Boolean {
@@ -163,12 +173,10 @@ class UdpPacketizer(
     }
 
     private fun sendLoop() {
-        val packetBuffer = ByteArray(PacketHeader.HEADER_SIZE + MAX_PAYLOAD_SIZE)
-        val datagram = DatagramPacket(packetBuffer, 0, address, socket.port)
-
+        val headerBuffer = ByteArray(PacketHeader.HEADER_SIZE)
         while (running.get()) {
             val accessUnit = waitForAccessUnit() ?: break
-            sendAccessUnitNow(accessUnit, packetBuffer, datagram)
+            sendAccessUnitNow(accessUnit, headerBuffer)
         }
     }
 
@@ -192,46 +200,31 @@ class UdpPacketizer(
 
     private fun sendAccessUnitNow(
         accessUnit: PendingAccessUnit,
-        packetBuffer: ByteArray,
-        datagram: DatagramPacket,
+        headerBuffer: ByteArray,
     ) {
-        val packetCount = (accessUnit.payload.size + MAX_PAYLOAD_SIZE - 1) / MAX_PAYLOAD_SIZE
-        for (index in 0 until packetCount) {
-            if (!running.get()) {
-                return
-            }
-
-            val start = index * MAX_PAYLOAD_SIZE
-            val end = min(start + MAX_PAYLOAD_SIZE, accessUnit.payload.size)
-            val chunkSize = end - start
-            PacketHeader(
-                flags = accessUnit.flags,
-                streamId = streamId,
-                frameId = accessUnit.frameId,
-                packetIndex = index,
-                packetCount = packetCount,
-                payloadSize = chunkSize,
-                ptsUs = accessUnit.ptsUs,
-            ).writeTo(packetBuffer)
-            System.arraycopy(
-                accessUnit.payload,
-                start,
-                packetBuffer,
-                PacketHeader.HEADER_SIZE,
-                chunkSize,
-            )
-
-            datagram.length = PacketHeader.HEADER_SIZE + chunkSize
-            socket.send(datagram)
+        if (!running.get()) {
+            return
         }
+
+        PacketHeader(
+            flags = accessUnit.flags,
+            streamId = streamId,
+            frameId = accessUnit.frameId,
+            packetIndex = 0,
+            packetCount = 1,
+            payloadSize = accessUnit.payload.size,
+            ptsUs = accessUnit.ptsUs,
+        ).writeTo(headerBuffer)
+
+        outputStream.write(headerBuffer)
+        outputStream.write(accessUnit.payload)
     }
 
     companion object {
-        const val MAX_PAYLOAD_SIZE = 1400
-        private const val WARNING_PENDING_ACCESS_UNITS = 16
-        private const val WARNING_RESET_PENDING_ACCESS_UNITS = 8
-        private const val TRIMMED_PENDING_ACCESS_UNITS = 20
-        private const val MAX_PENDING_ACCESS_UNITS = 48
+        private const val CONNECT_TIMEOUT_MS = 4_000
+        private const val WARNING_RESET_PENDING_ACCESS_UNITS = 48
+        private const val TRIMMED_PENDING_ACCESS_UNITS = 96
+        private const val MAX_PENDING_ACCESS_UNITS = 192
         private const val TAG = "UdpPacketizer"
     }
 }

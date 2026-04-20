@@ -9,12 +9,15 @@ import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.view.Display
 import android.view.Surface
+import com.example.androidcast.audio.AudioStreamConfig
+import com.example.androidcast.audio.ProjectionAudioStreamer
 import com.example.androidcast.codec.CapabilityProbe
 import com.example.androidcast.codec.VideoEncoder
 import com.example.androidcast.diagnostics.SenderDiagnostics
 import com.example.androidcast.model.StreamProfile
 import com.example.androidcast.network.ControlClient
 import com.example.androidcast.network.PacketHeader
+import com.example.androidcast.network.UdpAudioSender
 import com.example.androidcast.network.UdpPacketizer
 import com.example.androidcast.settings.StreamSettingsStore
 import java.util.concurrent.atomic.AtomicBoolean
@@ -39,27 +42,30 @@ class ProjectionSession(
     private var controlClient: ControlClient? = null
     private var packetizer: UdpPacketizer? = null
     private var encoder: VideoEncoder? = null
+    private var audioStreamer: ProjectionAudioStreamer? = null
     private var projectionCallback: MediaProjection.Callback? = null
     private var displayMonitorThread: Thread? = null
     private var activeVideoPort: Int = 0
+    private var activeAudioPort: Int = 0
 
     val videoPort: Int
         get() = activeVideoPort
 
     fun start() {
         val logFile = SenderDiagnostics.startSession(context, CapabilityProbe.BUILD_LABEL)
-        SenderDiagnostics.i(TAG, "\u53D1\u9001\u7AEF\u8BCA\u65AD\u65E5\u5FD7\u6587\u4EF6=${logFile.absolutePath}")
+        SenderDiagnostics.i(TAG, "发送端诊断日志文件=${logFile.absolutePath}")
 
         val availableProfiles = CapabilityProbe().chooseProfiles()
-        require(availableProfiles.isNotEmpty()) { "\u6CA1\u6709\u627E\u5230\u53EF\u7528\u7684 AVC \u7F16\u7801\u914D\u7F6E\u3002" }
+        require(availableProfiles.isNotEmpty()) { "没有找到可用的 AVC 编码配置。" }
 
         val configuredProfile = StreamSettingsStore(context).resolveSelectedProfile(availableProfiles)
         val supportedProfiles = listOf(configuredProfile)
+        val audioRequested = configuredProfile.audioEnabled
         SenderDiagnostics.i(
             TAG,
-            "\u542F\u52A8\u7248\u672C=${CapabilityProbe.BUILD_LABEL}\uFF0C\u5F53\u524D\u4E0A\u62A5\u914D\u7F6E=${
+            "启动版本=${CapabilityProbe.BUILD_LABEL}，当前上报配置=${
                 supportedProfiles.joinToString { "${it.width}x${it.height}@${it.frameRateDebugLabel}/${it.bitrate}" }
-            }",
+            }，音频开关=${if (audioRequested) "开启" else "关闭"}",
         )
         logPhysicalDisplayState()
         ProjectionStatusBridge.publish(
@@ -67,10 +73,12 @@ class ProjectionSession(
             ProjectionStatusBridge.connecting(receiverHost, controlPort),
         )
 
-        val selected = createControlClient(supportedProfiles).connectAndSelectProfile {
-            encoder?.requestKeyFrame()
-        }
+        val selected =
+            createControlClient(supportedProfiles, audioRequested).connectAndSelectProfile {
+                encoder?.requestKeyFrame()
+            }
         activeVideoPort = selected.videoPort
+        activeAudioPort = 0
         ProjectionStatusBridge.publish(context, ProjectionStatusBridge.preparingStream())
 
         packetizer =
@@ -84,12 +92,12 @@ class ProjectionSession(
 
         val projection =
             projectionManager.getMediaProjection(resultCode, resultData)
-                ?: error("\u6CA1\u6709\u62FF\u5230\u5C4F\u5E55\u5F55\u5236\u6743\u9650\u3002")
+                ?: error("没有拿到屏幕录制权限。")
         mediaProjection = projection
         projectionCallback =
             object : MediaProjection.Callback() {
                 override fun onStop() {
-                    stop("\u6295\u5C4F\u6743\u9650\u5DF2\u505C\u6B62")
+                    stop("投屏权限已停止")
                 }
             }.also { callback ->
                 projection.registerCallback(callback, null)
@@ -106,12 +114,12 @@ class ProjectionSession(
                 )
                 SenderDiagnostics.i(
                     TAG,
-                    "\u5DF2\u5411\u6295\u5C4F\u8F93\u5165 Surface \u7533\u660E\u91C7\u96C6\u4E0A\u9650 ${selected.fps} fps\uFF0C\u5F53\u524D\u6A21\u5F0F=${selected.frameRateLabel}",
+                    "已向投屏输入 Surface 声明采集上限 ${selected.fps} fps，当前模式=${selected.frameRateLabel}",
                 )
             }.onFailure { error ->
                 SenderDiagnostics.w(
                     TAG,
-                    "\u8BBE\u7F6E\u6295\u5C4F\u8F93\u5165 Surface \u5E27\u7387\u63D0\u793A\u5931\u8D25: ${error.message}",
+                    "设置投屏输入 Surface 帧率提示失败: ${error.message}",
                     error,
                 )
             }
@@ -119,7 +127,7 @@ class ProjectionSession(
 
         virtualDisplay =
             projection.createVirtualDisplay(
-                "\u5B89\u5353\u6295\u5C4F\u53D1\u9001\u7AEF",
+                "安卓投屏发送端",
                 selected.width,
                 selected.height,
                 context.resources.displayMetrics.densityDpi,
@@ -129,10 +137,19 @@ class ProjectionSession(
                 null,
             )
 
+        if (selected.audioEnabled && selected.audioPort > 0) {
+            startAudioStreaming(projection, selected)
+        } else if (audioRequested) {
+            SenderDiagnostics.w(
+                TAG,
+                "本次协商未启用安卓声音独立投送，画面仍会按原链路继续发送。",
+            )
+        }
+
         currentEncoder.requestKeyFrame()
         requestStartupKeyFrames()
 
-        logVirtualDisplayState("\u521B\u5EFA\u540E")
+        logVirtualDisplayState("创建后")
         startDisplayMonitor()
         ProjectionStatusBridge.publish(
             context,
@@ -140,18 +157,20 @@ class ProjectionSession(
         )
         SenderDiagnostics.i(
             TAG,
-            "\u6295\u5C4F\u4F1A\u8BDD\u5DF2\u542F\u52A8\uFF0C\u7248\u672C=${CapabilityProbe.BUILD_LABEL}\uFF0C\u673A\u578B=${Build.MODEL}\uFF0C\u914D\u7F6E=$selected",
+            "投屏会话已启动，版本=${CapabilityProbe.BUILD_LABEL}，机型=${Build.MODEL}，配置=$selected，音频=${if (activeAudioPort > 0) "UDP/$activeAudioPort" else "关闭"}",
         )
     }
 
     fun stop(reason: String, publishStoppedStatus: Boolean = true) {
-        SenderDiagnostics.i(TAG, "\u6B63\u5728\u505C\u6B62\u6295\u5C4F\u4F1A\u8BDD\uFF0C\u539F\u56E0=$reason")
+        SenderDiagnostics.i(TAG, "正在停止投屏会话，原因=$reason")
         monitorRunning.set(false)
         runCatching { displayMonitorThread?.interrupt() }
         runCatching { displayMonitorThread?.join(300) }
         displayMonitorThread = null
-        logVirtualDisplayState("\u505C\u6B62\u524D")
+        logVirtualDisplayState("停止前")
         runCatching { controlClient?.sendStop(reason) }
+        runCatching { audioStreamer?.stop() }
+        audioStreamer = null
         runCatching {
             projectionCallback?.let { mediaProjection?.unregisterCallback(it) }
         }
@@ -167,6 +186,7 @@ class ProjectionSession(
         runCatching { controlClient?.close() }
         controlClient = null
         activeVideoPort = 0
+        activeAudioPort = 0
         if (publishStoppedStatus) {
             ProjectionStatusBridge.publish(
                 context,
@@ -176,15 +196,55 @@ class ProjectionSession(
         SenderDiagnostics.stopSession(reason)
     }
 
-    private fun createControlClient(supportedProfiles: List<StreamProfile>): ControlClient =
+    private fun createControlClient(
+        supportedProfiles: List<StreamProfile>,
+        audioRequested: Boolean,
+    ): ControlClient =
         ControlClient(
             receiverHost = receiverHost,
             controlPort = controlPort,
             deviceName = "${Build.MANUFACTURER} ${Build.MODEL} [${CapabilityProbe.BUILD_LABEL}]",
             supportedProfiles = supportedProfiles,
+            audioEnabled = audioRequested,
+            audioSampleRate = if (audioRequested) AudioStreamConfig.SAMPLE_RATE else 0,
+            audioChannels = if (audioRequested) AudioStreamConfig.CHANNEL_COUNT else 0,
         ).also {
             controlClient = it
         }
+
+    private fun startAudioStreaming(
+        projection: MediaProjection,
+        selected: StreamProfile,
+    ) {
+        runCatching {
+            val sender =
+                UdpAudioSender(
+                    host = receiverHost,
+                    port = selected.audioPort,
+                )
+            ProjectionAudioStreamer(
+                mediaProjection = projection,
+                audioSender = sender,
+            ).also { streamer ->
+                streamer.start()
+                audioStreamer = streamer
+                activeAudioPort = selected.audioPort
+            }
+        }.onSuccess {
+            SenderDiagnostics.i(
+                TAG,
+                "安卓声音独立投送已启动: UDP/${selected.audioPort}, ${selected.audioSampleRate}Hz/${selected.audioChannels}ch",
+            )
+        }.onFailure { error ->
+            activeAudioPort = 0
+            audioStreamer = null
+            SenderDiagnostics.w(
+                TAG,
+                "安卓声音独立投送启动失败，已保持原视频链路继续工作: ${error.message}",
+                error,
+            )
+        }
+    }
 
     private fun createEncoder(selected: StreamProfile): VideoEncoder =
         VideoEncoder(
@@ -218,14 +278,14 @@ class ProjectionSession(
             }.orEmpty()
         SenderDiagnostics.i(
             TAG,
-            "\u7269\u7406\u5C4F\u5E55: displayId=${display?.displayId ?: -1}, refresh=${"%.2f".format(display?.refreshRate ?: 0f)}Hz, mode=${currentMode?.physicalWidth ?: 0}x${currentMode?.physicalHeight ?: 0}@${"%.2f".format(currentMode?.refreshRate ?: 0f)}, supported=[$supportedModes]",
+            "物理屏幕: displayId=${display?.displayId ?: -1}, refresh=${"%.2f".format(display?.refreshRate ?: 0f)}Hz, mode=${currentMode?.physicalWidth ?: 0}x${currentMode?.physicalHeight ?: 0}@${"%.2f".format(currentMode?.refreshRate ?: 0f)}, supported=[$supportedModes]",
         )
     }
 
     private fun logVirtualDisplayState(prefix: String) {
         val display = virtualDisplay?.display
         if (display == null) {
-            SenderDiagnostics.w(TAG, "$prefix \u865A\u62DF\u663E\u793A\u4E0D\u53EF\u7528")
+            SenderDiagnostics.w(TAG, "$prefix 虚拟显示不可用")
             return
         }
         val mode = display.mode
@@ -235,7 +295,7 @@ class ProjectionSession(
             }
         SenderDiagnostics.i(
             TAG,
-            "$prefix \u865A\u62DF\u663E\u793A: displayId=${display.displayId}, refresh=${"%.2f".format(display.refreshRate)}Hz, mode=${mode.physicalWidth}x${mode.physicalHeight}@${"%.2f".format(mode.refreshRate)}, rotation=${display.rotation}, supported=[$supportedModes]",
+            "$prefix 虚拟显示: displayId=${display.displayId}, refresh=${"%.2f".format(display.refreshRate)}Hz, mode=${mode.physicalWidth}x${mode.physicalHeight}@${"%.2f".format(mode.refreshRate)}, rotation=${display.rotation}, supported=[$supportedModes]",
         )
     }
 
@@ -245,7 +305,7 @@ class ProjectionSession(
             Thread {
                 var sampleCount = 0
                 while (monitorRunning.get()) {
-                    logVirtualDisplayState("\u8FD0\u884C\u4E2D#$sampleCount")
+                    logVirtualDisplayState("运行中#$sampleCount")
                     sampleCount += 1
                     try {
                         Thread.sleep(1_000)
@@ -274,7 +334,7 @@ class ProjectionSession(
                 }
 
                 encoder?.requestKeyFrame()
-                SenderDiagnostics.d(TAG, "\u542F\u52A8\u9636\u6BB5\u8FFD\u52A0\u8BF7\u6C42\u5173\u952E\u5E27: ${delayMs}ms")
+                SenderDiagnostics.d(TAG, "启动阶段追加请求关键帧: ${delayMs}ms")
             }
         }.apply {
             name = "projection-startup-keyframe"

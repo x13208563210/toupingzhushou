@@ -1,135 +1,89 @@
-# Windows Receiver
+# 直播投屏助手 Windows 接收端
 
-## App shape
+## 功能说明
 
-The Windows receiver should be a small native desktop app with one main window and a minimal status panel.
+直播投屏助手 PC 端负责接收、显示、诊断和输出投屏画面，当前支持：
 
-## Recommended modules
+- 安卓画面投屏接收
+- 安卓声音独立投送与本地播放
+- 苹果投屏接收（AirPlay）
+- 虚拟摄像头输出，供 OBS 等软件采集
+- PC 端离线语音控制，可识别“音乐 / 播放 / 暂停”并发送系统媒体播放/暂停键
+- 语音点歌，可识别成品主目录下“语音点歌”子目录名称并随机播放其中一首本地音乐
+- 独立语音控制页，只保留接收端自带的离线语音控制，并提供日志与目录入口
+- 连接状态查看
+- 诊断恢复
+- 日志与状态快照导出
 
-#### `AppMain`
+作者：粥6y
 
-Responsibilities:
+## 功能分组
 
-- initialize Winsock
-- create the main window
-- start network and decode subsystems
+- 总览
+- 设备连接
+- 画面显示
+- 语音控制
+- 诊断恢复
+- 日志导出
 
-#### `ControlServer`
+## 当前交付文件
 
-Responsibilities:
+- `直播投屏助手-接收端-0.3.40-voice-music-default-folders-2026-04-09.exe`
+- `live-cast-virtual-camera-media-source.dll`
+- `live-cast-virtual-camera-tool.exe`
+- `voice-runtime\...`
+- `voice-model\...`
+- `apple-airplay\_internal\...`
 
-- listen for a single TCP sender
-- parse JSON control messages
-- choose a supported stream profile
-- send `REQUEST_IDR` when decode recovery is needed
+## 端口说明
 
-#### `UdpVideoReceiver`
+- 控制通道：TCP/5500
+- 视频通道：UDP/55000
+- 安卓声音通道：UDP/55001
 
-Responsibilities:
+## 使用方法
 
-- bind the negotiated UDP port
-- receive packets continuously
-- hand packet data to frame reassembler
+1. 运行 PC 接收端。
+2. 首次运行如果 Windows 防火墙弹窗，请允许局域网访问。
+3. 确保手机和电脑位于同一局域网。
+4. 安卓发送端填写电脑当前局域网 IP。
+5. 控制端口填写 `5500`。
+6. 安卓端开始投屏后，PC 会自动接收画面。
+7. 如果安卓端开启“安卓声音独立投送”，PC 会额外接收并播放声音，不影响原有画面链路。
 
-#### `FrameReassembler`
+## 苹果投屏（AirPlay）
 
-Responsibilities:
+1. PC 接收端启动后，会自动尝试启动苹果投屏服务。
+2. 接收端成品目录内必须保留 `apple-airplay` 目录。
+3. 系统需要可用的 `Bonjour Service`，程序会优先尝试自动拉起。
+4. 在 iPhone 或 iPad 的“屏幕镜像”里选择“直播投屏助手”即可投屏到电脑。
+5. 苹果投屏日志会写入 `airplay-receiver.log`。
 
-- track in-flight frames by `frameId`
-- detect completion or timeout
-- emit complete access units to decoder
+## 虚拟摄像头
 
-#### `VideoDecoder`
+1. 打开 PC 端“画面显示”页。
+2. 第二个按钮会根据当前状态显示为“安装虚拟摄像头 / 启动虚拟摄像头 / 关闭虚拟摄像头”。
+3. 首次安装会弹出管理员授权。
+4. 启动后，可在 OBS、会议软件或其他支持摄像头采集的应用中选择“直播投屏助手虚拟摄像头”。
 
-Responsibilities:
+## 语音控制
 
-- create the hardware decode path if available
-- submit access units
-- surface decoded frames to renderer
-- detect desync and trigger IDR requests
+1. 打开 PC 端“语音控制”页。
+2. 左侧主按钮用于开启或关闭接收端内置的离线语音识别。
+3. 中间按钮用于直接打开本次运行日志。
+4. 右侧按钮用于打开接收端所在目录。
+5. 当前默认识别关键词为“音乐 / 播放 / 暂停”。
+6. 为避免中文目录导致识别模型加载失败，程序会自动把离线语音运行时和模型同步到 `%LOCALAPPDATA%\LiveCastAssistant\offline-voice`。
+7. 当前版本已移除 Windows 系统语音访问接入，只保留接收端自己的离线识别。为了提速，程序会使用更小的麦克风音频块，并对稳定命中的中途识别结果提前触发；最终识别结果仍然保留兜底确认。识别结果里只要包含“播放音乐”或“暂停音乐”，即使后面还带“啊 / 呀”等字样也会执行。每次执行播放/暂停后，还会短暂忽略麦克风回声，避免声音刚恢复时又被反复误判。
+8. 成品主目录下会自动创建 `语音点歌` 目录，并默认生成 `战歌`、`出货` 两个分类文件夹。你也可以继续按风格建立更多子目录，例如 `热血`、`纯音乐`、`123`，再把 `mp3 / wav / m4a / aac / flac / wma` 文件放进去。
+9. 对着 PC 说子目录名称即可随机播放该目录中的一首音乐。比如说“战歌”“出货”“热血”“纯音乐”“123”都能触发。如果目录名是纯数字，程序也会同时识别按数字逐字念出的中文说法，例如 `123 -> 一二三`。
 
-#### `Renderer`
+## 运行后会生成的文件
 
-Responsibilities:
+- `receiver-log.txt`
+- `receiver-status.json`
+- `receiver-profile-cache.json`
+- `receiver-codec-config.bin`
+- `airplay-receiver.log`
 
-- create `D3D11` device and swap chain
-- upload or bind decoded frame surfaces
-- present with low queue depth
-
-## Suggested folder layout
-
-```text
-windows-receiver/
-  src/
-    AppMain.cpp
-    ControlServer.cpp
-    UdpVideoReceiver.cpp
-    FrameReassembler.cpp
-    VideoDecoder.cpp
-    Renderer.cpp
-    Protocol.cpp
-  include/
-    ControlServer.h
-    UdpVideoReceiver.h
-    FrameReassembler.h
-    VideoDecoder.h
-    Renderer.h
-    Protocol.h
-```
-
-## Startup sequence
-
-1. App opens control port
-2. Sender connects and announces profiles
-3. Receiver picks the best locally supported profile
-4. Receiver starts UDP receive loop
-5. Sender starts streaming
-6. Reassembler emits complete access units
-7. Decoder produces displayable frames
-8. Renderer presents them immediately
-
-## Windows-specific advice
-
-### Decoder
-
-Prefer:
-
-- hardware decode first
-- software fallback only for debugging or compatibility
-
-The low-latency goal depends heavily on avoiding deep internal buffering.
-
-### Renderer
-
-Use:
-
-- `D3D11`
-- flip-model swap chain
-- minimal frame queueing
-
-Do not start with a complex UI toolkit if you can avoid it.
-
-## What to measure early
-
-- input packet rate
-- complete frame rate
-- dropped incomplete frames
-- decode success rate
-- present FPS
-- time from packet completion to present
-
-## First milestone behavior
-
-A successful first milestone on Windows means:
-
-- it accepts one Android sender
-- it displays stable `1080p60`
-- it recovers after packet loss by requesting IDR
-- it keeps latency visibly low without buffering up seconds of video
-
-## Nice-to-have later
-
-- auto-discovery on LAN
-- profile override UI
-- stats overlay
-- log export
+这些都属于正常运行文件。

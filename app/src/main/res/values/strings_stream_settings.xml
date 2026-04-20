@@ -1,11 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="section_stream_title">推流参数</string>
-    <string name="section_stream_desc">这些参数由手机端决定，电脑端会按这里的档位接收和显示。</string>
+    <string name="section_stream_desc">这些参数由手机端决定，电脑端会按这里的配置接收和显示。</string>
     <string name="hint_stream_resolution">分辨率</string>
     <string name="hint_stream_fps">帧率</string>
     <string name="hint_stream_bitrate">码率（Mbps）</string>
-    <string name="stream_bitrate_tip">推荐范围 6 到 40 Mbps，数值越高画质越好，但手机和网络压力也越大。</string>
+    <string name="stream_bitrate_tip">推荐范围 6 到 40 Mbps，数值越高画质越好，但手机和网络压力也会更大。</string>
     <string name="stream_settings_summary_prefix">当前推流：</string>
     <string name="status_invalid_stream_settings">请先选择有效的分辨率、帧率和码率。</string>
+    <string name="audio_toggle_title">安卓声音独立投送</string>
+    <string name="audio_toggle_desc">开启后会单独采集安卓系统声音，另外送到 PC 端播放，不影响画面主链路。</string>
 </resources>

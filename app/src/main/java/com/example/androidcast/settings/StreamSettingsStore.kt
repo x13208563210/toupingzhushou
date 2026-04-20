@@ -9,6 +9,7 @@ data class SenderStreamSettings(
     val fpsUpperBound: Int,
     val bitrateMbps: Int,
     val adaptiveFps: Boolean,
+    val captureAudio: Boolean,
 ) {
     val bitrateBps: Int
         get() = bitrateMbps * 1_000_000
@@ -19,11 +20,12 @@ class StreamSettingsStore(context: Context) {
         context.getSharedPreferences(PREFERENCE_NAME, Context.MODE_PRIVATE)
 
     fun load(supportedProfiles: List<StreamProfile>): SenderStreamSettings {
-        val defaultSettings = defaultSettings(supportedProfiles)
+        val availableProfiles = supportedProfiles.map(::capProfileFps)
+        val defaultSettings = defaultSettings(availableProfiles)
         val savedWidth = preferences.getInt(KEY_WIDTH, defaultSettings.width)
         val savedHeight = preferences.getInt(KEY_HEIGHT, defaultSettings.height)
         val resolutionProfiles =
-            supportedProfiles.filter {
+            availableProfiles.filter {
                 it.width == savedWidth &&
                     it.height == savedHeight
             }
@@ -31,14 +33,14 @@ class StreamSettingsStore(context: Context) {
             if (resolutionProfiles.isNotEmpty()) {
                 resolutionProfiles
             } else {
-                supportedProfiles.filter {
+                availableProfiles.filter {
                     it.width == defaultSettings.width &&
                         it.height == defaultSettings.height
                 }
             }
         val matchedProfile =
             matchedResolutionProfiles.maxByOrNull { it.fps }
-                ?: supportedProfiles.first()
+                ?: availableProfiles.first()
 
         val savedBitrateMbps =
             preferences.getInt(
@@ -69,6 +71,7 @@ class StreamSettingsStore(context: Context) {
             fpsUpperBound = matchedProfile.fps,
             bitrateMbps = bitrateMbps,
             adaptiveFps = true,
+            captureAudio = preferences.getBoolean(KEY_CAPTURE_AUDIO, false),
         )
     }
 
@@ -77,6 +80,7 @@ class StreamSettingsStore(context: Context) {
             .putInt(KEY_WIDTH, settings.width)
             .putInt(KEY_HEIGHT, settings.height)
             .putInt(KEY_BITRATE_MBPS, settings.bitrateMbps.coerceIn(MIN_BITRATE_MBPS, MAX_BITRATE_MBPS))
+            .putBoolean(KEY_CAPTURE_AUDIO, settings.captureAudio)
             .putInt(KEY_QUALITY_MIGRATION_LEVEL, QUALITY_MIGRATION_LEVEL)
             .remove(KEY_FPS)
             .remove(KEY_ADAPTIVE_FPS)
@@ -84,29 +88,34 @@ class StreamSettingsStore(context: Context) {
     }
 
     fun resolveSelectedProfile(supportedProfiles: List<StreamProfile>): StreamProfile {
-        val settings = load(supportedProfiles)
+        val availableProfiles = supportedProfiles.map(::capProfileFps)
+        val settings = load(availableProfiles)
         val resolutionProfiles =
-            supportedProfiles.filter {
+            availableProfiles.filter {
                 it.width == settings.width &&
                     it.height == settings.height
             }
         val matchedProfile =
             resolutionProfiles.maxByOrNull { it.fps }
-                ?: defaultProfile(supportedProfiles)
+                ?: defaultProfile(availableProfiles)
 
-        return matchedProfile.copy(
-            bitrate = settings.bitrateBps,
-            adaptiveFps = true,
+        return capProfileFps(
+            matchedProfile.copy(
+                bitrate = settings.bitrateBps,
+                adaptiveFps = true,
+                audioEnabled = settings.captureAudio,
+            ),
         )
     }
 
     private fun defaultProfile(supportedProfiles: List<StreamProfile>): StreamProfile =
         supportedProfiles
+            .map(::capProfileFps)
             .maxWithOrNull(
                 compareBy<StreamProfile> { it.width * it.height }
                     .thenBy { it.fps },
             )
-            ?: supportedProfiles.first()
+            ?: capProfileFps(supportedProfiles.first())
 
     private fun defaultSettings(supportedProfiles: List<StreamProfile>): SenderStreamSettings {
         val profile = defaultProfile(supportedProfiles)
@@ -116,12 +125,14 @@ class StreamSettingsStore(context: Context) {
             fpsUpperBound = profile.fps,
             bitrateMbps = (profile.bitrate / 1_000_000).coerceIn(MIN_BITRATE_MBPS, MAX_BITRATE_MBPS),
             adaptiveFps = true,
+            captureAudio = false,
         )
     }
 
     companion object {
         const val MIN_BITRATE_MBPS = 4
         const val MAX_BITRATE_MBPS = 80
+        private const val MAX_STREAM_FPS = 60
         private const val QUALITY_MIGRATION_LEVEL = 1
 
         private const val PREFERENCE_NAME = "stream_settings"
@@ -130,9 +141,17 @@ class StreamSettingsStore(context: Context) {
         private const val KEY_FPS = "fps"
         private const val KEY_ADAPTIVE_FPS = "adaptive_fps"
         private const val KEY_BITRATE_MBPS = "bitrate_mbps"
+        private const val KEY_CAPTURE_AUDIO = "capture_audio"
         private const val KEY_QUALITY_MIGRATION_LEVEL = "quality_migration_level"
     }
 
     private fun recommendedBitrateMbps(profile: StreamProfile): Int =
         (profile.bitrate / 1_000_000).coerceIn(MIN_BITRATE_MBPS, MAX_BITRATE_MBPS)
+
+    private fun capProfileFps(profile: StreamProfile): StreamProfile =
+        if (profile.fps > MAX_STREAM_FPS) {
+            profile.copy(fps = MAX_STREAM_FPS)
+        } else {
+            profile
+        }
 }

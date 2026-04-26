@@ -2,6 +2,7 @@
 
 #include <wrl.h>
 
+#include <cwctype>
 #include <filesystem>
 #include <regex>
 #include <string>
@@ -9,6 +10,7 @@
 namespace {
 
 constexpr wchar_t kWebUiVirtualHost[] = L"appassets.livecast";
+constexpr wchar_t kWebUiEntryUrl[] = L"https://appassets.livecast/index.html";
 
 std::wstring WideFromUtf8(const std::string& value) {
     if (value.empty()) {
@@ -38,25 +40,141 @@ std::wstring WideFromUtf8(const std::string& value) {
     return result;
 }
 
+std::wstring UnescapeJsonString(const std::wstring& value) {
+    std::wstring result;
+    result.reserve(value.size());
+    for (size_t index = 0; index < value.size(); ++index) {
+        const wchar_t ch = value[index];
+        if (ch != L'\\' || index + 1 >= value.size()) {
+            result.push_back(ch);
+            continue;
+        }
+
+        const wchar_t escaped = value[++index];
+        switch (escaped) {
+        case L'"':
+            result.push_back(L'"');
+            break;
+        case L'\\':
+            result.push_back(L'\\');
+            break;
+        case L'/':
+            result.push_back(L'/');
+            break;
+        case L'b':
+            result.push_back(L'\b');
+            break;
+        case L'f':
+            result.push_back(L'\f');
+            break;
+        case L'n':
+            result.push_back(L'\n');
+            break;
+        case L'r':
+            result.push_back(L'\r');
+            break;
+        case L't':
+            result.push_back(L'\t');
+            break;
+        case L'u':
+            if (index + 4 < value.size()) {
+                wchar_t* end = nullptr;
+                const std::wstring hex = value.substr(index + 1, 4);
+                const unsigned long codepoint = std::wcstoul(hex.c_str(), &end, 16);
+                if (end != nullptr && *end == L'\0') {
+                    result.push_back(static_cast<wchar_t>(codepoint));
+                    index += 4;
+                    break;
+                }
+            }
+            result.push_back(escaped);
+            break;
+        default:
+            result.push_back(escaped);
+            break;
+        }
+    }
+    return result;
+}
+
 std::wstring ExtractJsonStringField(const std::wstring& json_text, const wchar_t* field_name) {
     if (field_name == nullptr || *field_name == L'\0' || json_text.empty()) {
         return {};
     }
 
-    const std::wregex field_regex(
-        std::wstring(L"\"") + field_name + L"\"\\s*:\\s*\"([^\"]*)\"",
-        std::regex::icase);
-    std::wsmatch match;
-    if (!std::regex_search(json_text, match, field_regex) || match.size() < 2) {
+    const std::wstring marker = std::wstring(L"\"") + field_name + L"\"";
+    size_t search_pos = 0;
+    while (search_pos < json_text.size()) {
+        const size_t field_pos = json_text.find(marker, search_pos);
+        if (field_pos == std::wstring::npos) {
+            return {};
+        }
+
+        size_t cursor = field_pos + marker.size();
+        while (cursor < json_text.size() && std::iswspace(json_text[cursor])) {
+            ++cursor;
+        }
+        if (cursor >= json_text.size() || json_text[cursor] != L':') {
+            search_pos = field_pos + marker.size();
+            continue;
+        }
+        ++cursor;
+        while (cursor < json_text.size() && std::iswspace(json_text[cursor])) {
+            ++cursor;
+        }
+        if (cursor >= json_text.size() || json_text[cursor] != L'"') {
+            return {};
+        }
+        ++cursor;
+
+        std::wstring raw_value;
+        raw_value.reserve(64);
+        bool escaped = false;
+        for (; cursor < json_text.size(); ++cursor) {
+            const wchar_t ch = json_text[cursor];
+            if (!escaped && ch == L'"') {
+                return UnescapeJsonString(raw_value);
+            }
+            if (!escaped && ch == L'\\') {
+                escaped = true;
+                raw_value.push_back(ch);
+                continue;
+            }
+            escaped = false;
+            raw_value.push_back(ch);
+        }
         return {};
     }
-    return match[1].str();
+    return {};
 }
 
 std::wstring FormatHr(HRESULT hr) {
     wchar_t buffer[32]{};
     swprintf_s(buffer, L"0x%08X", static_cast<unsigned int>(hr));
     return buffer;
+}
+
+std::wstring BuildVersionedWebUiUrl(const std::wstring& content_directory) {
+    if (content_directory.empty()) {
+        return kWebUiEntryUrl;
+    }
+
+    const std::filesystem::path index_path = std::filesystem::path(content_directory) / L"index.html";
+    std::error_code error;
+    const auto write_time = std::filesystem::last_write_time(index_path, error);
+    if (error) {
+        return kWebUiEntryUrl;
+    }
+
+    const auto file_size = std::filesystem::file_size(index_path, error);
+    if (error) {
+        return kWebUiEntryUrl;
+    }
+
+    std::wstring version = std::to_wstring(static_cast<long long>(write_time.time_since_epoch().count()));
+    version += L"-";
+    version += std::to_wstring(static_cast<unsigned long long>(file_size));
+    return std::wstring(kWebUiEntryUrl) + L"?v=" + version;
 }
 
 }  // namespace
@@ -82,6 +200,7 @@ bool EmbeddedWebUiBridge::Initialize(
     parent_window_ = parent_window;
     content_directory_ = content_directory;
     user_data_directory_ = user_data_directory;
+    navigation_url_ = BuildVersionedWebUiUrl(content_directory_);
 
     if (parent_window_ == nullptr) {
         Log(L"Web 前端：父窗口无效，无法初始化内嵌界面。");
@@ -171,7 +290,7 @@ bool EmbeddedWebUiBridge::Initialize(
                                 web_message_token_registered_ = true;
                             }
 
-                            webview_->Navigate(L"https://appassets.livecast/index.html");
+                            webview_->Navigate(navigation_url_.c_str());
                             Log(L"Web 前端：已启动内嵌 React 界面，等待前端握手。");
                             return S_OK;
                         }).Get());
@@ -276,7 +395,12 @@ void EmbeddedWebUiBridge::HandleWebMessage(const std::wstring& message_text) {
         const std::wstring action = ExtractJsonStringField(message_text, L"action");
         const std::wstring value = ExtractJsonStringField(message_text, L"value");
         const std::wstring extra = ExtractJsonStringField(message_text, L"extra");
+        if (action.empty()) {
+            Log(L"Web \u524d\u7aef\uff1a\u6536\u5230 action \u6d88\u606f\uff0c\u4f46\u672a\u89e3\u6790\u5230\u52a8\u4f5c\u3002");
+            return;
+        }
         if (!action.empty() && action_handler_) {
+            Log(std::wstring(L"Web \u524d\u7aef\uff1a\u6536\u5230\u52a8\u4f5c -> ") + action);
             action_handler_(action, value, extra);
             PushSnapshot(true);
         }

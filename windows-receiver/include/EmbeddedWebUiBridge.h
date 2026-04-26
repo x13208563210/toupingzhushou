@@ -41,6 +41,7 @@ private:
     HWND host_window_ = nullptr;
     std::wstring content_directory_;
     std::wstring user_data_directory_;
+    std::wstring navigation_url_;
     bool ready_ = false;
     ULONGLONG last_snapshot_tick_ = 0;
     EventRegistrationToken web_message_token_{};

@@ -16,6 +16,7 @@ set(ANDROID_CAST_FFMPEG_INCLUDE_DIR "${ANDROID_CAST_FFMPEG_DEV_ROOT}/include")
 set(ANDROID_CAST_FFMPEG_RUNTIME_DIR "${ANDROID_CAST_FFMPEG_DEV_ROOT}/bin")
 set(ANDROID_CAST_VIRTUAL_CAMERA_PLACEHOLDER_IMAGE "${CMAKE_CURRENT_SOURCE_DIR}/assets/virtual-camera-default.png")
 set(ANDROID_CAST_DANMAKU_REMINDER_SOUND "${CMAKE_CURRENT_SOURCE_DIR}/assets/danmaku-reminder.wav")
+set(ANDROID_CAST_GIFT_REMINDER_SOUND "${CMAKE_CURRENT_SOURCE_DIR}/assets/gift-reminder.wav")
 set(ANDROID_CAST_WEBVIEW2_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/webview2-sdk/1.0.3856.49")
 set(ANDROID_CAST_WEBVIEW2_INCLUDE "${ANDROID_CAST_WEBVIEW2_SDK_DIR}/build/native/include")
 set(ANDROID_CAST_WEBVIEW2_STATIC_LIB "${ANDROID_CAST_WEBVIEW2_SDK_DIR}/build/native/x64/WebView2LoaderStatic.lib")
@@ -108,7 +109,6 @@ if (EXISTS "${ANDROID_CAST_NV_CODEC_ROOT}/third_party/nvcuvid.h" AND DEFINED ENV
         "${ANDROID_CAST_NV_CODEC_ROOT}/third_party"
         "$ENV{CUDA_PATH}/include"
     )
-    target_link_libraries(AndroidCastReceiver PRIVATE "$ENV{CUDA_PATH}/lib/x64/cuda.lib")
 endif()
 
 target_compile_definitions(AndroidCastCuvid PRIVATE
@@ -146,6 +146,7 @@ if (MSVC)
     target_compile_options(AndroidCastReceiver PRIVATE /utf-8)
     target_compile_options(LiveCastVirtualCameraMediaSource PRIVATE /utf-8)
     target_compile_options(LiveCastVirtualCameraTool PRIVATE /utf-8)
+    target_link_options(AndroidCastReceiver PRIVATE "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'")
 endif()
 
 target_link_libraries(AndroidCastReceiver PRIVATE AndroidCastCuvid)
@@ -202,4 +203,7 @@ add_custom_command(TARGET AndroidCastReceiver POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${ANDROID_CAST_DANMAKU_REMINDER_SOUND}"
         "$<TARGET_FILE_DIR:AndroidCastReceiver>/danmaku-reminder.wav"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${ANDROID_CAST_GIFT_REMINDER_SOUND}"
+        "$<TARGET_FILE_DIR:AndroidCastReceiver>/gift-reminder.wav"
 )

@@ -1,10 +1,11 @@
 #include <winver.h>
 
 1 ICON "z6y-logo.ico"
+1 RT_MANIFEST "receiver.manifest"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,3,85,0
- PRODUCTVERSION 0,3,85,0
+FILEVERSION 0,4,10,0
+PRODUCTVERSION 0,4,10,0
  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
 #ifdef _DEBUG
  FILEFLAGS VS_FF_DEBUG
@@ -21,11 +22,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Zhou6Y\0"
             VALUE "FileDescription", "Live Cast Assistant Receiver\0"
-            VALUE "FileVersion", "0.3.85.0\0"
+            VALUE "FileVersion", "0.4.10.0\0"
             VALUE "InternalName", "AndroidCastReceiver\0"
             VALUE "OriginalFilename", "AndroidCastReceiver.exe\0"
             VALUE "ProductName", "Live Cast Assistant Receiver\0"
-            VALUE "ProductVersion", "0.3.85.0\0"
+            VALUE "ProductVersion", "0.4.10.0\0"
         END
     END
     BLOCK "VarFileInfo"

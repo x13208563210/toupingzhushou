@@ -34,7 +34,7 @@ std::wstring Utf8ToWide(const char* value) {
 #if ANDROID_CAST_HAVE_NVIDIA_CUVID_PROBE
 
 template <typename T>
-bool LoadCuvidSymbol(HMODULE module, const char* name, T* output) {
+bool LoadSymbol(HMODULE module, const char* name, T* output) {
     if (module == nullptr || name == nullptr || output == nullptr) {
         return false;
     }
@@ -42,11 +42,33 @@ bool LoadCuvidSymbol(HMODULE module, const char* name, T* output) {
     return *output != nullptr;
 }
 
-std::wstring CudaErrorText(CUresult result) {
+template <typename T>
+bool LoadAnySymbol(HMODULE module, const char* primary_name, const char* fallback_name, T* output) {
+    return LoadSymbol(module, primary_name, output) || LoadSymbol(module, fallback_name, output);
+}
+
+struct CudaApi {
+    HMODULE module = nullptr;
+    decltype(&cuInit) init = nullptr;
+    decltype(&cuGetErrorName) get_error_name = nullptr;
+    decltype(&cuGetErrorString) get_error_string = nullptr;
+    decltype(&cuDeviceGetCount) device_get_count = nullptr;
+    decltype(&cuDeviceGet) device_get = nullptr;
+    decltype(&cuDeviceGetName) device_get_name = nullptr;
+    decltype(&cuCtxCreate) ctx_create = nullptr;
+    decltype(&cuCtxSetCurrent) ctx_set_current = nullptr;
+    decltype(&cuCtxDestroy) ctx_destroy = nullptr;
+};
+
+std::wstring CudaErrorText(const CudaApi& cuda, CUresult result) {
     const char* error_name = nullptr;
     const char* error_string = nullptr;
-    cuGetErrorName(result, &error_name);
-    cuGetErrorString(result, &error_string);
+    if (cuda.get_error_name != nullptr) {
+        cuda.get_error_name(result, &error_name);
+    }
+    if (cuda.get_error_string != nullptr) {
+        cuda.get_error_string(result, &error_string);
+    }
 
     std::wostringstream stream;
     stream << L"CUDA \u9519\u8BEF 0x" << std::hex << std::uppercase
@@ -60,18 +82,70 @@ std::wstring CudaErrorText(CUresult result) {
     return stream.str();
 }
 
+bool LoadCudaApi(CudaApi* api, std::wstring* error) {
+    if (api == nullptr) {
+        return false;
+    }
+
+    *api = {};
+    api->module = LoadLibraryW(L"nvcuda.dll");
+    if (api->module == nullptr) {
+        if (error != nullptr) {
+            *error = L"\u672A\u627E\u5230 nvcuda.dll\u3002";
+        }
+        return false;
+    }
+
+    const bool ok =
+        LoadSymbol(api->module, "cuInit", &api->init) &&
+        LoadSymbol(api->module, "cuGetErrorName", &api->get_error_name) &&
+        LoadSymbol(api->module, "cuGetErrorString", &api->get_error_string) &&
+        LoadSymbol(api->module, "cuDeviceGetCount", &api->device_get_count) &&
+        LoadSymbol(api->module, "cuDeviceGet", &api->device_get) &&
+        LoadSymbol(api->module, "cuDeviceGetName", &api->device_get_name) &&
+        LoadAnySymbol(api->module, "cuCtxCreate_v2", "cuCtxCreate", &api->ctx_create) &&
+        LoadSymbol(api->module, "cuCtxSetCurrent", &api->ctx_set_current) &&
+        LoadAnySymbol(api->module, "cuCtxDestroy_v2", "cuCtxDestroy", &api->ctx_destroy);
+
+    if (!ok) {
+        if (error != nullptr) {
+            *error = L"nvcuda.dll \u5DF2\u52A0\u8F7D\uff0C\u4F46\u5BFC\u51FA\u51FD\u6570\u4E0D\u5B8C\u6574\u3002";
+        }
+        FreeLibrary(api->module);
+        *api = {};
+        return false;
+    }
+
+    return true;
+}
+
+void UnloadCudaApi(CudaApi* api) {
+    if (api == nullptr) {
+        return;
+    }
+    if (api->module != nullptr) {
+        FreeLibrary(api->module);
+    }
+    *api = {};
+}
+
 struct CuvidApi {
     HMODULE module = nullptr;
     decltype(&cuvidGetDecoderCaps) cuvid_get_decoder_caps = nullptr;
 };
 
 struct ScopedCudaContext {
+    const CudaApi* cuda = nullptr;
     CUcontext context = nullptr;
 
     ~ScopedCudaContext() {
-        if (context != nullptr) {
-            cuCtxSetCurrent(nullptr);
-            cuCtxDestroy(context);
+        if (cuda != nullptr && context != nullptr) {
+            if (cuda->ctx_set_current != nullptr) {
+                cuda->ctx_set_current(nullptr);
+            }
+            if (cuda->ctx_destroy != nullptr) {
+                cuda->ctx_destroy(context);
+            }
         }
     }
 };
@@ -81,6 +155,7 @@ bool LoadCuvidApi(CuvidApi* api, std::wstring* error) {
         return false;
     }
 
+    *api = {};
     api->module = LoadLibraryW(L"nvcuvid.dll");
     if (api->module == nullptr) {
         if (error != nullptr) {
@@ -89,12 +164,12 @@ bool LoadCuvidApi(CuvidApi* api, std::wstring* error) {
         return false;
     }
 
-    if (!LoadCuvidSymbol(api->module, "cuvidGetDecoderCaps", &api->cuvid_get_decoder_caps)) {
+    if (!LoadSymbol(api->module, "cuvidGetDecoderCaps", &api->cuvid_get_decoder_caps)) {
         if (error != nullptr) {
-            *error = L"nvcuvid.dll \u5DF2\u52A0\u8F7D\uff0c\u4F46\u7F3A\u5C11 cuvidGetDecoderCaps \u5BFC\u51FA\u3002";
+            *error = L"nvcuvid.dll \u5DF2\u52A0\u8F7D\uff0C\u4F46\u7F3A\u5C11 cuvidGetDecoderCaps \u5BFC\u51FA\u3002";
         }
         FreeLibrary(api->module);
-        api->module = nullptr;
+        *api = {};
         return false;
     }
     return true;
@@ -106,28 +181,28 @@ void UnloadCuvidApi(CuvidApi* api) {
     }
     if (api->module != nullptr) {
         FreeLibrary(api->module);
-        api->module = nullptr;
     }
-    api->cuvid_get_decoder_caps = nullptr;
+    *api = {};
 }
 
-bool CreateProbeContext(CUdevice device, ScopedCudaContext* scoped_context, std::wstring* error) {
+bool CreateProbeContext(const CudaApi& cuda, CUdevice device, ScopedCudaContext* scoped_context, std::wstring* error) {
     if (scoped_context == nullptr) {
         return false;
     }
 
-    const CUresult create_result = cuCtxCreate(&scoped_context->context, 0, device);
+    scoped_context->cuda = &cuda;
+    const CUresult create_result = cuda.ctx_create(&scoped_context->context, 0, device);
     if (create_result != CUDA_SUCCESS) {
         if (error != nullptr) {
-            *error = L"\u521B\u5EFA CUDA \u4E0A\u4E0B\u6587\u5931\u8D25\uff0c" + CudaErrorText(create_result);
+            *error = L"\u521B\u5EFA CUDA \u4E0A\u4E0B\u6587\u5931\u8D25\uff0C" + CudaErrorText(cuda, create_result);
         }
         return false;
     }
 
-    const CUresult set_current_result = cuCtxSetCurrent(scoped_context->context);
+    const CUresult set_current_result = cuda.ctx_set_current(scoped_context->context);
     if (set_current_result != CUDA_SUCCESS) {
         if (error != nullptr) {
-            *error = L"\u8BBE\u7F6E CUDA \u5F53\u524D\u4E0A\u4E0B\u6587\u5931\u8D25\uff0C" + CudaErrorText(set_current_result);
+            *error = L"\u8BBE\u7F6E CUDA \u5F53\u524D\u4E0A\u4E0B\u6587\u5931\u8D25\uff0C" + CudaErrorText(cuda, set_current_result);
         }
         return false;
     }
@@ -146,40 +221,52 @@ NvidiaCuvidProbeResult ProbeNvidiaCuvidSupport() {
     result.summary = L"NVIDIA NVDEC \u63A2\u6D4B\uff1A\u5F53\u524D\u6784\u5EFA\u672A\u63A5\u5165 CUDA/CUVID \u5F00\u53D1\u5934\u6587\u4EF6\u3002";
     return result;
 #else
-    const CUresult init_result = cuInit(0);
+    CudaApi cuda;
+    std::wstring cuda_load_error;
+    if (!LoadCudaApi(&cuda, &cuda_load_error)) {
+        result.summary = L"NVIDIA NVDEC \u63A2\u6D4B\uff1A" + cuda_load_error;
+        return result;
+    }
+
+    const CUresult init_result = cuda.init(0);
     if (init_result != CUDA_SUCCESS) {
-        result.summary = L"NVIDIA NVDEC \u63A2\u6D4B\uff1ACUDA \u9A71\u52A8\u521D\u59CB\u5316\u5931\u8D25\uff0C" + CudaErrorText(init_result);
+        result.summary = L"NVIDIA NVDEC \u63A2\u6D4B\uff1ACUDA \u9A71\u52A8\u521D\u59CB\u5316\u5931\u8D25\uff0C" + CudaErrorText(cuda, init_result);
+        UnloadCudaApi(&cuda);
         return result;
     }
     result.cuda_driver_ready = true;
 
     int device_count = 0;
-    const CUresult count_result = cuDeviceGetCount(&device_count);
+    const CUresult count_result = cuda.device_get_count(&device_count);
     if (count_result != CUDA_SUCCESS) {
-        result.summary = L"NVIDIA NVDEC \u63A2\u6D4B\uff1A\u65E0\u6CD5\u8BFB\u53D6 CUDA \u8BBE\u5907\u6570\u91CF\uff0C" + CudaErrorText(count_result);
+        result.summary = L"NVIDIA NVDEC \u63A2\u6D4B\uff1A\u65E0\u6CD5\u8BFB\u53D6 CUDA \u8BBE\u5907\u6570\u91CF\uff0C" + CudaErrorText(cuda, count_result);
+        UnloadCudaApi(&cuda);
         return result;
     }
     if (device_count <= 0) {
         result.summary = L"NVIDIA NVDEC \u63A2\u6D4B\uff1A\u5F53\u524D\u6CA1\u6709\u53EF\u7528\u7684 CUDA \u8BBE\u5907\u3002";
+        UnloadCudaApi(&cuda);
         return result;
     }
 
     CUdevice device = 0;
-    const CUresult device_result = cuDeviceGet(&device, 0);
+    const CUresult device_result = cuda.device_get(&device, 0);
     if (device_result != CUDA_SUCCESS) {
-        result.summary = L"NVIDIA NVDEC \u63A2\u6D4B\uff1A\u65E0\u6CD5\u6253\u5F00\u7B2C\u4E00\u5757 CUDA \u8BBE\u5907\uff0C" + CudaErrorText(device_result);
+        result.summary = L"NVIDIA NVDEC \u63A2\u6D4B\uff1A\u65E0\u6CD5\u6253\u5F00\u7B2C\u4E00\u5757 CUDA \u8BBE\u5907\uff0C" + CudaErrorText(cuda, device_result);
+        UnloadCudaApi(&cuda);
         return result;
     }
 
     char device_name[256] = {};
-    if (cuDeviceGetName(device_name, static_cast<int>(sizeof(device_name)), device) == CUDA_SUCCESS) {
+    if (cuda.device_get_name(device_name, static_cast<int>(sizeof(device_name)), device) == CUDA_SUCCESS) {
         result.gpu_name = Utf8ToWide(device_name);
     }
 
     ScopedCudaContext probe_context;
     std::wstring context_error;
-    if (!CreateProbeContext(device, &probe_context, &context_error)) {
+    if (!CreateProbeContext(cuda, device, &probe_context, &context_error)) {
         result.summary = L"NVIDIA NVDEC \u63A2\u6D4B\uff1A\u5DF2\u627E\u5230 CUDA \u8BBE\u5907\uff0C\u4F46\u521D\u59CB\u5316\u63A2\u6D4B\u4E0A\u4E0B\u6587\u5931\u8D25\uff0C" + context_error;
+        UnloadCudaApi(&cuda);
         return result;
     }
 
@@ -187,6 +274,7 @@ NvidiaCuvidProbeResult ProbeNvidiaCuvidSupport() {
     std::wstring load_error;
     if (!LoadCuvidApi(&api, &load_error)) {
         result.summary = L"NVIDIA NVDEC \u63A2\u6D4B\uff1ACUDA \u5DF2\u5C31\u7EEA\uff0C\u4F46 CUVID \u8FD0\u884C\u5E93\u4E0D\u53EF\u7528\uff0C" + load_error;
+        UnloadCudaApi(&cuda);
         return result;
     }
     result.cuvid_library_ready = true;
@@ -198,8 +286,9 @@ NvidiaCuvidProbeResult ProbeNvidiaCuvidSupport() {
 
     const CUresult caps_result = api.cuvid_get_decoder_caps(&caps);
     if (caps_result != CUDA_SUCCESS) {
-        result.summary = L"NVIDIA NVDEC \u63A2\u6D4B\uff1ACUVID \u5DF2\u52A0\u8F7D\uff0C\u4F46\u8BFB\u53D6 H.264 \u89E3\u7801\u80FD\u529B\u5931\u8D25\uff0C" + CudaErrorText(caps_result);
+        result.summary = L"NVIDIA NVDEC \u63A2\u6D4B\uff1ACUVID \u5DF2\u52A0\u8F7D\uff0C\u4F46\u8BFB\u53D6 H.264 \u89E3\u7801\u80FD\u529B\u5931\u8D25\uff0C" + CudaErrorText(cuda, caps_result);
         UnloadCuvidApi(&api);
+        UnloadCudaApi(&cuda);
         return result;
     }
 
@@ -224,6 +313,7 @@ NvidiaCuvidProbeResult ProbeNvidiaCuvidSupport() {
     result.summary = stream.str();
 
     UnloadCuvidApi(&api);
+    UnloadCudaApi(&cuda);
     return result;
 #endif
 }

@@ -10,6 +10,16 @@
 
 namespace {
 
+using MFCreateVirtualCameraFn = HRESULT(WINAPI*)(
+    MFVirtualCameraType,
+    MFVirtualCameraLifetime,
+    MFVirtualCameraAccess,
+    PCWSTR,
+    PCWSTR,
+    IMFAttributes*,
+    ULONG,
+    IMFVirtualCamera**);
+
 std::wstring QueryInstalledMediaSourcePath() {
     HKEY key = nullptr;
     const std::wstring registry_path =
@@ -54,6 +64,29 @@ void DestroyVirtualCamera(IMFVirtualCamera*& camera) {
         camera->Release();
         camera = nullptr;
     }
+}
+
+MFCreateVirtualCameraFn ResolveMFCreateVirtualCamera() {
+    static MFCreateVirtualCameraFn create_virtual_camera = []() -> MFCreateVirtualCameraFn {
+        const wchar_t* module_names[] = {L"mfplat.dll", L"mf.dll"};
+        for (const auto* module_name : module_names) {
+            HMODULE module = GetModuleHandleW(module_name);
+            if (module == nullptr) {
+                module = LoadLibraryW(module_name);
+            }
+            if (module == nullptr) {
+                continue;
+            }
+
+            auto* function = reinterpret_cast<MFCreateVirtualCameraFn>(GetProcAddress(module, "MFCreateVirtualCamera"));
+            if (function != nullptr) {
+                return function;
+            }
+        }
+        return nullptr;
+    }();
+
+    return create_virtual_camera;
 }
 
 }  // namespace
@@ -161,6 +194,10 @@ bool VirtualCameraController::Start() {
             last_error_ = L"\u865A\u62DF\u6444\u50CF\u5934\u7EC4\u4EF6\u5C1A\u672A\u5B89\u88C5\u3002";
             return false;
         }
+        if (ResolveMFCreateVirtualCamera() == nullptr) {
+            last_error_ = L"\u5F53\u524D Windows \u7248\u672C\u4E0D\u652F\u6301\u865A\u62DF\u6444\u50CF\u5934\u63A5\u53E3 MFCreateVirtualCamera\u3002";
+            return false;
+        }
 
         last_error_.clear();
         desired_running_ = true;
@@ -263,7 +300,9 @@ void VirtualCameraController::WorkerMain() {
 
         if (should_run) {
             IMFVirtualCamera* new_camera = nullptr;
-            HRESULT start_hr = MFCreateVirtualCamera(
+            auto* create_virtual_camera = ResolveMFCreateVirtualCamera();
+            HRESULT start_hr = create_virtual_camera != nullptr
+                ? create_virtual_camera(
                 MFVirtualCameraType_SoftwareCameraSource,
                 MFVirtualCameraLifetime_Session,
                 MFVirtualCameraAccess_CurrentUser,
@@ -271,7 +310,8 @@ void VirtualCameraController::WorkerMain() {
                 virtual_camera::kMediaSourceClsidString,
                 nullptr,
                 0,
-                &new_camera);
+                &new_camera)
+                : HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
             if (SUCCEEDED(start_hr)) {
                 start_hr = new_camera->Start(nullptr);
             }

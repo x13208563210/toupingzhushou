@@ -14,6 +14,16 @@
 
 namespace {
 
+using MFCreateVirtualCameraFn = HRESULT(WINAPI*)(
+    MFVirtualCameraType,
+    MFVirtualCameraLifetime,
+    MFVirtualCameraAccess,
+    PCWSTR,
+    PCWSTR,
+    IMFAttributes*,
+    ULONG,
+    IMFVirtualCamera**);
+
 std::wstring HrToString(HRESULT hr) {
     std::wostringstream stream;
     stream << L"0x" << std::hex << std::uppercase << hr;
@@ -101,6 +111,29 @@ std::wstring QueryRegisteredPath() {
         value.resize(end);
     }
     return value;
+}
+
+MFCreateVirtualCameraFn ResolveMFCreateVirtualCamera() {
+    static MFCreateVirtualCameraFn create_virtual_camera = []() -> MFCreateVirtualCameraFn {
+        const wchar_t* module_names[] = {L"mfplat.dll", L"mf.dll"};
+        for (const auto* module_name : module_names) {
+            HMODULE module = GetModuleHandleW(module_name);
+            if (module == nullptr) {
+                module = LoadLibraryW(module_name);
+            }
+            if (module == nullptr) {
+                continue;
+            }
+
+            auto* function = reinterpret_cast<MFCreateVirtualCameraFn>(GetProcAddress(module, "MFCreateVirtualCamera"));
+            if (function != nullptr) {
+                return function;
+            }
+        }
+        return nullptr;
+    }();
+
+    return create_virtual_camera;
 }
 
 HRESULT InstallMediaSource(const std::wstring& dll_path) {
@@ -307,8 +340,13 @@ HRESULT StartVirtualCamera(IMFVirtualCamera** camera) {
     }
     *camera = nullptr;
 
+    auto* create_virtual_camera = ResolveMFCreateVirtualCamera();
+    if (create_virtual_camera == nullptr) {
+        return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+    }
+
     IMFVirtualCamera* raw_camera = nullptr;
-    HRESULT hr = MFCreateVirtualCamera(
+    HRESULT hr = create_virtual_camera(
         MFVirtualCameraType_SoftwareCameraSource,
         MFVirtualCameraLifetime_Session,
         MFVirtualCameraAccess_CurrentUser,

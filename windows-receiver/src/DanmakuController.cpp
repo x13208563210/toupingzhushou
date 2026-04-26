@@ -1,15 +1,23 @@
 #include "DanmakuController.h"
 
 #include <Windows.h>
+#include <d3d11.h>
 #include <objbase.h>
+#include <oleacc.h>
 #include <UIAutomationClient.h>
 #include <mmsystem.h>
 #include <sapi.h>
+#include <windows.graphics.capture.interop.h>
+#include <windows.graphics.directx.direct3d11.interop.h>
 #include <windowsx.h>
 
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Graphics.h>
+#include <winrt/Windows.Graphics.Capture.h>
+#include <winrt/Windows.Graphics.DirectX.h>
+#include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 #include <winrt/Windows.Graphics.Imaging.h>
 #include <winrt/Windows.Media.Ocr.h>
 #include <winrt/Windows.Storage.Streams.h>
@@ -18,6 +26,7 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <cstring>
 #include <cmath>
 #include <cstdio>
 #include <cwctype>
@@ -29,12 +38,15 @@
 
 namespace {
 
+#pragma comment(lib, "Oleacc.lib")
+
 constexpr wchar_t kRegionOverlayClassName[] = L"LiveCastDanmakuRegionOverlay";
 constexpr int kMinSelectionSize = 18;
 constexpr ULONGLONG kDedupeWindowMs = 2500;
 constexpr ULONGLONG kGiftCooldownMs = 4500;
 constexpr int kUiProbeDelayMs = 3000;
 constexpr int kUiLivePollIntervalMs = 180;
+constexpr size_t kUiInitialCatchupLines = 4;
 constexpr size_t kMaxRecentEvents = 12;
 constexpr size_t kMaxProbeLines = 10;
 constexpr size_t kMaxUiLiveVisibleLines = 40;
@@ -42,7 +54,10 @@ constexpr size_t kMaxDedupeEntries = 32;
 constexpr size_t kMaxSpeechQueue = 6;
 constexpr int kGiftStableFrames = 2;
 constexpr int kGiftHashTolerance = 10;
+constexpr int kUiReadDedupeBucketPx = 12;
 constexpr UINT kOverlayAlpha = 118;
+constexpr DWORD kGraphicsCaptureFrameWaitMs = 220;
+constexpr int kGraphicsCaptureMaxAttempts = 4;
 
 struct OverlaySelectionContext {
     RECT bounds{};
@@ -53,6 +68,34 @@ struct OverlaySelectionContext {
     bool finished = false;
     bool cancelled = true;
     bool has_selection = false;
+};
+
+struct ScopedComApartment {
+    HRESULT init_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+    ~ScopedComApartment() {
+        if (SUCCEEDED(init_result)) {
+            CoUninitialize();
+        }
+    }
+
+    bool ready() const {
+        return SUCCEEDED(init_result) || init_result == RPC_E_CHANGED_MODE;
+    }
+};
+
+struct GraphicsCaptureDeviceContext {
+    std::mutex mutex;
+    winrt::com_ptr<ID3D11Device> d3d_device;
+    winrt::com_ptr<ID3D11DeviceContext> d3d_context;
+    winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice winrt_device{nullptr};
+};
+
+struct RawCaptureFrame {
+    int width = 0;
+    int height = 0;
+    RECT screen_rect{};
+    std::vector<uint8_t> pixels;
 };
 
 std::wstring TrimWhitespace(const std::wstring& text) {
@@ -83,6 +126,28 @@ bool ContainsChinese(const std::wstring& text) {
     return std::any_of(text.begin(), text.end(), [](wchar_t ch) {
         return ch >= 0x3400 && ch <= 0x9FFF;
     });
+}
+
+int CountChineseChars(const std::wstring& text) {
+    int count = 0;
+    for (wchar_t ch : text) {
+        if (ch >= 0x3400 && ch <= 0x9FFF) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+int CountAsciiLettersAndDigits(const std::wstring& text) {
+    int count = 0;
+    for (wchar_t ch : text) {
+        if ((ch >= L'0' && ch <= L'9') ||
+            (ch >= L'a' && ch <= L'z') ||
+            (ch >= L'A' && ch <= L'Z')) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 std::wstring ReadWindowText(HWND hwnd) {
@@ -145,6 +210,307 @@ std::wstring GetDanmakuReminderSoundPath() {
         return {};
     }
     return sound_path.wstring();
+}
+
+std::wstring GetGiftReminderSoundPath() {
+    const std::wstring executable_directory = GetExecutableDirectoryPath();
+    if (executable_directory.empty()) {
+        return {};
+    }
+
+    const std::filesystem::path sound_path =
+        std::filesystem::path(executable_directory) / L"gift-reminder.wav";
+    std::error_code error;
+    if (!std::filesystem::exists(sound_path, error) || error) {
+        return {};
+    }
+    return sound_path.wstring();
+}
+
+GraphicsCaptureDeviceContext& GetGraphicsCaptureDeviceContext() {
+    static GraphicsCaptureDeviceContext context;
+    return context;
+}
+
+bool EnsureGraphicsCaptureDevice(std::wstring* error) {
+    auto& context = GetGraphicsCaptureDeviceContext();
+    std::lock_guard<std::mutex> lock(context.mutex);
+    if (context.d3d_device != nullptr &&
+        context.d3d_context != nullptr &&
+        context.winrt_device != nullptr) {
+        return true;
+    }
+
+    UINT device_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    D3D_FEATURE_LEVEL feature_levels[] = {
+        D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0,
+    };
+    D3D_FEATURE_LEVEL created_level = D3D_FEATURE_LEVEL_10_0;
+
+    HRESULT hr = D3D11CreateDevice(
+        nullptr,
+        D3D_DRIVER_TYPE_HARDWARE,
+        nullptr,
+        device_flags,
+        feature_levels,
+        static_cast<UINT>(std::size(feature_levels)),
+        D3D11_SDK_VERSION,
+        context.d3d_device.put(),
+        &created_level,
+        context.d3d_context.put());
+    if (FAILED(hr)) {
+        hr = D3D11CreateDevice(
+            nullptr,
+            D3D_DRIVER_TYPE_WARP,
+            nullptr,
+            device_flags,
+            feature_levels,
+            static_cast<UINT>(std::size(feature_levels)),
+            D3D11_SDK_VERSION,
+            context.d3d_device.put(),
+            &created_level,
+            context.d3d_context.put());
+    }
+    if (FAILED(hr) || context.d3d_device == nullptr || context.d3d_context == nullptr) {
+        if (error != nullptr) {
+            *error = L"\u65e0\u6cd5\u521d\u59cb\u5316 Windows \u7a97\u53e3\u753b\u9762\u6293\u53d6\u8bbe\u5907";
+        }
+        context.d3d_device = nullptr;
+        context.d3d_context = nullptr;
+        context.winrt_device = nullptr;
+        return false;
+    }
+
+    winrt::com_ptr<IDXGIDevice> dxgi_device = context.d3d_device.as<IDXGIDevice>();
+    winrt::com_ptr<::IInspectable> inspectable;
+    hr = CreateDirect3D11DeviceFromDXGIDevice(dxgi_device.get(), inspectable.put());
+    if (FAILED(hr) || inspectable == nullptr) {
+        if (error != nullptr) {
+            *error = L"\u65e0\u6cd5\u521d\u59cb\u5316 Windows \u7a97\u53e3\u753b\u9762\u6293\u53d6 WinRT \u8bbe\u5907";
+        }
+        context.d3d_device = nullptr;
+        context.d3d_context = nullptr;
+        context.winrt_device = nullptr;
+        return false;
+    }
+
+    context.winrt_device =
+        inspectable.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
+    return context.winrt_device != nullptr;
+}
+
+bool CreateGraphicsCaptureItemForWindow(
+    HWND target_window,
+    winrt::Windows::Graphics::Capture::GraphicsCaptureItem* item,
+    std::wstring* error) {
+    if (item == nullptr) {
+        if (error != nullptr) {
+            *error = L"\u5185\u90e8\u9519\u8bef";
+        }
+        return false;
+    }
+
+    if (!winrt::Windows::Graphics::Capture::GraphicsCaptureSession::IsSupported()) {
+        if (error != nullptr) {
+            *error = L"\u5f53\u524d Windows \u7248\u672c\u4e0d\u652f\u6301\u6309\u7a97\u53e3\u53e5\u67c4\u6293\u53d6";
+        }
+        return false;
+    }
+
+    try {
+        const auto interop = winrt::get_activation_factory<
+            winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
+            IGraphicsCaptureItemInterop>();
+        HRESULT hr = interop->CreateForWindow(
+            target_window,
+            winrt::guid_of<winrt::Windows::Graphics::Capture::GraphicsCaptureItem>(),
+            winrt::put_abi(*item));
+        if (FAILED(hr) || *item == nullptr) {
+            if (error != nullptr) {
+                *error = L"\u65e0\u6cd5\u4e3a\u5f39\u5e55\u60ac\u6d6e\u7a97\u521b\u5efa\u53e5\u67c4\u6293\u53d6\u9879";
+            }
+            return false;
+        }
+        return true;
+    } catch (const winrt::hresult_error& exception) {
+        if (error != nullptr) {
+            std::wostringstream stream;
+            stream << L"\u521b\u5efa\u7a97\u53e3\u6293\u53d6\u9879\u5931\u8d25\uff0c\u9519\u8bef 0x" << std::hex << exception.code().value;
+            *error = stream.str();
+        }
+        return false;
+    }
+}
+
+bool CopyTexturePixelsToFrameCapture(
+    ID3D11Texture2D* texture,
+    const RECT& screen_rect,
+    RawCaptureFrame* frame,
+    std::wstring* error) {
+    if (texture == nullptr || frame == nullptr) {
+        if (error != nullptr) {
+            *error = L"\u6293\u53d6\u7ed3\u679c\u4e3a\u7a7a";
+        }
+        return false;
+    }
+
+    auto& context = GetGraphicsCaptureDeviceContext();
+    std::lock_guard<std::mutex> lock(context.mutex);
+    if (context.d3d_device == nullptr || context.d3d_context == nullptr) {
+        if (error != nullptr) {
+            *error = L"\u7a97\u53e3\u6293\u53d6\u8bbe\u5907\u672a\u521d\u59cb\u5316";
+        }
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC desc{};
+    texture->GetDesc(&desc);
+    if (desc.Width == 0 || desc.Height == 0) {
+        if (error != nullptr) {
+            *error = L"\u6293\u53d6\u753b\u9762\u5c3a\u5bf8\u65e0\u6548";
+        }
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC staging_desc = desc;
+    staging_desc.BindFlags = 0;
+    staging_desc.MiscFlags = 0;
+    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    staging_desc.Usage = D3D11_USAGE_STAGING;
+    staging_desc.ArraySize = 1;
+    staging_desc.MipLevels = 1;
+
+    winrt::com_ptr<ID3D11Texture2D> staging_texture;
+    HRESULT hr = context.d3d_device->CreateTexture2D(&staging_desc, nullptr, staging_texture.put());
+    if (FAILED(hr) || staging_texture == nullptr) {
+        if (error != nullptr) {
+            *error = L"\u65e0\u6cd5\u521b\u5efa\u7a97\u53e3\u6293\u53d6\u8bfb\u53d6\u7f13\u51b2";
+        }
+        return false;
+    }
+
+    context.d3d_context->CopyResource(staging_texture.get(), texture);
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    hr = context.d3d_context->Map(staging_texture.get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr) || mapped.pData == nullptr) {
+        if (error != nullptr) {
+            *error = L"\u65e0\u6cd5\u8bfb\u53d6\u7a97\u53e3\u6293\u53d6\u50cf\u7d20";
+        }
+        return false;
+    }
+
+    frame->width = static_cast<int>(desc.Width);
+    frame->height = static_cast<int>(desc.Height);
+    frame->screen_rect = screen_rect;
+    frame->pixels.resize(static_cast<size_t>(frame->width) * static_cast<size_t>(frame->height) * 4u);
+
+    const size_t row_bytes = static_cast<size_t>(frame->width) * 4u;
+    for (int y = 0; y < frame->height; ++y) {
+        const auto* src = static_cast<const uint8_t*>(mapped.pData) + static_cast<size_t>(mapped.RowPitch) * static_cast<size_t>(y);
+        auto* dst = frame->pixels.data() + static_cast<size_t>(y) * row_bytes;
+        std::memcpy(dst, src, row_bytes);
+    }
+
+    context.d3d_context->Unmap(staging_texture.get(), 0);
+    return true;
+}
+
+bool CaptureWindowWithGraphicsCapture(
+    HWND target_window,
+    const RECT& capture_rect,
+    RawCaptureFrame* frame,
+    std::wstring* error) {
+    if (!EnsureGraphicsCaptureDevice(error)) {
+        return false;
+    }
+
+    winrt::Windows::Graphics::Capture::GraphicsCaptureItem item{nullptr};
+    if (!CreateGraphicsCaptureItemForWindow(target_window, &item, error)) {
+        return false;
+    }
+
+    const auto item_size = item.Size();
+    if (item_size.Width <= 0 || item_size.Height <= 0) {
+        if (error != nullptr) {
+            *error = L"\u5f39\u5e55\u60ac\u6d6e\u7a97\u5c3a\u5bf8\u65e0\u6548";
+        }
+        return false;
+    }
+
+    try {
+        auto& context = GetGraphicsCaptureDeviceContext();
+        const auto frame_pool =
+            winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
+                context.winrt_device,
+                winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                1,
+                item_size);
+        const auto session = frame_pool.CreateCaptureSession(item);
+        try {
+            session.IsCursorCaptureEnabled(false);
+        } catch (...) {
+        }
+        try {
+            session.IsBorderRequired(false);
+        } catch (...) {
+        }
+
+        winrt::handle frame_ready_event(CreateEventW(nullptr, FALSE, FALSE, nullptr));
+        if (!frame_ready_event) {
+            if (error != nullptr) {
+                *error = L"\u65e0\u6cd5\u521b\u5efa\u7a97\u53e3\u6293\u53d6\u540c\u6b65\u4e8b\u4ef6";
+            }
+            return false;
+        }
+
+        const auto frame_ready_handle = frame_ready_event.get();
+        const auto token = frame_pool.FrameArrived([frame_ready_handle](auto&, auto&) {
+            SetEvent(frame_ready_handle);
+        });
+
+        session.StartCapture();
+
+        winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame capture_frame{nullptr};
+        for (int attempt = 0; attempt < kGraphicsCaptureMaxAttempts && capture_frame == nullptr; ++attempt) {
+            WaitForSingleObject(frame_ready_event.get(), kGraphicsCaptureFrameWaitMs);
+            capture_frame = frame_pool.TryGetNextFrame();
+        }
+        frame_pool.FrameArrived(token);
+
+        if (capture_frame == nullptr) {
+            if (error != nullptr) {
+                *error = L"\u7a97\u53e3\u753b\u9762\u6293\u53d6\u8d85\u65f6\uff0c\u672a\u53d6\u5230\u5f39\u5e55\u5e27";
+            }
+            return false;
+        }
+
+        const auto surface = capture_frame.Surface();
+        const auto dxgi_access =
+            surface.as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
+        winrt::com_ptr<ID3D11Texture2D> texture;
+        HRESULT hr = dxgi_access->GetInterface(
+            __uuidof(ID3D11Texture2D),
+            texture.put_void());
+        if (FAILED(hr) || texture == nullptr) {
+            if (error != nullptr) {
+                *error = L"\u65e0\u6cd5\u5c06\u7a97\u53e3\u6293\u53d6\u5e27\u8f6c\u4e3a D3D11 \u7eb9\u7406";
+            }
+            return false;
+        }
+
+        return CopyTexturePixelsToFrameCapture(texture.get(), capture_rect, frame, error);
+    } catch (const winrt::hresult_error& exception) {
+        if (error != nullptr) {
+            std::wostringstream stream;
+            stream << L"\u7a97\u53e3\u753b\u9762\u6293\u53d6\u5931\u8d25\uff0c\u9519\u8bef 0x" << std::hex << exception.code().value;
+            *error = stream.str();
+        }
+        return false;
+    }
 }
 
 std::wstring ReadSpeechVoiceName(ISpObjectToken* token) {
@@ -442,6 +808,12 @@ std::wstring NormalizeUiCompareText(const std::wstring& text) {
 
 std::wstring CleanUiDanmakuText(const std::wstring& text) {
     std::wstring cleaned = TrimWhitespace(text);
+    while (cleaned.size() >= 4 &&
+           cleaned.size() % 2 == 0 &&
+           cleaned.substr(0, cleaned.size() / 2) == cleaned.substr(cleaned.size() / 2)) {
+        cleaned = TrimWhitespace(cleaned.substr(0, cleaned.size() / 2));
+    }
+
     size_t cut_pos = std::wstring::npos;
     for (const auto& token : {std::wstring(L"\u6253\u8d4f\u7b49\u7ea7"), std::wstring(L"\u7c89\u4e1d\u56e2\u7b49\u7ea7")}) {
         const size_t pos = cleaned.find(token);
@@ -451,6 +823,19 @@ std::wstring CleanUiDanmakuText(const std::wstring& text) {
     }
     if (cut_pos != std::wstring::npos) {
         cleaned = TrimWhitespace(cleaned.substr(0, cut_pos));
+    }
+
+    const size_t colon_pos = cleaned.find(L'\uff1a');
+    const size_t ascii_colon_pos = cleaned.find(L':');
+    const size_t separator = colon_pos != std::wstring::npos ? colon_pos : ascii_colon_pos;
+    if (separator != std::wstring::npos) {
+        const std::wstring left = TrimWhitespace(cleaned.substr(0, separator));
+        const std::wstring right = TrimWhitespace(cleaned.substr(separator + 1));
+        if (!right.empty() &&
+            CountChineseChars(left) == 0 &&
+            CountAsciiLettersAndDigits(left) == 0) {
+            cleaned = right;
+        }
     }
     return cleaned;
 }
@@ -465,9 +850,59 @@ bool IsUiGiftMessageText(const std::wstring& text) {
         normalized.find(L"\u5c0f\u5fc3\u5fc3") != std::wstring::npos;
 }
 
+bool IsUiSystemNoticeText(const std::wstring& text) {
+    const std::wstring normalized = NormalizeUiCompareText(text);
+    if (normalized.empty()) {
+        return true;
+    }
+
+    static const wchar_t* const kSystemNoticeTokens[] = {
+        L"\u901a\u77e5",
+        L"\u4e3b\u9898",
+        L"\u901a\u8fc7\u76f4\u64ad\u63a8",
+        L"\u901a\u8fc7\u76f4\u64ad\u63a8\u8350\u8fdb\u5165",
+        L"\u6b22\u8fce\u6765\u5230\u76f4",
+        L"\u8fdb\u5165\u76f4\u64ad\u95f4",
+        L"\u6b22\u8fce\u6765\u5230\u76f4\u64ad\u95f4",
+        L"\u6253\u8d4f\u793c\u7269",
+        L"\u79c1\u4e0b\u4ea4\u6613",
+        L"\u7406\u6027\u6d88\u8d39",
+        L"\u8fdd\u89c4\u884c\u4e3a",
+        L"\u8bf7\u53ca\u65f6\u6295\u8bc9",
+        L"\u76f4\u64ad\u95f4\u5185\u7981\u6b62",
+        L"\u76f4\u64ad\u53ca\u8fde\u9ea6\u65f6\u7981\u6b62",
+        L"\u5e73\u53f0\u6d41\u91cf\u6276\u6301\u5df2\u5f00\u542f",
+        L"\u4e3b\u64ad\u6210\u957f\u5361",
+        L"\u5feb\u70b9\u51fb\u53bb\u4f7f\u7528\u5427",
+        L"\u6682\u65e0\u89c2\u4f17\u9001\u793c",
+    };
+    for (const auto* token : kSystemNoticeTokens) {
+        if (normalized.find(token) != std::wstring::npos) {
+            return true;
+        }
+    }
+
+    const size_t colon_pos = normalized.find(L':');
+    const size_t fullwidth_colon_pos = normalized.find(L'\uff1a');
+    const size_t separator = colon_pos != std::wstring::npos ? colon_pos : fullwidth_colon_pos;
+    if (separator == std::wstring::npos &&
+        normalized.starts_with(L"\u4e3b\u64ad") &&
+        (normalized.find(L"\u5929") != std::wstring::npos ||
+         normalized.find(L"\u5468") != std::wstring::npos ||
+         normalized.find(L"\u6708") != std::wstring::npos ||
+         normalized.find(L"\u5e74") != std::wstring::npos)) {
+        return true;
+    }
+
+    return false;
+}
+
 bool IsUiDanmakuMessageText(const std::wstring& text) {
     const std::wstring cleaned = CleanUiDanmakuText(text);
     if (cleaned.empty()) {
+        return false;
+    }
+    if (IsUiSystemNoticeText(cleaned)) {
         return false;
     }
 
@@ -491,7 +926,7 @@ bool IsUiDanmakuMessageText(const std::wstring& text) {
     if (separator != std::wstring::npos) {
         const std::wstring left = TrimWhitespace(cleaned.substr(0, separator));
         const std::wstring right = TrimWhitespace(cleaned.substr(separator + 1));
-        return !left.empty() && !right.empty();
+        return !left.empty() && !right.empty() && right.size() <= 48;
     }
 
     return IsUiGiftMessageText(cleaned);
@@ -511,14 +946,14 @@ bool IsUiTextDanmakuText(const std::wstring& text) {
     return !left.empty() && !right.empty();
 }
 
-size_t FindUiLineOverlap(const std::deque<std::wstring>& previous_lines, const std::vector<std::wstring>& current_lines) {
+size_t FindUiLineOverlap(const std::vector<std::wstring>& previous_lines, const std::vector<std::wstring>& current_lines) {
     const size_t max_overlap = std::min(previous_lines.size(), current_lines.size());
     for (size_t overlap = max_overlap; overlap > 0; --overlap) {
         bool matched = true;
         for (size_t index = 0; index < overlap; ++index) {
             const auto& left = previous_lines[previous_lines.size() - overlap + index];
             const auto& right = current_lines[index];
-            if (NormalizeUiCompareText(left) != NormalizeUiCompareText(right)) {
+            if (left != right) {
                 matched = false;
                 break;
             }
@@ -531,32 +966,20 @@ size_t FindUiLineOverlap(const std::deque<std::wstring>& previous_lines, const s
 }
 
 std::vector<size_t> CollectUiFreshLineIndicesByLcs(
-    const std::deque<std::wstring>& previous_lines,
+    const std::vector<std::wstring>& previous_lines,
     const std::vector<std::wstring>& current_lines) {
     std::vector<size_t> fresh_indices;
     if (previous_lines.empty() || current_lines.empty()) {
         return fresh_indices;
     }
 
-    std::vector<std::wstring> previous_normalized;
-    previous_normalized.reserve(previous_lines.size());
-    for (const auto& line : previous_lines) {
-        previous_normalized.push_back(NormalizeUiCompareText(line));
-    }
-
-    std::vector<std::wstring> current_normalized;
-    current_normalized.reserve(current_lines.size());
-    for (const auto& line : current_lines) {
-        current_normalized.push_back(NormalizeUiCompareText(line));
-    }
-
     std::vector<std::vector<int>> lcs(
-        previous_normalized.size() + 1,
-        std::vector<int>(current_normalized.size() + 1, 0));
-    for (size_t prev_index = 1; prev_index <= previous_normalized.size(); ++prev_index) {
-        for (size_t current_index = 1; current_index <= current_normalized.size(); ++current_index) {
-            if (!previous_normalized[prev_index - 1].empty() &&
-                previous_normalized[prev_index - 1] == current_normalized[current_index - 1]) {
+        previous_lines.size() + 1,
+        std::vector<int>(current_lines.size() + 1, 0));
+    for (size_t prev_index = 1; prev_index <= previous_lines.size(); ++prev_index) {
+        for (size_t current_index = 1; current_index <= current_lines.size(); ++current_index) {
+            if (!previous_lines[prev_index - 1].empty() &&
+                previous_lines[prev_index - 1] == current_lines[current_index - 1]) {
                 lcs[prev_index][current_index] = lcs[prev_index - 1][current_index - 1] + 1;
             } else {
                 lcs[prev_index][current_index] =
@@ -565,12 +988,12 @@ std::vector<size_t> CollectUiFreshLineIndicesByLcs(
         }
     }
 
-    std::vector<bool> matched_current(current_normalized.size(), false);
-    size_t prev_index = previous_normalized.size();
-    size_t current_index = current_normalized.size();
+    std::vector<bool> matched_current(current_lines.size(), false);
+    size_t prev_index = previous_lines.size();
+    size_t current_index = current_lines.size();
     while (prev_index > 0 && current_index > 0) {
-        if (!previous_normalized[prev_index - 1].empty() &&
-            previous_normalized[prev_index - 1] == current_normalized[current_index - 1] &&
+        if (!previous_lines[prev_index - 1].empty() &&
+            previous_lines[prev_index - 1] == current_lines[current_index - 1] &&
             lcs[prev_index][current_index] == lcs[prev_index - 1][current_index - 1] + 1) {
             matched_current[current_index - 1] = true;
             --prev_index;
@@ -584,8 +1007,8 @@ std::vector<size_t> CollectUiFreshLineIndicesByLcs(
         }
     }
 
-    for (size_t index = 0; index < current_normalized.size(); ++index) {
-        if (!matched_current[index] && !current_normalized[index].empty()) {
+    for (size_t index = 0; index < current_lines.size(); ++index) {
+        if (!matched_current[index] && !current_lines[index].empty()) {
             fresh_indices.push_back(index);
         }
     }
@@ -595,14 +1018,121 @@ std::vector<size_t> CollectUiFreshLineIndicesByLcs(
 struct UiDanmakuReadResult {
     std::wstring target_title;
     std::vector<std::wstring> lines;
+    std::vector<std::wstring> compare_keys;
     std::wstring error;
 };
 
+struct UiElementSnapshot {
+    CONTROLTYPEID control_type = 0;
+    std::wstring class_name;
+    RECT bounds{};
+    std::wstring runtime_id;
+    std::vector<std::wstring> texts;
+};
+
+struct UiCollectedLine {
+    std::wstring text;
+    std::wstring compare_key;
+    RECT bounds{};
+    bool is_gift_marker = false;
+};
+
+std::wstring ReadAccessibleName(IAccessible* accessible, VARIANT child);
+std::wstring ReadAccessibleValue(IAccessible* accessible, VARIANT child);
+std::wstring ReadAccessibleDescription(IAccessible* accessible, VARIANT child);
+bool ReadAccessibleBounds(IAccessible* accessible, VARIANT child, RECT* bounds);
+std::vector<std::wstring> ReadAccessibleTextCandidates(IAccessible* accessible, VARIANT child);
+void CollectMsaaDanmakuLinesFromAccessible(
+    IAccessible* accessible,
+    int depth,
+    size_t max_nodes,
+    size_t* visited_nodes,
+    std::vector<UiCollectedLine>* lines);
+std::vector<UiCollectedLine> ReadMsaaDanmakuLines(HWND target_window);
+
 std::wstring ReadElementName(IUIAutomationElement* element);
 std::wstring ReadElementClassName(IUIAutomationElement* element);
+std::wstring ReadElementRuntimeId(IUIAutomationElement* element);
 std::wstring ControlTypeLabel(CONTROLTYPEID control_type);
 bool IsIgnoredUiProbeText(const std::wstring& text);
 int ScoreUiProbeText(const std::wstring& text, CONTROLTYPEID control_type);
+void AppendUniqueUiText(std::vector<std::wstring>* texts, const std::wstring& text);
+std::vector<std::wstring> ReadElementTextCandidates(IUIAutomationElement* element);
+bool CollectUiElementSnapshots(
+    IUIAutomation* automation,
+    IUIAutomationElement* root,
+    size_t max_elements,
+    std::vector<UiElementSnapshot>* snapshots);
+bool IsUiGiftCounterText(const std::wstring& text);
+std::wstring NormalizeUiGiftCounterText(const std::wstring& text);
+std::wstring BuildUiGiftMarkerCompareKey(const RECT& bounds, const std::wstring& marker_text);
+bool IsUiGiftMarkerLineInGiftBand(const UiCollectedLine& line, int first_text_top, const RECT& window_bounds);
+
+int BuildUiReadDedupeBucket(const RECT& bounds) {
+    const bool valid = bounds.bottom > bounds.top && bounds.right > bounds.left;
+    if (!valid) {
+        return std::numeric_limits<int>::min();
+    }
+    const int center_y = bounds.top + ((bounds.bottom - bounds.top) / 2);
+    return center_y / kUiReadDedupeBucketPx;
+}
+
+std::wstring BuildUiReadDedupeKey(const std::wstring& normalized_text, const RECT& bounds) {
+    if (normalized_text.empty()) {
+        return {};
+    }
+    const int bucket = BuildUiReadDedupeBucket(bounds);
+    if (bucket == std::numeric_limits<int>::min()) {
+        return normalized_text;
+    }
+    return normalized_text + L"@" + std::to_wstring(bucket);
+}
+
+bool HasValidBounds(const RECT& bounds) {
+    return bounds.right > bounds.left && bounds.bottom > bounds.top;
+}
+
+std::wstring BuildUiCompareBaseKey(const UiElementSnapshot&, const std::wstring& normalized_text) {
+    if (!normalized_text.empty()) {
+        return L"text:" + normalized_text;
+    }
+    return {};
+}
+
+std::vector<std::wstring> BuildUiOccurrenceKeys(const std::vector<std::wstring>& base_keys) {
+    std::vector<std::wstring> occurrence_keys;
+    occurrence_keys.reserve(base_keys.size());
+
+    std::vector<std::pair<std::wstring, size_t>> seen_counts;
+    seen_counts.reserve(base_keys.size());
+    for (const auto& raw_key : base_keys) {
+        const std::wstring key = TrimWhitespace(raw_key);
+        if (key.empty()) {
+            occurrence_keys.push_back({});
+            continue;
+        }
+
+        size_t occurrence = 1;
+        auto it = std::find_if(seen_counts.begin(), seen_counts.end(), [&key](const auto& entry) {
+            return entry.first == key;
+        });
+        if (it == seen_counts.end()) {
+            seen_counts.emplace_back(key, 1);
+        } else {
+            it->second += 1;
+            occurrence = it->second;
+        }
+
+        occurrence_keys.push_back(
+            occurrence <= 1 ? key : (key + L"#" + std::to_wstring(occurrence)));
+    }
+    return occurrence_keys;
+}
+
+std::vector<std::wstring> BuildUiOccurrenceKeys(const std::deque<std::wstring>& base_keys) {
+    std::vector<std::wstring> keys(base_keys.begin(), base_keys.end());
+    return BuildUiOccurrenceKeys(keys);
+}
 
 UiDanmakuReadResult ReadUiDanmakuWindow(HWND target_window) {
     UiDanmakuReadResult result{};
@@ -612,6 +1142,40 @@ UiDanmakuReadResult ReadUiDanmakuWindow(HWND target_window) {
     }
     if (target_window == nullptr || !IsWindow(target_window)) {
         result.error = L"UIA \u76d1\u542c\u6ca1\u6293\u5230\u6709\u6548\u7a97\u53e3";
+        return result;
+    }
+
+    const std::wstring target_class_name = ReadWindowClassName(target_window);
+    const bool prefer_msaa =
+        target_class_name == L"FinderLiveCommentFloatWnd" ||
+        (ContainsCaseInsensitive(result.target_title, L"\u4e92\u52a8\u6d88\u606f") &&
+            ContainsCaseInsensitive(target_class_name, L"FinderLive"));
+    auto try_read_msaa = [&result, target_window]() -> bool {
+        const auto msaa_lines = ReadMsaaDanmakuLines(target_window);
+        if (msaa_lines.empty()) {
+            return false;
+        }
+
+        result.lines.clear();
+        result.compare_keys.clear();
+        result.lines.reserve(msaa_lines.size());
+        result.compare_keys.reserve(msaa_lines.size());
+        for (const auto& line : msaa_lines) {
+            result.lines.push_back(line.text);
+            result.compare_keys.push_back(line.compare_key);
+        }
+        if (result.lines.size() > kMaxUiLiveVisibleLines) {
+            const auto remove_count = result.lines.size() - kMaxUiLiveVisibleLines;
+            result.lines.erase(
+                result.lines.begin(),
+                result.lines.begin() + static_cast<std::ptrdiff_t>(remove_count));
+            result.compare_keys.erase(
+                result.compare_keys.begin(),
+                result.compare_keys.begin() + static_cast<std::ptrdiff_t>(remove_count));
+        }
+        return true;
+    };
+    if (prefer_msaa && try_read_msaa()) {
         return result;
     }
 
@@ -656,13 +1220,16 @@ UiDanmakuReadResult ReadUiDanmakuWindow(HWND target_window) {
         }
         return result;
     }
-
     int length = 0;
     elements->get_Length(&length);
     std::vector<std::wstring> list_item_lines;
+    std::vector<std::wstring> list_item_keys;
     std::vector<std::wstring> text_lines;
+    std::vector<std::wstring> text_keys;
     list_item_lines.reserve(64);
+    list_item_keys.reserve(64);
     text_lines.reserve(64);
+    text_keys.reserve(64);
     for (int index = 0; index < length && index < 1200; ++index) {
         winrt::com_ptr<IUIAutomationElement> element;
         if (FAILED(elements->GetElement(index, element.put())) || !element) {
@@ -671,7 +1238,8 @@ UiDanmakuReadResult ReadUiDanmakuWindow(HWND target_window) {
 
         CONTROLTYPEID control_type_id = 0;
         element->get_CurrentControlType(&control_type_id);
-        if (control_type_id != UIA_ListItemControlTypeId && control_type_id != UIA_TextControlTypeId) {
+        if (control_type_id != UIA_ListItemControlTypeId &&
+            control_type_id != UIA_TextControlTypeId) {
             continue;
         }
 
@@ -680,18 +1248,49 @@ UiDanmakuReadResult ReadUiDanmakuWindow(HWND target_window) {
             continue;
         }
 
+        const std::wstring compare_key = L"text:" + NormalizeUiCompareText(text);
         if (control_type_id == UIA_ListItemControlTypeId) {
             list_item_lines.push_back(text);
+            list_item_keys.push_back(compare_key);
         } else {
             text_lines.push_back(text);
+            text_keys.push_back(compare_key);
         }
     }
 
-    result.lines = !list_item_lines.empty() ? std::move(list_item_lines) : std::move(text_lines);
+    std::vector<std::wstring> best_lines;
+    std::vector<std::wstring> best_keys;
+    if (!list_item_lines.empty()) {
+        best_lines = std::move(list_item_lines);
+        best_keys = std::move(list_item_keys);
+    } else {
+        best_lines = std::move(text_lines);
+        best_keys = std::move(text_keys);
+    }
+
+    if (best_lines.empty() && !prefer_msaa) {
+        const auto msaa_lines = ReadMsaaDanmakuLines(target_window);
+        if (!msaa_lines.empty()) {
+            best_lines.reserve(msaa_lines.size());
+            best_keys.reserve(msaa_lines.size());
+            for (const auto& line : msaa_lines) {
+                best_lines.push_back(line.text);
+                best_keys.push_back(line.compare_key);
+            }
+        }
+    }
+
+    result.lines = std::move(best_lines);
+    result.compare_keys = std::move(best_keys);
+
     if (result.lines.size() > kMaxUiLiveVisibleLines) {
+        const auto remove_count = result.lines.size() - kMaxUiLiveVisibleLines;
         result.lines.erase(
             result.lines.begin(),
-            result.lines.end() - static_cast<std::ptrdiff_t>(kMaxUiLiveVisibleLines));
+            result.lines.begin() + static_cast<std::ptrdiff_t>(remove_count));
+        result.compare_keys.erase(
+            result.compare_keys.begin(),
+            result.compare_keys.begin() + static_cast<std::ptrdiff_t>(remove_count));
     }
 
     if (SUCCEEDED(apartment_result)) {
@@ -729,6 +1328,686 @@ std::wstring ReadElementClassName(IUIAutomationElement* element) {
         return {};
     }
     return TakeBstrAndFree(value);
+}
+
+std::wstring ReadElementRuntimeId(IUIAutomationElement* element) {
+    if (element == nullptr) {
+        return {};
+    }
+
+    SAFEARRAY* runtime_id = nullptr;
+    if (FAILED(element->GetRuntimeId(&runtime_id)) || runtime_id == nullptr) {
+        return {};
+    }
+
+    LONG lower_bound = 0;
+    LONG upper_bound = -1;
+    if (FAILED(SafeArrayGetLBound(runtime_id, 1, &lower_bound)) ||
+        FAILED(SafeArrayGetUBound(runtime_id, 1, &upper_bound)) ||
+        upper_bound < lower_bound) {
+        SafeArrayDestroy(runtime_id);
+        return {};
+    }
+
+    std::wostringstream stream;
+    for (LONG index = lower_bound; index <= upper_bound; ++index) {
+        int value = 0;
+        if (FAILED(SafeArrayGetElement(runtime_id, &index, &value))) {
+            continue;
+        }
+        if (stream.tellp() > 0) {
+            stream << L'.';
+        }
+        stream << value;
+    }
+
+    SafeArrayDestroy(runtime_id);
+    return stream.str();
+}
+
+std::wstring ReadElementHelpText(IUIAutomationElement* element) {
+    if (element == nullptr) {
+        return {};
+    }
+    BSTR value = nullptr;
+    if (FAILED(element->get_CurrentHelpText(&value))) {
+        return {};
+    }
+    return TakeBstrAndFree(value);
+}
+
+std::wstring ReadElementItemStatus(IUIAutomationElement* element) {
+    if (element == nullptr) {
+        return {};
+    }
+    BSTR value = nullptr;
+    if (FAILED(element->get_CurrentItemStatus(&value))) {
+        return {};
+    }
+    return TakeBstrAndFree(value);
+}
+
+std::wstring TakeAccessibleBstrAndFree(BSTR value) {
+    if (value == nullptr) {
+        return {};
+    }
+    std::wstring text(value, SysStringLen(value));
+    SysFreeString(value);
+    return TrimWhitespace(text);
+}
+
+std::wstring ReadAccessibleName(IAccessible* accessible, VARIANT child) {
+    if (accessible == nullptr) {
+        return {};
+    }
+    BSTR value = nullptr;
+    if (FAILED(accessible->get_accName(child, &value))) {
+        return {};
+    }
+    return TakeAccessibleBstrAndFree(value);
+}
+
+std::wstring ReadAccessibleValue(IAccessible* accessible, VARIANT child) {
+    if (accessible == nullptr) {
+        return {};
+    }
+    BSTR value = nullptr;
+    if (FAILED(accessible->get_accValue(child, &value))) {
+        return {};
+    }
+    return TakeAccessibleBstrAndFree(value);
+}
+
+std::wstring ReadAccessibleDescription(IAccessible* accessible, VARIANT child) {
+    if (accessible == nullptr) {
+        return {};
+    }
+    BSTR value = nullptr;
+    if (FAILED(accessible->get_accDescription(child, &value))) {
+        return {};
+    }
+    return TakeAccessibleBstrAndFree(value);
+}
+
+bool ReadAccessibleBounds(IAccessible* accessible, VARIANT child, RECT* bounds) {
+    if (accessible == nullptr || bounds == nullptr) {
+        return false;
+    }
+
+    long left = 0;
+    long top = 0;
+    long width = 0;
+    long height = 0;
+    if (FAILED(accessible->accLocation(&left, &top, &width, &height, child))) {
+        return false;
+    }
+    if (width <= 0 || height <= 0) {
+        return false;
+    }
+
+    bounds->left = left;
+    bounds->top = top;
+    bounds->right = left + width;
+    bounds->bottom = top + height;
+    return true;
+}
+
+std::vector<std::wstring> ReadAccessibleTextCandidates(IAccessible* accessible, VARIANT child) {
+    std::vector<std::wstring> texts;
+    AppendUniqueUiText(&texts, ReadAccessibleName(accessible, child));
+    AppendUniqueUiText(&texts, ReadAccessibleValue(accessible, child));
+    AppendUniqueUiText(&texts, ReadAccessibleDescription(accessible, child));
+    return texts;
+}
+
+std::wstring NormalizeUiGiftCounterText(const std::wstring& text) {
+    std::wstring normalized;
+    normalized.reserve(text.size());
+    for (wchar_t ch : TrimWhitespace(text)) {
+        if (std::iswspace(ch)) {
+            continue;
+        }
+        if (ch >= L'０' && ch <= L'９') {
+            normalized.push_back(static_cast<wchar_t>(L'0' + (ch - L'０')));
+            continue;
+        }
+        if (ch == L'×' || ch == L'X') {
+            normalized.push_back(L'x');
+            continue;
+        }
+        normalized.push_back(static_cast<wchar_t>(std::towlower(ch)));
+    }
+    return normalized;
+}
+
+bool IsUiGiftCounterText(const std::wstring& text) {
+    const std::wstring normalized = NormalizeUiGiftCounterText(text);
+    if (normalized.size() < 2 || normalized[0] != L'x') {
+        return false;
+    }
+
+    bool has_digit = false;
+    for (size_t index = 1; index < normalized.size(); ++index) {
+        if (!std::iswdigit(normalized[index])) {
+            return false;
+        }
+        has_digit = true;
+    }
+    return has_digit;
+}
+
+std::wstring BuildUiGiftMarkerCompareKey(const RECT& bounds, const std::wstring& marker_text) {
+    const std::wstring normalized_marker = NormalizeUiGiftCounterText(marker_text);
+    if (normalized_marker.empty()) {
+        return {};
+    }
+
+    const std::wstring vertical_key = BuildUiReadDedupeKey(normalized_marker, bounds);
+    if (!HasValidBounds(bounds)) {
+        return L"gift:" + vertical_key;
+    }
+
+    const int center_x = bounds.left + ((bounds.right - bounds.left) / 2);
+    const int horizontal_bucket = center_x / 40;
+    return L"gift:" + vertical_key + L":" + std::to_wstring(horizontal_bucket);
+}
+
+bool IsUiGiftMarkerLineInGiftBand(const UiCollectedLine& line, int first_text_top, const RECT& window_bounds) {
+    if (!line.is_gift_marker || !HasValidBounds(line.bounds)) {
+        return false;
+    }
+
+    const int width = line.bounds.right - line.bounds.left;
+    const int height = line.bounds.bottom - line.bounds.top;
+    if (width < 10 || width > 160 || height < 12 || height > 96) {
+        return false;
+    }
+
+    if (first_text_top != std::numeric_limits<int>::max()) {
+        return line.bounds.top + 8 < first_text_top;
+    }
+
+    if (!HasValidBounds(window_bounds)) {
+        return true;
+    }
+
+    const int window_height = window_bounds.bottom - window_bounds.top;
+    if (window_height <= 0) {
+        return true;
+    }
+
+    const int relative_top = line.bounds.top - window_bounds.top;
+    return relative_top >= 0 && relative_top < (window_height * 3 / 4);
+}
+
+int ScoreDanmakuCandidateText(const std::wstring& text) {
+    if (text.empty()) {
+        return std::numeric_limits<int>::min();
+    }
+
+    int score = 0;
+    if (IsUiTextDanmakuText(text)) {
+        score += 40;
+    }
+    if (IsUiGiftMessageText(text)) {
+        score += 28;
+    }
+    if (ContainsChinese(text)) {
+        score += 6;
+    }
+    if (text.size() >= 4 && text.size() <= 96) {
+        score += 4;
+    }
+    return score;
+}
+
+bool TryAppendBestAccessibleDanmakuLine(
+    const std::vector<std::wstring>& texts,
+    const RECT& bounds,
+    std::vector<UiCollectedLine>* lines) {
+    if (lines == nullptr || texts.empty()) {
+        return false;
+    }
+
+    int best_score = std::numeric_limits<int>::min();
+    std::wstring best_text;
+    for (const auto& raw_text : texts) {
+        const std::wstring cleaned = CleanUiDanmakuText(raw_text);
+        // MSAA 会暴露很多窗口说明文本，这里只接收强特征的真实弹幕/礼物文本。
+        const bool strong_text = IsUiTextDanmakuText(cleaned);
+        const bool gift_text = IsUiGiftMessageText(cleaned);
+        if (!strong_text && !gift_text) {
+            continue;
+        }
+        const int score = ScoreDanmakuCandidateText(cleaned);
+        if (score > best_score) {
+            best_score = score;
+            best_text = cleaned;
+        }
+    }
+
+    if (best_text.empty()) {
+        return false;
+    }
+
+    UiCollectedLine line{};
+    line.text = std::move(best_text);
+    line.compare_key = L"text:" + NormalizeUiCompareText(line.text);
+    line.bounds = bounds;
+    lines->push_back(std::move(line));
+    return true;
+}
+
+bool TryAppendAccessibleGiftMarkerLine(
+    const std::vector<std::wstring>& texts,
+    const RECT& bounds,
+    std::vector<UiCollectedLine>* lines) {
+    if (lines == nullptr || texts.empty() || !HasValidBounds(bounds)) {
+        return false;
+    }
+
+    std::wstring marker_text;
+    for (const auto& raw_text : texts) {
+        const std::wstring cleaned = TrimWhitespace(raw_text);
+        if (IsUiGiftCounterText(cleaned)) {
+            marker_text = cleaned;
+            break;
+        }
+    }
+    if (marker_text.empty()) {
+        return false;
+    }
+
+    UiCollectedLine line{};
+    line.text = L"有礼物";
+    line.compare_key = BuildUiGiftMarkerCompareKey(bounds, marker_text);
+    line.bounds = bounds;
+    line.is_gift_marker = true;
+    lines->push_back(std::move(line));
+    return true;
+}
+
+void CollectMsaaDanmakuLinesFromAccessible(
+    IAccessible* accessible,
+    int depth,
+    size_t max_nodes,
+    size_t* visited_nodes,
+    std::vector<UiCollectedLine>* lines) {
+    if (accessible == nullptr ||
+        lines == nullptr ||
+        visited_nodes == nullptr ||
+        depth > 14 ||
+        *visited_nodes >= max_nodes ||
+        lines->size() >= kMaxUiLiveVisibleLines) {
+        return;
+    }
+
+    VARIANT self{};
+    self.vt = VT_I4;
+    self.lVal = CHILDID_SELF;
+    RECT self_bounds{};
+    ReadAccessibleBounds(accessible, self, &self_bounds);
+    const auto self_texts = ReadAccessibleTextCandidates(accessible, self);
+    if (!TryAppendBestAccessibleDanmakuLine(self_texts, self_bounds, lines)) {
+        TryAppendAccessibleGiftMarkerLine(self_texts, self_bounds, lines);
+    }
+    if (lines->size() >= kMaxUiLiveVisibleLines) {
+        return;
+    }
+
+    long child_count = 0;
+    if (FAILED(accessible->get_accChildCount(&child_count)) || child_count <= 0) {
+        return;
+    }
+
+    std::vector<VARIANT> children(static_cast<size_t>(child_count));
+    for (auto& child : children) {
+        VariantInit(&child);
+    }
+
+    long obtained = 0;
+    const HRESULT children_result = AccessibleChildren(
+        accessible,
+        0,
+        child_count,
+        children.data(),
+        &obtained);
+    if (FAILED(children_result) || obtained <= 0) {
+        for (auto& child : children) {
+            VariantClear(&child);
+        }
+        return;
+    }
+
+    for (long index = 0; index < obtained && *visited_nodes < max_nodes; ++index) {
+        VARIANT& child = children[static_cast<size_t>(index)];
+        *visited_nodes += 1;
+
+        if (child.vt == VT_DISPATCH && child.pdispVal != nullptr) {
+            winrt::com_ptr<IAccessible> child_accessible;
+            child.pdispVal->QueryInterface(IID_PPV_ARGS(child_accessible.put()));
+            if (child_accessible) {
+                CollectMsaaDanmakuLinesFromAccessible(
+                    child_accessible.get(),
+                    depth + 1,
+                    max_nodes,
+                    visited_nodes,
+                    lines);
+            }
+        } else if (child.vt == VT_I4) {
+            RECT child_bounds{};
+            ReadAccessibleBounds(accessible, child, &child_bounds);
+            const auto child_texts = ReadAccessibleTextCandidates(accessible, child);
+            if (!TryAppendBestAccessibleDanmakuLine(child_texts, child_bounds, lines)) {
+                TryAppendAccessibleGiftMarkerLine(child_texts, child_bounds, lines);
+            }
+        }
+
+        VariantClear(&child);
+        if (lines->size() >= kMaxUiLiveVisibleLines) {
+            break;
+        }
+    }
+}
+
+std::vector<UiCollectedLine> ReadMsaaDanmakuLines(HWND target_window) {
+    std::vector<UiCollectedLine> lines;
+    if (target_window == nullptr || !IsWindow(target_window)) {
+        return lines;
+    }
+
+    winrt::com_ptr<IAccessible> accessible;
+    HRESULT result = AccessibleObjectFromWindow(
+        target_window,
+        OBJID_WINDOW,
+        IID_IAccessible,
+        reinterpret_cast<void**>(accessible.put()));
+    if (FAILED(result) || !accessible) {
+        result = AccessibleObjectFromWindow(
+            target_window,
+            OBJID_CLIENT,
+            IID_IAccessible,
+            reinterpret_cast<void**>(accessible.put()));
+        if (FAILED(result) || !accessible) {
+            return lines;
+        }
+    }
+
+    size_t visited_nodes = 0;
+    CollectMsaaDanmakuLinesFromAccessible(
+        accessible.get(),
+        0,
+        2400,
+        &visited_nodes,
+        &lines);
+
+    RECT window_bounds{};
+    if (!GetWindowRect(target_window, &window_bounds)) {
+        window_bounds = RECT{};
+    }
+
+    int first_text_top = std::numeric_limits<int>::max();
+    for (const auto& line : lines) {
+        if (line.is_gift_marker || !HasValidBounds(line.bounds)) {
+            continue;
+        }
+        if (IsUiTextDanmakuText(line.text)) {
+            first_text_top = std::min(first_text_top, static_cast<int>(line.bounds.top));
+        }
+    }
+
+    std::vector<UiCollectedLine> filtered_lines;
+    filtered_lines.reserve(lines.size());
+    for (const auto& line : lines) {
+        if (line.is_gift_marker &&
+            !IsUiGiftMarkerLineInGiftBand(line, first_text_top, window_bounds)) {
+            continue;
+        }
+
+        const bool duplicated = std::any_of(
+            filtered_lines.begin(),
+            filtered_lines.end(),
+            [&line](const UiCollectedLine& existing) {
+                return !line.compare_key.empty() && existing.compare_key == line.compare_key;
+            });
+        if (duplicated) {
+            continue;
+        }
+        filtered_lines.push_back(line);
+    }
+
+    std::stable_sort(
+        filtered_lines.begin(),
+        filtered_lines.end(),
+        [](const UiCollectedLine& left, const UiCollectedLine& right) {
+            const bool left_valid = HasValidBounds(left.bounds);
+            const bool right_valid = HasValidBounds(right.bounds);
+            if (left_valid != right_valid) {
+                return left_valid;
+            }
+            if (left_valid && right_valid) {
+                if (left.bounds.top != right.bounds.top) {
+                    return left.bounds.top < right.bounds.top;
+                }
+                if (left.bounds.left != right.bounds.left) {
+                    return left.bounds.left < right.bounds.left;
+                }
+            }
+            return left.compare_key < right.compare_key;
+        });
+
+    lines = std::move(filtered_lines);
+
+    return lines;
+}
+
+void AppendUniqueUiText(std::vector<std::wstring>* texts, const std::wstring& text) {
+    if (texts == nullptr) {
+        return;
+    }
+    const std::wstring trimmed = TrimWhitespace(text);
+    if (trimmed.empty()) {
+        return;
+    }
+    if (std::find(texts->begin(), texts->end(), trimmed) != texts->end()) {
+        return;
+    }
+    texts->push_back(trimmed);
+}
+
+std::vector<std::wstring> ReadElementTextCandidates(IUIAutomationElement* element) {
+    std::vector<std::wstring> texts;
+    if (element == nullptr) {
+        return texts;
+    }
+
+    AppendUniqueUiText(&texts, ReadElementName(element));
+    AppendUniqueUiText(&texts, ReadElementHelpText(element));
+    AppendUniqueUiText(&texts, ReadElementItemStatus(element));
+
+    winrt::com_ptr<IUIAutomationValuePattern> value_pattern;
+    if (SUCCEEDED(element->GetCurrentPatternAs(UIA_ValuePatternId, IID_PPV_ARGS(value_pattern.put()))) &&
+        value_pattern) {
+        BSTR value = nullptr;
+        if (SUCCEEDED(value_pattern->get_CurrentValue(&value))) {
+            AppendUniqueUiText(&texts, TakeBstrAndFree(value));
+        }
+    }
+
+    winrt::com_ptr<IUIAutomationLegacyIAccessiblePattern> legacy_pattern;
+    if (SUCCEEDED(element->GetCurrentPatternAs(
+            UIA_LegacyIAccessiblePatternId,
+            IID_PPV_ARGS(legacy_pattern.put()))) &&
+        legacy_pattern) {
+        BSTR legacy_name = nullptr;
+        BSTR legacy_value = nullptr;
+        std::wstring legacy_name_text;
+        std::wstring legacy_value_text;
+        if (SUCCEEDED(legacy_pattern->get_CurrentName(&legacy_name))) {
+            legacy_name_text = TakeBstrAndFree(legacy_name);
+            AppendUniqueUiText(&texts, legacy_name_text);
+        }
+        if (SUCCEEDED(legacy_pattern->get_CurrentValue(&legacy_value))) {
+            legacy_value_text = TakeBstrAndFree(legacy_value);
+            AppendUniqueUiText(&texts, legacy_value_text);
+        }
+        if (!legacy_name_text.empty() && !legacy_value_text.empty()) {
+            const bool has_separator = legacy_value_text.find(L'\uff1a') != std::wstring::npos ||
+                legacy_value_text.find(L':') != std::wstring::npos;
+            AppendUniqueUiText(
+                &texts,
+                has_separator
+                    ? (legacy_name_text + legacy_value_text)
+                    : (legacy_name_text + L"\uff1a" + legacy_value_text));
+        }
+    }
+
+    return texts;
+}
+
+void AppendUiSnapshotFromElement(
+    IUIAutomationElement* element,
+    std::vector<UiElementSnapshot>* snapshots,
+    size_t max_elements) {
+    if (element == nullptr || snapshots == nullptr || snapshots->size() >= max_elements) {
+        return;
+    }
+
+    UiElementSnapshot snapshot{};
+    element->get_CurrentControlType(&snapshot.control_type);
+    snapshot.class_name = ReadElementClassName(element);
+    element->get_CurrentBoundingRectangle(&snapshot.bounds);
+    snapshot.runtime_id = ReadElementRuntimeId(element);
+    snapshot.texts = ReadElementTextCandidates(element);
+    if (!snapshot.texts.empty()) {
+        snapshots->push_back(std::move(snapshot));
+    }
+}
+
+void CollectUiElementSnapshotsRawRecursive(
+    IUIAutomationTreeWalker* walker,
+    IUIAutomationElement* parent,
+    int depth,
+    size_t max_elements,
+    size_t* visited_nodes,
+    std::vector<UiElementSnapshot>* snapshots) {
+    if (walker == nullptr ||
+        parent == nullptr ||
+        snapshots == nullptr ||
+        visited_nodes == nullptr ||
+        depth > 24 ||
+        *visited_nodes >= 2400 ||
+        snapshots->size() >= max_elements) {
+        return;
+    }
+
+    winrt::com_ptr<IUIAutomationElement> child;
+    if (FAILED(walker->GetFirstChildElement(parent, child.put())) || !child) {
+        return;
+    }
+
+    while (child && *visited_nodes < 2400 && snapshots->size() < max_elements) {
+        *visited_nodes += 1;
+        AppendUiSnapshotFromElement(child.get(), snapshots, max_elements);
+        CollectUiElementSnapshotsRawRecursive(
+            walker,
+            child.get(),
+            depth + 1,
+            max_elements,
+            visited_nodes,
+            snapshots);
+
+        winrt::com_ptr<IUIAutomationElement> sibling;
+        if (FAILED(walker->GetNextSiblingElement(child.get(), sibling.put()))) {
+            break;
+        }
+        child = std::move(sibling);
+    }
+}
+
+bool CollectUiElementSnapshots(
+    IUIAutomation* automation,
+    IUIAutomationElement* root,
+    size_t max_elements,
+    std::vector<UiElementSnapshot>* snapshots) {
+    if (snapshots == nullptr) {
+        return false;
+    }
+    snapshots->clear();
+    if (automation == nullptr || root == nullptr || max_elements == 0) {
+        return false;
+    }
+
+    bool tree_read_ok = false;
+    winrt::com_ptr<IUIAutomationCondition> true_condition;
+    winrt::com_ptr<IUIAutomationElementArray> elements;
+    if (SUCCEEDED(automation->CreateTrueCondition(true_condition.put())) &&
+        true_condition &&
+        SUCCEEDED(root->FindAll(TreeScope_Descendants, true_condition.get(), elements.put())) &&
+        elements) {
+        tree_read_ok = true;
+        int length = 0;
+        elements->get_Length(&length);
+        for (int index = 0; index < length && snapshots->size() < max_elements; ++index) {
+            winrt::com_ptr<IUIAutomationElement> element;
+            if (FAILED(elements->GetElement(index, element.put())) || !element) {
+                continue;
+            }
+            AppendUiSnapshotFromElement(element.get(), snapshots, max_elements);
+        }
+    }
+
+    if (snapshots->size() >= 3) {
+        std::stable_sort(snapshots->begin(), snapshots->end(), [](const UiElementSnapshot& left, const UiElementSnapshot& right) {
+            const bool left_valid = left.bounds.bottom > left.bounds.top && left.bounds.right > left.bounds.left;
+            const bool right_valid = right.bounds.bottom > right.bounds.top && right.bounds.right > right.bounds.left;
+            if (left_valid != right_valid) {
+                return left_valid && !right_valid;
+            }
+            if (!left_valid && !right_valid) {
+                return false;
+            }
+            if (left.bounds.top != right.bounds.top) {
+                return left.bounds.top < right.bounds.top;
+            }
+            if (left.bounds.left != right.bounds.left) {
+                return left.bounds.left < right.bounds.left;
+            }
+            return left.control_type < right.control_type;
+        });
+        return true;
+    }
+
+    winrt::com_ptr<IUIAutomationTreeWalker> raw_walker;
+    if (SUCCEEDED(automation->get_RawViewWalker(raw_walker.put())) && raw_walker) {
+        tree_read_ok = true;
+        size_t visited_nodes = 0;
+        CollectUiElementSnapshotsRawRecursive(
+            raw_walker.get(),
+            root,
+            0,
+            max_elements,
+            &visited_nodes,
+            snapshots);
+    }
+    std::stable_sort(snapshots->begin(), snapshots->end(), [](const UiElementSnapshot& left, const UiElementSnapshot& right) {
+        const bool left_valid = left.bounds.bottom > left.bounds.top && left.bounds.right > left.bounds.left;
+        const bool right_valid = right.bounds.bottom > right.bounds.top && right.bounds.right > right.bounds.left;
+        if (left_valid != right_valid) {
+            return left_valid && !right_valid;
+        }
+        if (!left_valid && !right_valid) {
+            return false;
+        }
+        if (left.bounds.top != right.bounds.top) {
+            return left.bounds.top < right.bounds.top;
+        }
+        if (left.bounds.left != right.bounds.left) {
+            return left.bounds.left < right.bounds.left;
+        }
+        return left.control_type < right.control_type;
+    });
+    return tree_read_ok;
 }
 
 std::wstring ControlTypeLabel(CONTROLTYPEID control_type) {
@@ -1148,34 +2427,25 @@ void DanmakuController::SetWindows(HWND owner_window, HWND video_window) {
     video_window_ = video_window;
 }
 
+void DanmakuController::SetEventFn(EventFn event_fn) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    event_fn_ = std::move(event_fn);
+}
+
 bool DanmakuController::SelectRegion() {
-    const RECT screen_bounds = GetDesktopCaptureBounds();
-    NormalizedRegion next_region{};
-    if (!ShowRegionOverlay(screen_bounds, &next_region)) {
-        SetStatus(L"\u5df2\u53d6\u6d88\u5f39\u5e55\u533a\u57df\u9009\u62e9");
-        return false;
-    }
-
-    std::wstring label;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        region_ = next_region;
-        ResetGiftCandidateLocked();
-        visual_baseline_ready_ = false;
-        last_gift_tick_ = 0;
-        SaveRegionLocked();
-        label = BuildRegionLabelLocked();
-        status_text_ = L"\u5f39\u5e55\u533a\u57df\u5df2\u66f4\u65b0";
-    }
-
+    SetStatus(L"\u5df2\u79fb\u9664\u5f39\u5e55\u56fe\u50cf\u8bc6\u522b\uff0c\u4ec5\u4fdd\u7559\u4e92\u52a8\u6d88\u606f\u60ac\u6d6e\u7a97\u7684 UI \u6587\u672c\u6811\u8bc6\u522b");
     if (log_fn_) {
-        log_fn_(std::wstring(L"\u5f39\u5e55\u8bc6\u522b\uff1a\u5df2\u66f4\u65b0\u533a\u57df\uff0c") + label);
+        log_fn_(L"\u5f39\u5e55\u8bc6\u522b\uff1a\u5df2\u7981\u7528\u56fe\u50cf\u9009\u533a\u5165\u53e3\uff0c\u5f53\u524d\u53ea\u4f7f\u7528 UI \u6587\u672c\u6811\u65b9\u6848\u3002");
     }
-    return true;
+    return false;
 }
 
 bool DanmakuController::TestRecognizeFrame() {
-    return CaptureAndRecognizeFrame(true);
+    SetStatus(L"\u5df2\u79fb\u9664\u5f39\u5e55\u56fe\u50cf\u8bc6\u522b\u6d4b\u8bd5\uff0c\u5f53\u524d\u53ea\u4f7f\u7528 UI \u6587\u672c\u6811\u65b9\u6848");
+    if (log_fn_) {
+        log_fn_(L"\u5f39\u5e55\u8bc6\u522b\uff1a\u5df2\u7981\u7528\u56fe\u50cf\u6d4b\u8bd5\u5165\u53e3\uff0c\u5f53\u524d\u53ea\u4f7f\u7528 UI \u6587\u672c\u6811\u65b9\u6848\u3002");
+    }
+    return false;
 }
 
 bool DanmakuController::Start() {
@@ -1190,6 +2460,7 @@ bool DanmakuController::Start() {
         last_gift_tick_ = 0;
         ui_live_target_title_.clear();
         ui_live_visible_lines_.clear();
+        ui_live_visible_keys_.clear();
         running_ = true;
         status_text_ = L"\u76d1\u542c\u4e2d\uff0c\u7b49\u5f85\u4e92\u52a8\u6d88\u606f\u60ac\u6d6e\u7a97";
         if (ui_probe_target_title_.empty()) {
@@ -1227,6 +2498,7 @@ void DanmakuController::Stop() {
     last_gift_tick_ = 0;
     ui_live_target_title_.clear();
     ui_live_visible_lines_.clear();
+    ui_live_visible_keys_.clear();
     status_text_ = L"\u5df2\u505c\u6b62\u76d1\u542c";
 }
 
@@ -1238,7 +2510,7 @@ bool DanmakuController::StartUiAutomationProbe() {
         }
         ui_probe_running_ = true;
         ui_probe_target_title_.clear();
-        ui_probe_status_ = L"\u8bf7\u5728 3 \u79d2\u5185\u5207\u5230\u89c6\u9891\u53f7\u76f4\u64ad\u52a9\u624b\u8bc4\u8bba\u533a";
+        ui_probe_status_ = L"\u8bf7\u5728 3 \u79d2\u5185\u5207\u5230\u89c6\u9891\u53f7\u76f4\u64ad\u52a9\u624b\u201c\u4e92\u52a8\u6d88\u606f\u201d\u60ac\u6d6e\u7a97";
         recent_probe_lines_.clear();
     }
 
@@ -1247,7 +2519,7 @@ bool DanmakuController::StartUiAutomationProbe() {
     }
     ui_probe_thread_ = std::thread(&DanmakuController::UiProbeLoop, this);
     if (log_fn_) {
-        log_fn_(L"\u5f39\u5e55\u8bc6\u522b\uff1a\u5df2\u542f\u52a8 UIA \u63a2\u6d4b\uff0c\u8bf7\u5c06\u89c6\u9891\u53f7\u76f4\u64ad\u52a9\u624b\u5207\u5230\u524d\u53f0\u3002");
+        log_fn_(L"\u5f39\u5e55\u8bc6\u522b\uff1a\u5df2\u542f\u52a8\u60ac\u6d6e\u7a97\u63a2\u6d4b\uff0c\u8bf7\u5c06\u89c6\u9891\u53f7\u76f4\u64ad\u52a9\u624b\u5207\u5230\u524d\u53f0\u3002");
     }
     return true;
 }
@@ -1267,6 +2539,25 @@ bool DanmakuController::ToggleReminder() {
         log_fn_(enabled
             ? L"\u5f39\u5e55\u8bc6\u522b\uff1a\u5df2\u5f00\u542f\u65b0\u5f39\u5e55\u63d0\u9192\u97f3\u3002"
             : L"\u5f39\u5e55\u8bc6\u522b\uff1a\u5df2\u5173\u95ed\u65b0\u5f39\u5e55\u63d0\u9192\u97f3\u3002");
+    }
+    return enabled;
+}
+
+bool DanmakuController::ToggleGiftReminder() {
+    bool enabled = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        gift_reminder_enabled_ = !gift_reminder_enabled_;
+        SaveRegionLocked();
+        status_text_ = gift_reminder_enabled_
+            ? L"\u5df2\u5f00\u542f\u65b0\u793c\u7269\u63d0\u9192"
+            : L"\u5df2\u5173\u95ed\u65b0\u793c\u7269\u63d0\u9192";
+        enabled = gift_reminder_enabled_;
+    }
+    if (log_fn_) {
+        log_fn_(enabled
+            ? L"\u5f39\u5e55\u8bc6\u522b\uff1a\u5df2\u5f00\u542f\u65b0\u793c\u7269\u63d0\u9192\u97f3\u3002"
+            : L"\u5f39\u5e55\u8bc6\u522b\uff1a\u5df2\u5173\u95ed\u65b0\u793c\u7269\u63d0\u9192\u97f3\u3002");
     }
     return enabled;
 }
@@ -1352,8 +2643,9 @@ void DanmakuController::ClearRecentEvents() {
     last_text_.clear();
     ui_live_target_title_.clear();
     ui_live_visible_lines_.clear();
+    ui_live_visible_keys_.clear();
     if (ui_probe_running_) {
-        ui_probe_status_ = L"\u6b63\u5728\u8fdb\u884c UIA \u63a2\u6d4b";
+        ui_probe_status_ = L"\u6b63\u5728\u8fdb\u884c\u60ac\u6d6e\u7a97\u63a2\u6d4b";
     } else if (ui_probe_target_title_.empty()) {
         ui_probe_status_ = L"\u7b49\u5f85\u63a2\u6d4b\u4e92\u52a8\u6d88\u606f\u60ac\u6d6e\u7a97";
     }
@@ -1369,6 +2661,7 @@ DanmakuController::Snapshot DanmakuController::GetSnapshot() const {
     snapshot.running = running_;
     snapshot.ui_probe_running = ui_probe_running_;
     snapshot.reminder_enabled = reminder_enabled_;
+    snapshot.gift_reminder_enabled = gift_reminder_enabled_;
     snapshot.speech_enabled = speech_enabled_;
     snapshot.speech_voice_count = static_cast<int>(speech_voice_names_.size());
     snapshot.status_text = status_text_;
@@ -1421,6 +2714,7 @@ bool DanmakuController::PollUiDanmakuWindow() {
         std::lock_guard<std::mutex> lock(mutex_);
         ui_live_target_title_.clear();
         ui_live_visible_lines_.clear();
+        ui_live_visible_keys_.clear();
         if (!ui_probe_running_) {
             ui_probe_status_ = L"\u7b49\u5f85\u4e92\u52a8\u6d88\u606f\u60ac\u6d6e\u7a97";
         }
@@ -1428,34 +2722,65 @@ bool DanmakuController::PollUiDanmakuWindow() {
         return false;
     }
 
-    UiDanmakuReadResult result = ReadUiDanmakuWindow(preferred_windows.front().hwnd);
-    if (!result.error.empty()) {
+    const auto& target_window = preferred_windows.front();
+    std::wstring target_title = !target_window.title.empty()
+        ? target_window.title
+        : ReadWindowText(target_window.hwnd);
+    if (target_title.empty()) {
+        target_title = !target_window.class_name.empty()
+            ? target_window.class_name
+            : ReadWindowClassName(target_window.hwnd);
+    }
+
+    const auto read_result = ReadUiDanmakuWindow(target_window.hwnd);
+    if (!read_result.error.empty() && read_result.lines.empty()) {
         std::lock_guard<std::mutex> lock(mutex_);
-        ui_live_target_title_ = result.target_title;
-        if (!result.target_title.empty()) {
-            ui_probe_target_title_ = result.target_title;
+        ui_live_target_title_ = target_title;
+        if (!target_title.empty()) {
+            ui_probe_target_title_ = target_title;
         }
-        ui_probe_status_ = std::wstring(L"\u8bfb\u53d6\u5931\u8d25\uff1a") + result.error;
-        status_text_ = std::wstring(L"\u76d1\u542c\u4e2d\uff0c") + result.error;
+        ui_probe_status_ = std::wstring(L"\u5df2\u8fde\u63a5\u4e92\u52a8\u6d88\u606f\u60ac\u6d6e\u7a97\uff0c\u4f46 UI \u6587\u672c\u6811\u8bfb\u53d6\u5931\u8d25\uff1a") + read_result.error;
+        status_text_ = target_title.empty()
+            ? (std::wstring(L"\u76d1\u542c\u4e2d\uff0cUI \u6587\u672c\u6811\u8bfb\u53d6\u5931\u8d25\uff1a") + read_result.error)
+            : (std::wstring(L"\u76d1\u542c\u4e2d\uff0c") + target_title + L" UI \u6587\u672c\u6811\u8bfb\u53d6\u5931\u8d25\uff1a" + read_result.error);
         return false;
     }
 
+    const std::vector<std::wstring> visible_lines = read_result.lines;
+    std::vector<std::wstring> visible_compare_keys = read_result.compare_keys;
+    if (visible_compare_keys.size() != visible_lines.size()) {
+        visible_compare_keys.clear();
+        visible_compare_keys.reserve(visible_lines.size());
+        for (const auto& line : visible_lines) {
+            visible_compare_keys.push_back(L"text:" + NormalizeUiCompareText(line));
+        }
+    }
+    const std::vector<std::wstring> visible_occurrence_keys = BuildUiOccurrenceKeys(visible_compare_keys);
+
     std::deque<std::wstring> previous_lines;
+    std::deque<std::wstring> previous_compare_keys;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         previous_lines = ui_live_visible_lines_;
+        previous_compare_keys = ui_live_visible_keys_;
     }
+    if (!previous_compare_keys.empty() && previous_compare_keys.size() != previous_lines.size()) {
+        previous_compare_keys.clear();
+    }
+    const std::vector<std::wstring> previous_occurrence_keys = BuildUiOccurrenceKeys(previous_compare_keys);
 
-    const size_t overlap = FindUiLineOverlap(previous_lines, result.lines);
+    const size_t overlap = FindUiLineOverlap(previous_occurrence_keys, visible_occurrence_keys);
     std::vector<size_t> fresh_line_indices;
-    if (!previous_lines.empty()) {
+    if (previous_lines.empty() || previous_compare_keys.empty()) {
+        fresh_line_indices.clear();
+    } else {
         if (overlap > 0) {
-            fresh_line_indices.reserve(result.lines.size() - overlap);
-            for (size_t index = overlap; index < result.lines.size(); ++index) {
+            fresh_line_indices.reserve(visible_lines.size() - overlap);
+            for (size_t index = overlap; index < visible_lines.size(); ++index) {
                 fresh_line_indices.push_back(index);
             }
         } else {
-            fresh_line_indices = CollectUiFreshLineIndicesByLcs(previous_lines, result.lines);
+            fresh_line_indices = CollectUiFreshLineIndicesByLcs(previous_occurrence_keys, visible_occurrence_keys);
         }
     }
     const ULONGLONG now_tick = GetTickCount64();
@@ -1463,59 +2788,71 @@ bool DanmakuController::PollUiDanmakuWindow() {
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        ui_live_target_title_ = result.target_title;
-        if (!result.target_title.empty()) {
-            ui_probe_target_title_ = result.target_title;
+        ui_live_target_title_ = target_title;
+        if (!target_title.empty()) {
+            ui_probe_target_title_ = target_title;
         }
-        ui_probe_status_ = result.lines.empty()
-            ? L"\u5df2\u8fde\u63a5\u4e92\u52a8\u6d88\u606f\u60ac\u6d6e\u7a97\uff0c\u6682\u65e0\u53ef\u89c1\u5f39\u5e55"
-            : (std::wstring(L"\u5df2\u8fde\u63a5\u4e92\u52a8\u6d88\u606f\u60ac\u6d6e\u7a97\uff0c\u5f53\u524d\u53ef\u89c1 ") +
-                std::to_wstring(result.lines.size()) + L" \u6761");
+        ui_probe_status_ = visible_lines.empty()
+            ? L"\u5df2\u8fde\u63a5\u4e92\u52a8\u6d88\u606f\u60ac\u6d6e\u7a97\uff0cUI \u6587\u672c\u6811\u5f53\u524d\u672a\u8bc6\u522b\u5230\u5f39\u5e55"
+            : (std::wstring(L"\u5df2\u8fde\u63a5\u4e92\u52a8\u6d88\u606f\u60ac\u6d6e\u7a97\uff0cUI \u6587\u672c\u6811\u8bc6\u522b\u5230 ") +
+                std::to_wstring(visible_lines.size()) + L" \u6761\u53ef\u89c1\u6587\u672c");
 
-        if (result.lines.empty()) {
-            status_text_ = result.target_title.empty()
-                ? L"\u5df2\u8fde\u63a5\u4e92\u52a8\u6d88\u606f\u60ac\u6d6e\u7a97\uff0c\u6682\u65e0\u53ef\u89c1\u5f39\u5e55"
-                : (std::wstring(L"\u5df2\u8fde\u63a5 ") + result.target_title + L"\uff0c\u6682\u65e0\u53ef\u89c1\u5f39\u5e55");
+        if (visible_lines.empty()) {
+            status_text_ = target_title.empty()
+                ? L"\u5df2\u8fde\u63a5\u4e92\u52a8\u6d88\u606f\u60ac\u6d6e\u7a97\uff0cUI \u6587\u672c\u6811\u5f53\u524d\u672a\u8bc6\u522b\u5230\u5f39\u5e55"
+                : (std::wstring(L"\u5df2\u8fde\u63a5 ") + target_title + L"\uff0c\u5f53\u524d\u672a\u8bc6\u522b\u5230\u5f39\u5e55");
         } else if (previous_lines.empty()) {
-            status_text_ = result.target_title.empty()
-                ? L"\u5df2\u8fde\u63a5\u4e92\u52a8\u6d88\u606f\u60ac\u6d6e\u7a97\uff0c\u5df2\u540c\u6b65\u5f53\u524d\u53ef\u89c1\u5f39\u5e55"
-                : (std::wstring(L"\u5df2\u8fde\u63a5 ") + result.target_title + L"\uff0c\u5df2\u540c\u6b65\u5f53\u524d\u53ef\u89c1\u5f39\u5e55");
-        } else {
-            for (size_t line_index : fresh_line_indices) {
-                const std::wstring cleaned = CleanUiDanmakuText(result.lines[line_index]);
-                if (cleaned.empty()) {
+            status_text_ = target_title.empty()
+                ? L"\u5df2\u8fde\u63a5\u4e92\u52a8\u6d88\u606f\u60ac\u6d6e\u7a97\uff0c\u6b63\u5728\u540c\u6b65\u5f53\u524d\u53ef\u89c1\u5185\u5bb9"
+                : (std::wstring(L"\u5df2\u8fde\u63a5 ") + target_title + L"\uff0c\u6b63\u5728\u540c\u6b65\u5f53\u524d\u53ef\u89c1\u5185\u5bb9");
+        }
+
+        for (size_t line_index : fresh_line_indices) {
+            const std::wstring cleaned = CleanUiDanmakuText(visible_lines[line_index]);
+            if (cleaned.empty()) {
+                continue;
+            }
+            const std::wstring dedupe_key = line_index < visible_occurrence_keys.size()
+                ? (L"ui:" + visible_occurrence_keys[line_index])
+                : (L"ui:text:" + NormalizeText(cleaned));
+
+            EventKind kind = EventKind::kText;
+            std::wstring accepted_text = cleaned;
+            if (!IsUiTextDanmakuText(cleaned) && IsUiGiftMessageText(cleaned)) {
+                kind = EventKind::kImageGift;
+                accepted_text = L"\u6709\u793c\u7269";
+            } else {
+                if (NormalizeText(cleaned).empty()) {
                     continue;
                 }
-
-                EventKind kind = EventKind::kText;
-                std::wstring accepted_text = cleaned;
-                if (!IsUiTextDanmakuText(cleaned) && IsUiGiftMessageText(cleaned)) {
-                    kind = EventKind::kImageGift;
-                    accepted_text = L"\u6709\u793c\u7269";
-                } else {
-                    const std::wstring normalized = NormalizeText(cleaned);
-                    if (normalized.empty()) {
-                        continue;
-                    }
+                if (IsDuplicateLocked(dedupe_key, now_tick)) {
+                    continue;
                 }
-
-                AppendEventLocked(kind, accepted_text, std::wstring{}, now_tick);
-                accepted_events.emplace_back(kind, accepted_text);
             }
 
-            if (accepted_events.empty()) {
-                status_text_ = result.target_title.empty()
-                    ? L"\u76d1\u542c\u4e2d\uff0c\u5df2\u8fde\u63a5\u4e92\u52a8\u6d88\u606f\u60ac\u6d6e\u7a97"
-                    : (std::wstring(L"\u76d1\u542c\u4e2d\uff0c\u5df2\u8fde\u63a5 ") + result.target_title);
-            }
+            AppendEventLocked(kind, accepted_text, std::wstring{}, dedupe_key, now_tick);
+            accepted_events.emplace_back(kind, accepted_text);
+        }
+
+        if (accepted_events.empty() && !visible_lines.empty()) {
+            status_text_ = target_title.empty()
+                ? L"\u76d1\u542c\u4e2d\uff0c\u5df2\u8fde\u63a5\u4e92\u52a8\u6d88\u606f\u60ac\u6d6e\u7a97"
+                : (std::wstring(L"\u76d1\u542c\u4e2d\uff0c\u5df2\u8fde\u63a5 ") + target_title);
         }
 
         ui_live_visible_lines_.clear();
-        for (const auto& line : result.lines) {
+        for (const auto& line : visible_lines) {
             ui_live_visible_lines_.push_back(line);
+        }
+        ui_live_visible_keys_.clear();
+        for (const auto& key : visible_compare_keys) {
+            ui_live_visible_keys_.push_back(key);
         }
         while (ui_live_visible_lines_.size() > kMaxUiLiveVisibleLines) {
             ui_live_visible_lines_.pop_front();
+        }
+        while (ui_live_visible_keys_.size() > kMaxUiLiveVisibleLines) {
+            ui_live_visible_keys_.pop_front();
         }
     }
 
@@ -1637,7 +2974,7 @@ void DanmakuController::UiProbeLoop() {
 
     const auto preferred_windows = CollectPreferredUiProbeWindows(owner_window, video_window);
     if (!preferred_windows.empty()) {
-        ApplyUiProbeResult(ProbeWindowByUiAutomation(preferred_windows.front().hwnd));
+        ApplyUiProbeResult(ProbeWindowByVisibleContent(preferred_windows.front().hwnd));
         return;
     }
 
@@ -1654,7 +2991,7 @@ void DanmakuController::UiProbeLoop() {
         return;
     }
 
-    ApplyUiProbeResult(ProbeWindowByUiAutomation(target_window));
+    ApplyUiProbeResult(ProbeWindowByVisibleContent(target_window));
 }
 
 void DanmakuController::ApplyUiProbeResult(UiProbeResult result) {
@@ -1663,7 +3000,7 @@ void DanmakuController::ApplyUiProbeResult(UiProbeResult result) {
         ui_probe_running_ = false;
         ui_probe_target_title_ = std::move(result.target_title);
         ui_probe_status_ = result.status_text.empty()
-            ? L"UIA \u63a2\u6d4b\u5df2\u5b8c\u6210"
+            ? L"\u60ac\u6d6e\u7a97\u63a2\u6d4b\u5df2\u5b8c\u6210"
             : std::move(result.status_text);
         recent_probe_lines_.clear();
         for (const auto& line : result.lines) {
@@ -1675,7 +3012,7 @@ void DanmakuController::ApplyUiProbeResult(UiProbeResult result) {
     }
 
     if (log_fn_) {
-        const std::wstring log_line = std::wstring(L"\u5f39\u5e55\u8bc6\u522b\uff1aUIA \u63a2\u6d4b -> ") + GetSnapshot().ui_probe_status;
+        const std::wstring log_line = std::wstring(L"\u5f39\u5e55\u8bc6\u522b\uff1a\u60ac\u6d6e\u7a97\u63a2\u6d4b -> ") + GetSnapshot().ui_probe_status;
         log_fn_(log_line);
     }
 }
@@ -1716,7 +3053,7 @@ bool DanmakuController::CaptureAndRecognizeFrame(bool manual_test) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!normalized.empty()) {
-            duplicate = IsDuplicateLocked(normalized, now_tick);
+            duplicate = IsDuplicateLocked(L"ocr:" + normalized, now_tick);
             visual_baseline_ready_ = true;
             ResetGiftCandidateLocked();
         } else if (!manual_test) {
@@ -1766,7 +3103,12 @@ bool DanmakuController::CaptureAndRecognizeFrame(bool manual_test) {
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        AppendEventLocked(event_kind, accepted_text, capture_path, now_tick);
+        AppendEventLocked(
+            event_kind,
+            accepted_text,
+            capture_path,
+            normalized.empty() ? std::wstring{} : (L"ocr:" + normalized),
+            now_tick);
         if (manual_test) {
             status_text_ = std::wstring(L"\u6d4b\u8bd5\u8bc6\u522b\u6210\u529f\uff1a") + TruncateText(accepted_text, 42);
         }
@@ -1776,6 +3118,112 @@ bool DanmakuController::CaptureAndRecognizeFrame(bool manual_test) {
     if (manual_test && log_fn_) {
         log_fn_(std::wstring(L"\u5f39\u5e55\u8bc6\u522b\uff1a\u6d4b\u8bd5\u547d\u4e2d -> ") + accepted_text);
     }
+    return true;
+}
+
+bool DanmakuController::CaptureScreenRect(const RECT& capture_rect, FrameCapture* frame, std::wstring* error) const {
+    if (frame == nullptr) {
+        if (error != nullptr) {
+            *error = L"\u5185\u90e8\u9519\u8bef";
+        }
+        return false;
+    }
+
+    const RECT desktop_bounds = GetDesktopCaptureBounds();
+    RECT clamped_rect = capture_rect;
+    clamped_rect.left = std::clamp(clamped_rect.left, desktop_bounds.left, desktop_bounds.right);
+    clamped_rect.top = std::clamp(clamped_rect.top, desktop_bounds.top, desktop_bounds.bottom);
+    clamped_rect.right = std::clamp(clamped_rect.right, clamped_rect.left + 1, desktop_bounds.right);
+    clamped_rect.bottom = std::clamp(clamped_rect.bottom, clamped_rect.top + 1, desktop_bounds.bottom);
+
+    const int capture_width = clamped_rect.right > clamped_rect.left
+        ? static_cast<int>(clamped_rect.right - clamped_rect.left)
+        : 1;
+    const int capture_height = clamped_rect.bottom > clamped_rect.top
+        ? static_cast<int>(clamped_rect.bottom - clamped_rect.top)
+        : 1;
+
+    const HDC screen_dc = GetDC(nullptr);
+    if (screen_dc == nullptr) {
+        if (error != nullptr) {
+            *error = L"\u65e0\u6cd5\u83b7\u53d6\u5c4f\u5e55 DC";
+        }
+        return false;
+    }
+
+    const HDC memory_dc = CreateCompatibleDC(screen_dc);
+    const HBITMAP bitmap = CreateCompatibleBitmap(screen_dc, capture_width, capture_height);
+    if (memory_dc == nullptr || bitmap == nullptr) {
+        if (bitmap != nullptr) {
+            DeleteObject(bitmap);
+        }
+        if (memory_dc != nullptr) {
+            DeleteDC(memory_dc);
+        }
+        ReleaseDC(nullptr, screen_dc);
+        if (error != nullptr) {
+            *error = L"\u65e0\u6cd5\u521b\u5efa\u622a\u56fe\u7f13\u51b2";
+        }
+        return false;
+    }
+
+    const HGDIOBJ old_bitmap = SelectObject(memory_dc, bitmap);
+    if (!BitBlt(
+            memory_dc,
+            0,
+            0,
+            capture_width,
+            capture_height,
+            screen_dc,
+            clamped_rect.left,
+            clamped_rect.top,
+            SRCCOPY | CAPTUREBLT)) {
+        SelectObject(memory_dc, old_bitmap);
+        DeleteObject(bitmap);
+        DeleteDC(memory_dc);
+        ReleaseDC(nullptr, screen_dc);
+        if (error != nullptr) {
+            *error = L"\u5c4f\u5e55\u533a\u57df\u622a\u56fe\u5931\u8d25";
+        }
+        return false;
+    }
+
+    BITMAPINFO bitmap_info{};
+    bitmap_info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bitmap_info.bmiHeader.biWidth = capture_width;
+    bitmap_info.bmiHeader.biHeight = -capture_height;
+    bitmap_info.bmiHeader.biPlanes = 1;
+    bitmap_info.bmiHeader.biBitCount = 32;
+    bitmap_info.bmiHeader.biCompression = BI_RGB;
+
+    frame->width = capture_width;
+    frame->height = capture_height;
+    frame->screen_rect = clamped_rect;
+    frame->pixels.resize(static_cast<size_t>(capture_width) * static_cast<size_t>(capture_height) * 4u);
+
+    if (GetDIBits(
+            memory_dc,
+            bitmap,
+            0,
+            static_cast<UINT>(capture_height),
+            frame->pixels.data(),
+            &bitmap_info,
+            DIB_RGB_COLORS) == 0) {
+        frame->pixels.clear();
+        SelectObject(memory_dc, old_bitmap);
+        DeleteObject(bitmap);
+        DeleteDC(memory_dc);
+        ReleaseDC(nullptr, screen_dc);
+        if (error != nullptr) {
+            *error = L"\u622a\u56fe\u50cf\u7d20\u8bfb\u53d6\u5931\u8d25";
+        }
+        return false;
+    }
+
+    SelectObject(memory_dc, old_bitmap);
+    DeleteObject(bitmap);
+    DeleteDC(memory_dc);
+    ReleaseDC(nullptr, screen_dc);
     return true;
 }
 
@@ -1812,84 +3260,103 @@ bool DanmakuController::CaptureCurrentRegion(FrameCapture* frame, std::wstring* 
     capture_rect.top = std::clamp(capture_rect.top, desktop_bounds.top, desktop_bounds.bottom);
     capture_rect.right = std::clamp(capture_rect.right, capture_rect.left + 1, desktop_bounds.right);
     capture_rect.bottom = std::clamp(capture_rect.bottom, capture_rect.top + 1, desktop_bounds.bottom);
+    return CaptureScreenRect(capture_rect, frame, error);
+}
 
-    const int capture_width = capture_rect.right > capture_rect.left ? static_cast<int>(capture_rect.right - capture_rect.left) : 1;
-    const int capture_height = capture_rect.bottom > capture_rect.top ? static_cast<int>(capture_rect.bottom - capture_rect.top) : 1;
-
-    const HDC screen_dc = GetDC(nullptr);
-    if (screen_dc == nullptr) {
+bool DanmakuController::CaptureWindowRegion(HWND target_window, FrameCapture* frame, std::wstring* error) const {
+    if (frame == nullptr) {
         if (error != nullptr) {
-            *error = L"\u65e0\u6cd5\u83b7\u53d6\u5c4f\u5e55 DC";
+            *error = L"\u5185\u90e8\u9519\u8bef";
+        }
+        return false;
+    }
+    if (target_window == nullptr || !IsWindow(target_window) || !IsWindowVisible(target_window) || IsIconic(target_window)) {
+        if (error != nullptr) {
+            *error = L"\u4e92\u52a8\u6d88\u606f\u60ac\u6d6e\u7a97\u4e0d\u53ef\u7528";
         }
         return false;
     }
 
-    const HDC memory_dc = CreateCompatibleDC(screen_dc);
-    const HBITMAP bitmap = CreateCompatibleBitmap(screen_dc, capture_width, capture_height);
-    if (memory_dc == nullptr || bitmap == nullptr) {
-        if (bitmap != nullptr) {
-            DeleteObject(bitmap);
-        }
-        if (memory_dc != nullptr) {
-            DeleteDC(memory_dc);
-        }
-        ReleaseDC(nullptr, screen_dc);
+    RECT capture_rect{};
+    if (!GetWindowRect(target_window, &capture_rect)) {
         if (error != nullptr) {
-            *error = L"\u65e0\u6cd5\u521b\u5efa\u5f39\u5e55\u622a\u56fe\u7f13\u51b2";
+            *error = L"\u65e0\u6cd5\u8bfb\u53d6\u60ac\u6d6e\u7a97\u4f4d\u7f6e";
         }
         return false;
     }
 
-    const HGDIOBJ old_bitmap = SelectObject(memory_dc, bitmap);
-    if (!BitBlt(memory_dc, 0, 0, capture_width, capture_height, screen_dc, capture_rect.left, capture_rect.top, SRCCOPY | CAPTUREBLT)) {
-        SelectObject(memory_dc, old_bitmap);
-        DeleteObject(bitmap);
-        DeleteDC(memory_dc);
-        ReleaseDC(nullptr, screen_dc);
+    const std::wstring class_name = ReadWindowClassName(target_window);
+    const int width = std::max(1, static_cast<int>(capture_rect.right - capture_rect.left));
+    const int height = std::max(1, static_cast<int>(capture_rect.bottom - capture_rect.top));
+
+    int inset_left = std::max(6, static_cast<int>(std::lround(width * 0.05)));
+    int inset_right = std::max(6, static_cast<int>(std::lround(width * 0.05)));
+    int inset_top = std::max(40, static_cast<int>(std::lround(height * 0.18)));
+    int inset_bottom = std::max(48, static_cast<int>(std::lround(height * 0.10)));
+
+    if (class_name == L"FinderLiveCommentFloatWnd") {
+        inset_left = std::max(10, static_cast<int>(std::lround(width * 0.07)));
+        inset_right = std::max(10, static_cast<int>(std::lround(width * 0.07)));
+        inset_top = std::max(74, static_cast<int>(std::lround(height * 0.24)));
+        inset_bottom = std::max(54, static_cast<int>(std::lround(height * 0.08)));
+    }
+
+    RECT cropped_rect = capture_rect;
+    cropped_rect.left += inset_left;
+    cropped_rect.right -= inset_right;
+    cropped_rect.top += inset_top;
+    cropped_rect.bottom -= inset_bottom;
+    if (cropped_rect.right - cropped_rect.left < std::max(120, width / 3) ||
+        cropped_rect.bottom - cropped_rect.top < std::max(120, height / 3)) {
+        cropped_rect = capture_rect;
+    }
+
+    RawCaptureFrame full_frame{};
+    if (!CaptureWindowWithGraphicsCapture(target_window, capture_rect, &full_frame, error)) {
+        return false;
+    }
+
+    if (full_frame.width <= 0 || full_frame.height <= 0 || full_frame.pixels.empty()) {
         if (error != nullptr) {
-            *error = L"\u5c4f\u5e55\u533a\u57df\u622a\u56fe\u5931\u8d25";
+            *error = L"\u7a97\u53e3\u6293\u53d6\u7ed3\u679c\u4e3a\u7a7a";
         }
         return false;
     }
 
-    BITMAPINFO bitmap_info{};
-    bitmap_info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bitmap_info.bmiHeader.biWidth = capture_width;
-    bitmap_info.bmiHeader.biHeight = -capture_height;
-    bitmap_info.bmiHeader.biPlanes = 1;
-    bitmap_info.bmiHeader.biBitCount = 32;
-    bitmap_info.bmiHeader.biCompression = BI_RGB;
+    const int crop_left = std::clamp(static_cast<int>(cropped_rect.left - capture_rect.left), 0, full_frame.width - 1);
+    const int crop_top = std::clamp(static_cast<int>(cropped_rect.top - capture_rect.top), 0, full_frame.height - 1);
+    const int crop_right = std::clamp(static_cast<int>(cropped_rect.right - capture_rect.left), crop_left + 1, full_frame.width);
+    const int crop_bottom = std::clamp(static_cast<int>(cropped_rect.bottom - capture_rect.top), crop_top + 1, full_frame.height);
+    const int final_width = std::max(1, crop_right - crop_left);
+    const int final_height = std::max(1, crop_bottom - crop_top);
 
-    frame->width = capture_width;
-    frame->height = capture_height;
-    frame->screen_rect = capture_rect;
-    frame->pixels.resize(static_cast<size_t>(capture_width) * static_cast<size_t>(capture_height) * 4u);
+    frame->width = final_width;
+    frame->height = final_height;
+    frame->screen_rect = cropped_rect;
+    frame->pixels.resize(static_cast<size_t>(final_width) * static_cast<size_t>(final_height) * 4u);
 
-    if (GetDIBits(memory_dc, bitmap, 0, static_cast<UINT>(capture_height), frame->pixels.data(), &bitmap_info, DIB_RGB_COLORS) == 0) {
-        frame->pixels.clear();
-        SelectObject(memory_dc, old_bitmap);
-        DeleteObject(bitmap);
-        DeleteDC(memory_dc);
-        ReleaseDC(nullptr, screen_dc);
-        if (error != nullptr) {
-            *error = L"\u5f39\u5e55\u622a\u56fe\u50cf\u7d20\u8bfb\u53d6\u5931\u8d25";
-        }
-        return false;
+    for (int y = 0; y < final_height; ++y) {
+        const size_t src_offset =
+            (static_cast<size_t>(crop_top + y) * static_cast<size_t>(full_frame.width) + static_cast<size_t>(crop_left)) * 4u;
+        const size_t dst_offset =
+            static_cast<size_t>(y) * static_cast<size_t>(final_width) * 4u;
+        std::memcpy(
+            frame->pixels.data() + dst_offset,
+            full_frame.pixels.data() + src_offset,
+            static_cast<size_t>(final_width) * 4u);
     }
-
-    SelectObject(memory_dc, old_bitmap);
-    DeleteObject(bitmap);
-    DeleteDC(memory_dc);
-    ReleaseDC(nullptr, screen_dc);
     return true;
 }
 
-std::wstring DanmakuController::RecognizeText(const FrameCapture& frame, std::wstring* error) const {
+std::vector<std::wstring> DanmakuController::RecognizeTextLines(
+    const FrameCapture& frame,
+    std::wstring* error) const {
+    std::vector<std::wstring> lines_out;
     if (frame.width <= 0 || frame.height <= 0 || frame.pixels.empty()) {
         if (error != nullptr) {
             *error = L"\u622a\u56fe\u5185\u5bb9\u4e3a\u7a7a";
         }
-        return {};
+        return lines_out;
     }
 
     try {
@@ -1902,7 +3369,7 @@ std::wstring DanmakuController::RecognizeText(const FrameCapture& frame, std::ws
             if (error != nullptr) {
                 *error = L"\u5f53\u524d\u7cfb\u7edf OCR \u4e0d\u53ef\u7528";
             }
-            return {};
+            return lines_out;
         }
 
         DataWriter writer;
@@ -1916,30 +3383,37 @@ std::wstring DanmakuController::RecognizeText(const FrameCapture& frame, std::ws
             BitmapAlphaMode::Ignore);
 
         const auto result = engine.RecognizeAsync(bitmap).get();
-        std::wostringstream stream;
-        bool first = true;
         const auto lines = result.Lines();
+        lines_out.reserve(lines.Size());
         for (uint32_t index = 0; index < lines.Size(); ++index) {
-            const auto line = lines.GetAt(index);
-            const std::wstring line_text = TrimWhitespace(line.Text().c_str());
-            if (line_text.empty()) {
-                continue;
+            const std::wstring line_text = TrimWhitespace(lines.GetAt(index).Text().c_str());
+            if (!line_text.empty()) {
+                lines_out.push_back(line_text);
             }
-            if (!first) {
-                stream << L" / ";
-            }
-            first = false;
-            stream << line_text;
         }
-        return stream.str();
+        return lines_out;
     } catch (const winrt::hresult_error& exception) {
         if (error != nullptr) {
             std::wostringstream stream;
             stream << L"OCR \u89e3\u6790\u5931\u8d25\uff0c\u9519\u8bef 0x" << std::hex << exception.code().value;
             *error = stream.str();
         }
-        return {};
+        return lines_out;
     }
+}
+
+std::wstring DanmakuController::RecognizeText(const FrameCapture& frame, std::wstring* error) const {
+    const auto lines = RecognizeTextLines(frame, error);
+    std::wostringstream stream;
+    bool first = true;
+    for (const auto& line : lines) {
+        if (!first) {
+            stream << L" / ";
+        }
+        first = false;
+        stream << line;
+    }
+    return stream.str();
 }
 
 bool DanmakuController::SaveBitmap(const std::wstring& path, const FrameCapture& frame) const {
@@ -2030,6 +3504,11 @@ bool DanmakuController::LoadRegionLocked() {
         const std::string flag = bool_match[1].str();
         reminder_enabled_ = !flag.empty() && (flag[0] == 't' || flag[0] == 'T');
     }
+    std::regex gift_reminder_pattern("\"giftReminderEnabled\"\\s*:\\s*(true|false)", std::regex::icase);
+    if (std::regex_search(json, bool_match, gift_reminder_pattern) && bool_match.size() >= 2) {
+        const std::string flag = bool_match[1].str();
+        gift_reminder_enabled_ = !flag.empty() && (flag[0] == 't' || flag[0] == 'T');
+    }
     std::regex speech_pattern("\"speechEnabled\"\\s*:\\s*(true|false)", std::regex::icase);
     if (std::regex_search(json, bool_match, speech_pattern) && bool_match.size() >= 2) {
         const std::string flag = bool_match[1].str();
@@ -2060,6 +3539,7 @@ bool DanmakuController::SaveRegionLocked() const {
            << "  \"height\": " << region_.height << ",\n"
            << "  \"valid\": " << (region_.valid ? "true" : "false") << ",\n"
            << "  \"reminderEnabled\": " << (reminder_enabled_ ? "true" : "false") << ",\n"
+           << "  \"giftReminderEnabled\": " << (gift_reminder_enabled_ ? "true" : "false") << ",\n"
            << "  \"speechEnabled\": " << (speech_enabled_ ? "true" : "false") << ",\n"
            << "  \"speechVoiceIndex\": " << speech_voice_index_ << "\n"
            << "}\n";
@@ -2097,13 +3577,17 @@ std::wstring DanmakuController::BuildCaptureFilePath(bool manual_test) const {
     return stream.str();
 }
 
-bool DanmakuController::IsDuplicateLocked(const std::wstring& normalized_text, ULONGLONG now_tick) {
+bool DanmakuController::IsDuplicateLocked(const std::wstring& dedupe_key, ULONGLONG now_tick) {
+    if (dedupe_key.empty()) {
+        return false;
+    }
+
     while (!dedupe_entries_.empty() && now_tick - dedupe_entries_.front().tick > kDedupeWindowMs) {
         dedupe_entries_.pop_front();
     }
 
     for (const auto& entry : dedupe_entries_) {
-        if (entry.normalized_text == normalized_text) {
+        if (entry.dedupe_key == dedupe_key) {
             return true;
         }
     }
@@ -2114,8 +3598,9 @@ void DanmakuController::AppendEventLocked(
     EventKind kind,
     const std::wstring& text,
     const std::wstring& capture_path,
+    const std::wstring& dedupe_key,
     ULONGLONG now_tick) {
-    const std::wstring normalized = NormalizeText(text);
+    const std::wstring normalized = !dedupe_key.empty() ? dedupe_key : NormalizeText(text);
     if (normalized.empty()) {
         return;
     }
@@ -2198,23 +3683,39 @@ void DanmakuController::NotifyAcceptedEvent(EventKind kind, const std::wstring& 
     }
 
     bool reminder_enabled = false;
+    bool gift_reminder_enabled = false;
     bool speech_enabled = false;
+    EventFn event_fn;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         reminder_enabled = reminder_enabled_;
+        gift_reminder_enabled = gift_reminder_enabled_;
         speech_enabled = speech_enabled_;
+        event_fn = event_fn_;
     }
 
-    if (reminder_enabled) {
-        const std::wstring reminder_sound_path = GetDanmakuReminderSoundPath();
+    const bool play_reminder = kind == EventKind::kImageGift ? gift_reminder_enabled : reminder_enabled;
+    if (play_reminder) {
+        std::wstring reminder_sound_path = kind == EventKind::kImageGift
+            ? GetGiftReminderSoundPath()
+            : GetDanmakuReminderSoundPath();
+        if (reminder_sound_path.empty() && kind == EventKind::kImageGift) {
+            reminder_sound_path = GetDanmakuReminderSoundPath();
+        }
         if (!reminder_sound_path.empty()) {
             PlaySoundW(reminder_sound_path.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
         } else {
-            PlaySoundW(L"SystemAsterisk", nullptr, SND_ALIAS | SND_ASYNC | SND_NODEFAULT);
+            PlaySoundW(
+                kind == EventKind::kImageGift ? L"SystemExclamation" : L"SystemAsterisk",
+                nullptr,
+                SND_ALIAS | SND_ASYNC | SND_NODEFAULT);
         }
     }
     if (speech_enabled) {
         QueueSpeech(BuildSpeechText(kind, text));
+    }
+    if (event_fn) {
+        event_fn(kind == EventKind::kImageGift, text);
     }
 }
 
@@ -2244,6 +3745,106 @@ std::wstring DanmakuController::NormalizeText(const std::wstring& text) {
         normalized.push_back(ch);
     }
     return normalized;
+}
+
+std::vector<std::wstring> DanmakuController::ExtractOcrDanmakuLines(const std::vector<std::wstring>& lines) {
+    std::vector<std::wstring> filtered_lines;
+    std::vector<std::wstring> seen_lines;
+    filtered_lines.reserve(lines.size());
+    seen_lines.reserve(lines.size());
+
+    static const wchar_t* const kIgnoredTokens[] = {
+        L"\u4e92\u52a8\u6d88\u606f",
+        L"\u6dfb\u52a0\u8bc4\u8bba",
+        L"\u53d1\u9001",
+        L"\u6682\u65e0\u89c2\u4f17\u9001\u793c",
+        L"\u5173\u95ed",
+        L"\u6700\u5c0f\u5316",
+        L"\u7b49\u5f85\u8fde\u63a5",
+        L"\u7b49\u5f85\u68c0\u6d4b",
+        L"\u68c0\u6d4b",
+        L"\u76d1\u542c",
+        L"\u753b\u9762",
+        L"\u8bed\u97f3",
+        L"\u5f39\u5e55",
+        L"\u56de\u590d",
+        L"\u8bf4\u660e",
+        L"\u64ad\u62a5",
+        L"\u97f3\u8272",
+        L"\u60ac\u6d6e\u7a97",
+        L"Microsoft",
+        L"Huihui",
+    };
+
+    for (const auto& raw_line : lines) {
+        std::wstring cleaned = CleanUiDanmakuText(raw_line);
+        cleaned = TrimWhitespace(cleaned);
+        if (cleaned.empty()) {
+            continue;
+        }
+        const std::wstring normalized_cleaned = NormalizeUiCompareText(cleaned);
+        if (normalized_cleaned.empty()) {
+            continue;
+        }
+
+        bool ignored = false;
+        for (const auto* token : kIgnoredTokens) {
+            if (ContainsCaseInsensitive(cleaned, token)) {
+                ignored = true;
+                break;
+            }
+        }
+        if (ignored) {
+            continue;
+        }
+        if (IsUiSystemNoticeText(cleaned)) {
+            continue;
+        }
+        const size_t colon_pos = cleaned.find(L'\uff1a');
+        const size_t ascii_colon_pos = cleaned.find(L':');
+        const size_t separator = colon_pos != std::wstring::npos ? colon_pos : ascii_colon_pos;
+        const int chinese_count = CountChineseChars(cleaned);
+        const int ascii_count = CountAsciiLettersAndDigits(cleaned);
+        if (ascii_count >= 3 && ascii_count >= chinese_count * 2) {
+            continue;
+        }
+        if (chinese_count <= 1 && ascii_count > 0) {
+            continue;
+        }
+        if (separator == std::wstring::npos &&
+            normalized_cleaned.size() >= 18 &&
+            !IsUiGiftMessageText(cleaned)) {
+            continue;
+        }
+        if (!ContainsChinese(cleaned) &&
+            separator == std::wstring::npos &&
+            !IsUiGiftMessageText(cleaned)) {
+            continue;
+        }
+        if (cleaned.size() == 1 && !ContainsChinese(cleaned)) {
+            continue;
+        }
+        if (separator != std::wstring::npos) {
+            const std::wstring left = TrimWhitespace(cleaned.substr(0, separator));
+            const std::wstring right = TrimWhitespace(cleaned.substr(separator + 1));
+            if (left.empty() || right.empty()) {
+                continue;
+            }
+            if (right.size() > 24) {
+                continue;
+            }
+        } else if (chinese_count > 8 && !IsUiGiftMessageText(cleaned)) {
+            continue;
+        }
+
+        if (std::find(seen_lines.begin(), seen_lines.end(), normalized_cleaned) != seen_lines.end()) {
+            continue;
+        }
+
+        seen_lines.push_back(normalized_cleaned);
+        filtered_lines.push_back(cleaned);
+    }
+    return filtered_lines;
 }
 
 std::wstring DanmakuController::TrimWhitespace(const std::wstring& text) {
@@ -2408,7 +4009,7 @@ std::wstring DanmakuController::BuildSpeechText(EventKind kind, const std::wstri
     return speech;
 }
 
-DanmakuController::UiProbeResult DanmakuController::ProbeWindowByUiAutomation(HWND target_window) {
+DanmakuController::UiProbeResult DanmakuController::ProbeWindowByVisibleContent(HWND target_window) const {
     UiProbeResult result{};
     result.target_title = ReadWindowText(target_window);
     if (result.target_title.empty()) {
@@ -2420,133 +4021,33 @@ DanmakuController::UiProbeResult DanmakuController::ProbeWindowByUiAutomation(HW
         return result;
     }
 
-    const HRESULT apartment_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    if (FAILED(apartment_result) && apartment_result != RPC_E_CHANGED_MODE) {
-        result.status_text = L"UIA COM \u521d\u59cb\u5316\u5931\u8d25";
-        return result;
-    }
-
-    winrt::com_ptr<IUIAutomation> automation;
-    const HRESULT automation_result = CoCreateInstance(
-        CLSID_CUIAutomation,
-        nullptr,
-        CLSCTX_INPROC_SERVER,
-        IID_PPV_ARGS(automation.put()));
-    if (FAILED(automation_result) || !automation) {
-        result.status_text = L"\u65e0\u6cd5\u521b\u5efa Windows UI Automation \u63a2\u6d4b\u5668";
-        if (SUCCEEDED(apartment_result)) {
-            CoUninitialize();
+    const auto read_result = ReadUiDanmakuWindow(target_window);
+    if (!read_result.error.empty() && read_result.lines.empty()) {
+        result.status_text = std::wstring(L"\u5df2\u627e\u5230\u60ac\u6d6e\u7a97\uff0c\u4f46 UI \u6587\u672c\u6811\u8bfb\u53d6\u5931\u8d25\uff1a") + read_result.error;
+        if (!result.target_title.empty()) {
+            result.lines.push_back(L"\u76ee\u6807\u7a97\u53e3\uff1a" + result.target_title);
         }
         return result;
     }
 
-    winrt::com_ptr<IUIAutomationElement> root;
-    if (FAILED(automation->ElementFromHandle(target_window, root.put())) || !root) {
-        result.status_text = L"\u65e0\u6cd5\u8bfb\u53d6\u76ee\u6807\u7a97\u53e3\u7684 UIA \u6839\u8282\u70b9";
-        if (SUCCEEDED(apartment_result)) {
-            CoUninitialize();
-        }
-        return result;
-    }
-
-    winrt::com_ptr<IUIAutomationCondition> true_condition;
-    winrt::com_ptr<IUIAutomationElementArray> elements;
-    if (FAILED(automation->CreateTrueCondition(true_condition.put())) ||
-        !true_condition ||
-        FAILED(root->FindAll(TreeScope_Subtree, true_condition.get(), elements.put())) ||
-        !elements) {
-        result.status_text = L"UIA \u63a7\u4ef6\u6811\u626b\u63cf\u5931\u8d25";
-        if (SUCCEEDED(apartment_result)) {
-            CoUninitialize();
-        }
-        return result;
-    }
-
-    struct ProbeHit {
-        int score = 0;
-        std::wstring text;
-        std::wstring control_type;
-        std::wstring class_name;
-    };
-
-    int length = 0;
-    elements->get_Length(&length);
-    std::vector<ProbeHit> hits;
-    std::vector<std::wstring> fallback_lines;
-    std::vector<std::wstring> seen_texts;
-    seen_texts.reserve(64);
-
-    const auto already_seen = [&seen_texts](const std::wstring& text) {
-        return std::find(seen_texts.begin(), seen_texts.end(), text) != seen_texts.end();
-    };
-
-    for (int index = 0; index < length && index < 900; ++index) {
-        winrt::com_ptr<IUIAutomationElement> element;
-        if (FAILED(elements->GetElement(index, element.put())) || !element) {
-            continue;
-        }
-
-        const std::wstring text = ReadElementName(element.get());
-        if (text.empty() || already_seen(text)) {
-            continue;
-        }
-
-        CONTROLTYPEID control_type_id = 0;
-        element->get_CurrentControlType(&control_type_id);
-        const int score = ScoreUiProbeText(text, control_type_id);
-        const std::wstring control_type = ControlTypeLabel(control_type_id);
-        const std::wstring class_name = ReadElementClassName(element.get());
-        seen_texts.push_back(text);
-
-        if (score >= 4) {
-            hits.push_back({score, text, control_type, class_name});
-        } else if (!IsIgnoredUiProbeText(text) && text.size() >= 2 && fallback_lines.size() < kMaxProbeLines) {
-            std::wstring line = control_type + L"\uff1a" + text;
-            if (!class_name.empty()) {
-                line += L"  (" + class_name + L")";
-            }
-            fallback_lines.push_back(std::move(line));
-        }
-    }
-
-    std::sort(hits.begin(), hits.end(), [](const ProbeHit& left, const ProbeHit& right) {
-        if (left.score != right.score) {
-            return left.score > right.score;
-        }
-        return left.text.size() < right.text.size();
-    });
-
+    const auto& filtered_lines = read_result.lines;
     if (!result.target_title.empty()) {
         result.lines.push_back(L"\u76ee\u6807\u7a97\u53e3\uff1a" + result.target_title);
     }
-
-    if (!hits.empty()) {
-        const size_t limit = std::min(hits.size(), kMaxProbeLines - result.lines.size());
-        for (size_t index = 0; index < limit; ++index) {
-            std::wstring line =
-                L"\u5019\u9009 " + std::to_wstring(index + 1) +
-                L"\uff08" + hits[index].control_type + L"\uff09\uff1a" + hits[index].text;
-            if (!hits[index].class_name.empty()) {
-                line += L"  (" + hits[index].class_name + L")";
-            }
-            result.lines.push_back(std::move(line));
+    for (const auto& line : filtered_lines) {
+        if (result.lines.size() >= kMaxProbeLines) {
+            break;
         }
-        result.status_text =
-            L"UIA \u53ef\u8bfb\u53d6\uff0c\u5df2\u627e\u5230 " + std::to_wstring(hits.size()) +
-            L" \u6761\u5019\u9009\u6587\u672c\uff0c\u9002\u5408\u7ee7\u7eed\u505a\u76f4\u63a5\u6293\u53d6";
-    } else if (!fallback_lines.empty()) {
-        for (size_t index = 0; index < fallback_lines.size() && result.lines.size() < kMaxProbeLines; ++index) {
-            result.lines.push_back(fallback_lines[index]);
-        }
-        result.status_text =
-            L"UIA \u80fd\u8bfb\u5230\u4e00\u4e9b\u63a7\u4ef6\u6587\u5b57\uff0c\u4f46\u8fd8\u6ca1\u9501\u5b9a\u5230\u660e\u786e\u7684\u8bc4\u8bba\u5217\u8868";
-    } else {
-        result.status_text =
-            L"UIA \u51e0\u4e4e\u8bfb\u4e0d\u5230\u6709\u6548\u6587\u5b57\uff0c\u8fd9\u4e2a\u7a97\u53e3\u53ef\u80fd\u662f\u81ea\u7ed8\u6216 GPU \u6e32\u67d3\u63a7\u4ef6";
+        result.lines.push_back(L"\u53ef\u89c1\u6587\u672c\uff1a" + line);
     }
 
-    if (SUCCEEDED(apartment_result)) {
-        CoUninitialize();
+    if (!filtered_lines.empty()) {
+        result.status_text =
+            L"\u5df2\u8fde\u63a5\u4e92\u52a8\u6d88\u606f\u60ac\u6d6e\u7a97\uff0cUI \u6587\u672c\u6811\u8bc6\u522b\u5230 " +
+            std::to_wstring(filtered_lines.size()) + L" \u6761\u53ef\u89c1\u6587\u672c";
+    } else {
+        result.status_text =
+            L"\u5df2\u8fde\u63a5\u4e92\u52a8\u6d88\u606f\u60ac\u6d6e\u7a97\uff0cUI \u6587\u672c\u6811\u5f53\u524d\u672a\u8bc6\u522b\u5230\u53ef\u89c1\u5f39\u5e55";
     }
     return result;
 }

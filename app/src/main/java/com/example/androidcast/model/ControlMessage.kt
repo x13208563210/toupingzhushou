@@ -4,7 +4,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 object ControlMessage {
-    private const val MAX_STREAM_FPS = 60
+    private const val MAX_STREAM_FPS = 120
     const val TYPE_HELLO = "HELLO"
     const val TYPE_SELECT_PROFILE = "SELECT_PROFILE"
     const val TYPE_REQUEST_IDR = "REQUEST_IDR"

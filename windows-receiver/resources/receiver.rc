@@ -1,11 +1,13 @@
-#include <winver.h>
+﻿#include <winver.h>
+
+#pragma code_page(65001)
 
 1 ICON "z6y-logo.ico"
 1 RT_MANIFEST "receiver.manifest"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 0,4,10,0
-PRODUCTVERSION 0,4,10,0
+FILEVERSION 0,4,21,0
+PRODUCTVERSION 0,4,21,0
  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
 #ifdef _DEBUG
  FILEFLAGS VS_FF_DEBUG
@@ -20,13 +22,13 @@ BEGIN
     BEGIN
         BLOCK "080404B0"
         BEGIN
-            VALUE "CompanyName", "Zhou6Y\0"
-            VALUE "FileDescription", "Live Cast Assistant Receiver\0"
-            VALUE "FileVersion", "0.4.10.0\0"
-            VALUE "InternalName", "AndroidCastReceiver\0"
-            VALUE "OriginalFilename", "AndroidCastReceiver.exe\0"
-            VALUE "ProductName", "Live Cast Assistant Receiver\0"
-            VALUE "ProductVersion", "0.4.10.0\0"
+            VALUE "CompanyName", "z6y\0"
+            VALUE "FileDescription", "直播投屏助手接收端\0"
+            VALUE "FileVersion", "0.4.21.0\0"
+            VALUE "InternalName", "直播投屏助手\0"
+            VALUE "OriginalFilename", "直播投屏助手.exe\0"
+            VALUE "ProductName", "直播投屏助手\0"
+            VALUE "ProductVersion", "0.4.21.0\0"
         END
     END
     BLOCK "VarFileInfo"

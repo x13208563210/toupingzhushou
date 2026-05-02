@@ -26,7 +26,7 @@ class UdpPacketizer(
             tcpNoDelay = true
             keepAlive = true
             connect(InetSocketAddress(address, port), CONNECT_TIMEOUT_MS)
-            sendBufferSize = 16 shl 20
+            sendBufferSize = VIDEO_TCP_SEND_BUFFER_BYTES
             runCatching { trafficClass = 0x10 }
         }
     private val outputStream = socket.getOutputStream()
@@ -222,9 +222,10 @@ class UdpPacketizer(
 
     companion object {
         private const val CONNECT_TIMEOUT_MS = 4_000
-        private const val WARNING_RESET_PENDING_ACCESS_UNITS = 48
-        private const val TRIMMED_PENDING_ACCESS_UNITS = 96
-        private const val MAX_PENDING_ACCESS_UNITS = 192
+        private const val VIDEO_TCP_SEND_BUFFER_BYTES = 1 shl 20
+        private const val WARNING_RESET_PENDING_ACCESS_UNITS = 4
+        private const val TRIMMED_PENDING_ACCESS_UNITS = 6
+        private const val MAX_PENDING_ACCESS_UNITS = 18
         private const val TAG = "UdpPacketizer"
     }
 }

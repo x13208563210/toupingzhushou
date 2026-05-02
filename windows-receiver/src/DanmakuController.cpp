@@ -2820,7 +2820,9 @@ bool DanmakuController::PollUiDanmakuWindow() {
             std::wstring accepted_text = cleaned;
             if (!IsUiTextDanmakuText(cleaned) && IsUiGiftMessageText(cleaned)) {
                 kind = EventKind::kImageGift;
-                accepted_text = L"\u6709\u793c\u7269";
+                if (NormalizeText(accepted_text).empty()) {
+                    accepted_text = L"\u6709\u793c\u7269";
+                }
             } else {
                 if (NormalizeText(cleaned).empty()) {
                     continue;

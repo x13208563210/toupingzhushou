@@ -19,8 +19,9 @@ class VideoEncoder(
 ) {
     companion object {
         private const val DEFAULT_I_FRAME_INTERVAL_SECONDS = 1
-        private const val LOW_LATENCY_I_FRAME_INTERVAL_SECONDS = 0.35f
-        private const val MAX_STREAM_FPS = 60
+        private const val LOW_LATENCY_I_FRAME_INTERVAL_SECONDS = 0.25f
+        private const val MAX_STREAM_FPS = 120
+        private const val OUTPUT_DEQUEUE_TIMEOUT_US = 1_000L
         private const val TAG = "VideoEncoder"
         private const val STATS_LOG_INTERVAL_FRAMES = 30L
     }
@@ -67,6 +68,7 @@ class VideoEncoder(
             setInteger(MediaFormat.KEY_BIT_RATE, profile.bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, targetFps)
             runCatching { setFloat(MediaFormat.KEY_CAPTURE_RATE, targetFps.toFloat()) }
+            runCatching { setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, targetFps.toFloat()) }
             val preciseIFrameApplied =
                 runCatching {
                     setFloat(MediaFormat.KEY_I_FRAME_INTERVAL, LOW_LATENCY_I_FRAME_INTERVAL_SECONDS)
@@ -140,7 +142,7 @@ class VideoEncoder(
             }
             val bufferInfo = MediaCodec.BufferInfo()
             while (running.get()) {
-                when (val index = mediaCodec.dequeueOutputBuffer(bufferInfo, 2_000)) {
+                when (val index = mediaCodec.dequeueOutputBuffer(bufferInfo, OUTPUT_DEQUEUE_TIMEOUT_US)) {
                     MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
                     MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                         SenderDiagnostics.i(TAG, "编码输出格式变化: ${mediaCodec.outputFormat}")
@@ -405,6 +407,7 @@ class VideoEncoder(
 
     private fun applyLowLatencyHints(format: MediaFormat) {
         runCatching { format.setInteger(MediaFormat.KEY_PRIORITY, 0) }
+        runCatching { format.setInteger(MediaFormat.KEY_LATENCY, 1) }
         val operatingRate = targetFps.toFloat()
         runCatching { format.setFloat(MediaFormat.KEY_OPERATING_RATE, operatingRate) }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {

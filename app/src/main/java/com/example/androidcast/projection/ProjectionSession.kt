@@ -58,7 +58,8 @@ class ProjectionSession(
         val availableProfiles = CapabilityProbe().chooseProfiles()
         require(availableProfiles.isNotEmpty()) { "没有找到可用的 AVC 编码配置。" }
 
-        val configuredProfile = StreamSettingsStore(context).resolveSelectedProfile(availableProfiles)
+        val configuredProfile =
+            StreamSettingsStore(context).resolveSelectedProfile(availableProfiles)
         val supportedProfiles = listOf(configuredProfile)
         val audioRequested = configuredProfile.audioEnabled
         SenderDiagnostics.i(

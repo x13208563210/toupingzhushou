@@ -12,7 +12,7 @@
 namespace {
 
 constexpr SOCKET kInvalidSocket = INVALID_SOCKET;
-constexpr int kMaxStreamFps = 60;
+constexpr int kMaxStreamFps = 120;
 constexpr int kMinWirelessBitrate = 4'000'000;
 
 int SelectWirelessBitrateCap(const protocol::StreamProfile& profile) {
@@ -90,7 +90,7 @@ bool IsWithinFrameRateCap(const protocol::StreamProfile& profile) {
     return profile.fps > 0 && profile.fps <= kMaxStreamFps;
 }
 
-protocol::StreamProfile CapProfileTo60Fps(protocol::StreamProfile profile) {
+protocol::StreamProfile CapProfileToMaxFps(protocol::StreamProfile profile) {
     if (profile.fps > kMaxStreamFps) {
         profile.fps = kMaxStreamFps;
     }
@@ -98,7 +98,7 @@ protocol::StreamProfile CapProfileTo60Fps(protocol::StreamProfile profile) {
 }
 
 protocol::StreamProfile ApplyWirelessStabilityPolicy(protocol::StreamProfile profile) {
-    profile = CapProfileTo60Fps(profile);
+    profile = CapProfileToMaxFps(profile);
     const int bitrate_cap = std::max(kMinWirelessBitrate, SelectWirelessBitrateCap(profile));
     if (profile.bitrate <= 0 || profile.bitrate > bitrate_cap) {
         profile.bitrate = bitrate_cap;
@@ -445,7 +445,7 @@ protocol::StreamProfile ControlServer::ChooseProfile(const protocol::HelloMessag
             profile.height == 1080 &&
             profile.adaptive_fps &&
             IsWithinFrameRateCap(profile)) {
-            return CapProfileTo60Fps(profile);
+            return CapProfileToMaxFps(profile);
         }
     }
 
@@ -455,7 +455,7 @@ protocol::StreamProfile ControlServer::ChooseProfile(const protocol::HelloMessag
             profile.height == 1080 &&
             profile.fps == 60 &&
             IsWithinFrameRateCap(profile)) {
-            return CapProfileTo60Fps(profile);
+            return CapProfileToMaxFps(profile);
         }
     }
 
@@ -465,7 +465,7 @@ protocol::StreamProfile ControlServer::ChooseProfile(const protocol::HelloMessag
             profile.height == 1440 &&
             profile.fps == 30 &&
             IsWithinFrameRateCap(profile)) {
-            return CapProfileTo60Fps(profile);
+            return CapProfileToMaxFps(profile);
         }
     }
 
@@ -475,7 +475,7 @@ protocol::StreamProfile ControlServer::ChooseProfile(const protocol::HelloMessag
             profile.height == 1440 &&
             profile.fps == 60 &&
             IsWithinFrameRateCap(profile)) {
-            return CapProfileTo60Fps(profile);
+            return CapProfileToMaxFps(profile);
         }
     }
 
@@ -483,16 +483,16 @@ protocol::StreamProfile ControlServer::ChooseProfile(const protocol::HelloMessag
         if (profile.codec == protocol::Codec::kAvc &&
             profile.adaptive_fps &&
             IsWithinFrameRateCap(profile)) {
-            return CapProfileTo60Fps(profile);
+            return CapProfileToMaxFps(profile);
         }
     }
 
     for (const auto& profile : hello.profiles) {
         if (profile.codec == protocol::Codec::kAvc &&
             IsWithinFrameRateCap(profile)) {
-            return CapProfileTo60Fps(profile);
+            return CapProfileToMaxFps(profile);
         }
     }
 
-    return CapProfileTo60Fps(hello.profiles.front());
+    return CapProfileToMaxFps(hello.profiles.front());
 }

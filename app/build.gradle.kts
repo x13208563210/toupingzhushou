@@ -3,8 +3,8 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-val appVersionCode = 59
-val appVersionName = "0.3.49-latency-queue-stabilize-2026-04-16"
+val appVersionCode = 63
+val appVersionName = "0.4.22-2026-04-29"
 
 android {
     namespace = "com.example.androidcast"

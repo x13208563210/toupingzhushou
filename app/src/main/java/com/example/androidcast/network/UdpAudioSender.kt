@@ -23,7 +23,7 @@ class UdpAudioSender(
     private val address = InetAddress.getByName(host)
     private val socket = DatagramSocket().apply {
         connect(address, port)
-        sendBufferSize = 2 shl 20
+        sendBufferSize = AUDIO_UDP_SEND_BUFFER_BYTES
         runCatching { trafficClass = 0x10 }
     }
     private val running = AtomicBoolean(true)
@@ -169,8 +169,9 @@ class UdpAudioSender(
     }
 
     companion object {
+        private const val AUDIO_UDP_SEND_BUFFER_BYTES = 256 shl 10
         private const val MAX_PAYLOAD_SIZE = 1400
-        private const val MAX_PENDING_AUDIO_FRAMES = 6
+        private const val MAX_PENDING_AUDIO_FRAMES = 4
         private const val AUDIO_SEND_STATS_LOG_EVERY_FRAMES = 100L
         private const val TAG = "UdpAudioSender"
     }

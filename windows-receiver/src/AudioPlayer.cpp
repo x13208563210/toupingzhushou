@@ -1,24 +1,45 @@
 #include "AudioPlayer.h"
 
+#include <avrt.h>
+
 #include <algorithm>
 #include <chrono>
 #include <sstream>
 
+#pragma comment(lib, "Avrt.lib")
+
 namespace {
 
-// 低延迟配置 - 平衡延迟和音质
-constexpr size_t kMaxInFlightBuffers = 4;         // 增加并发缓冲数，避免欠载
-constexpr size_t kMaxPendingBufferedMs = 15;      // 待提交缓冲 15ms (原 40ms)
-constexpr size_t kMaxSubmittedBufferedMs = 12;    // 已提交缓冲 12ms (原 30ms)
-constexpr size_t kTargetTotalBufferedMs = 15;     // 目标总缓冲 15ms (原 28ms)
-constexpr size_t kHardTotalBufferedMs = 25;       // 硬限制 25ms (原 40ms)
-// Sender audio is delivered in ~10ms PCM frames. Keep startup low-latency by allowing
-// the first frame to submit immediately instead of waiting for a second frame that may
-// never coexist under the 15ms pending-buffer cap.
-constexpr size_t kMinSubmitFrameCount = 1;
+// Tune for 10ms PCM frames. The current waveOut path is more stable if it
+// behaves like a short buffered PCM queue instead of trying to schedule every
+// frame against the sender clock. We still keep the buffer compact, but give it
+// enough room to absorb normal wireless and thread jitter without audible cuts.
+constexpr bool kUseClockSyncedPcmScheduling = false;
+constexpr size_t kMaxInFlightBuffers = 10;
+constexpr size_t kMaxPendingBufferedMs = 120;
+constexpr size_t kStartupMaxSubmittedBufferedMs = 50;
+constexpr size_t kStartupTargetTotalBufferedMs = 60;
+constexpr size_t kStartupSoftTotalBufferedMs = 80;
+constexpr size_t kSteadyMaxSubmittedBufferedMs = 40;
+constexpr size_t kSteadyTargetTotalBufferedMs = 50;
+constexpr size_t kSteadySoftTotalBufferedMs = 70;
+constexpr size_t kRecoveryMaxSubmittedBufferedMs = 60;
+constexpr size_t kRecoveryTargetTotalBufferedMs = 70;
+constexpr size_t kRecoverySoftTotalBufferedMs = 90;
+constexpr size_t kHardTotalBufferedMs = 130;
+constexpr size_t kStartupMinSubmitFrameCount = 1;
+constexpr size_t kSteadyMinSubmitFrameCount = 1;
+constexpr size_t kRecoveryMinSubmitFrameCount = 1;
+constexpr uint64_t kSteadyStatePlayedFramesThreshold = 14;
+constexpr int64_t kSteadyStateWarmupUs = 200'000;
+constexpr int64_t kRecoveryHoldUs = 1'500'000;
+constexpr int64_t kSoftOverloadWindowUs = 800'000;
+constexpr uint64_t kSoftOverloadEventsBeforeRecovery = 2;
+constexpr uint64_t kSoftOverloadEventsBeforeResync = 5;
+constexpr int64_t kResyncCooldownUs = 1'500'000;
 
 constexpr int64_t kAudioSubmitLeadUs = 8'000;
-constexpr int64_t kAudioLateDropUs = 25'000;
+constexpr int64_t kAudioLateDropUs = 90'000;
 constexpr int64_t kAudioWakeMarginUs = 500;
 
 int64_t NowSteadyUs() {
@@ -76,6 +97,7 @@ bool AudioPlayer::Start(int sample_rate, int channels) {
         desired_channels_ = channels;
         if (!same_format) {
             pending_pcm_frames_.clear();
+            ResetSessionStateLocked();
             ++request_generation_;
         } else if (wave_out_ != nullptr) {
             return true;
@@ -125,7 +147,7 @@ bool AudioPlayer::SubmitPcmFrame(
     PendingPcmFrame frame;
     frame.bytes.assign(data, data + size);
     frame.sender_pts_us = sender_pts_us;
-    if (has_clock_sync && sender_pts_us > 0) {
+    if (kUseClockSyncedPcmScheduling && has_clock_sync && sender_pts_us > 0) {
         frame.target_submit_us =
             static_cast<int64_t>(sender_pts_us) - sender_clock_offset_us - kAudioSubmitLeadUs;
     }
@@ -152,8 +174,12 @@ AudioPlaybackStats AudioPlayer::GetStats() const {
     stats.submitted_frames = submitted_frames_;
     stats.played_frames = played_frames_;
     stats.dropped_frames = dropped_frames_;
+    stats.resync_count = resync_count_;
+    stats.recovery_mode = recovery_mode_until_us_ > NowSteadyUs();
     stats.buffered_frames = buffers_.size() + pending_pcm_frames_.size();
     stats.buffered_ms = TotalBufferedMsLocked();
+    stats.pending_buffered_ms = PendingBufferedMsLocked();
+    stats.submitted_buffered_ms = SubmittedBufferedMsLocked();
     return stats;
 }
 
@@ -172,6 +198,11 @@ void CALLBACK AudioPlayer::WaveOutCallback(
 }
 
 void AudioPlayer::WorkerMain() {
+    DWORD mmcss_task_index = 0;
+    HANDLE mmcss_handle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcss_task_index);
+    if (mmcss_handle != nullptr) {
+        AvSetMmThreadPriority(mmcss_handle, AVRT_PRIORITY_HIGH);
+    }
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
     uint64_t observed_generation = 0;
@@ -182,6 +213,7 @@ void AudioPlayer::WorkerMain() {
         int desired_channels = 0;
         bool needs_close = false;
         bool needs_open = false;
+        bool needs_resync = false;
         std::vector<uint8_t> frame_to_submit;
 
         {
@@ -197,12 +229,14 @@ void AudioPlayer::WorkerMain() {
                     break;
                 }
 
+                const BufferProfile active_profile = ActiveProfileLocked();
+                LogProfileTransitionIfNeededLocked(active_profile);
                 const bool can_submit =
                     desired_running_ &&
                     wave_out_ != nullptr &&
                     !pending_pcm_frames_.empty() &&
                     buffers_.size() < kMaxInFlightBuffers &&
-                    SubmittedBufferedMsLocked() < kMaxSubmittedBufferedMs;
+                    SubmittedBufferedMsLocked() < active_profile.max_submitted_buffered_ms;
                 if (!can_submit) {
                     cv_.wait(lock);
                     continue;
@@ -242,24 +276,37 @@ void AudioPlayer::WorkerMain() {
                     sample_rate_ != desired_sample_rate ||
                     channels_ != desired_channels);
             needs_open = should_run && wave_out_ == nullptr;
-
-            if (should_run &&
+            needs_resync =
+                should_run &&
+                wave_out_ != nullptr &&
                 !needs_close &&
-                !needs_open &&
-                !pending_pcm_frames_.empty()) {
-                if (TotalBufferedMsLocked() > kTargetTotalBufferedMs) {
-                    TrimTotalBufferedMsLocked(
-                        kTargetTotalBufferedMs,
-                        L"\u97f3\u9891\u64ad\u653e\u79ef\u538b\u8fc7\u6df1\uff0c\u4e22\u5f03\u8fc7\u671f PCM \u5e27\u4fdd\u6301\u4f4e\u5ef6\u8fdf\u3002");
+                playback_resync_requested_;
+            if (needs_resync) {
+                playback_resync_requested_ = false;
+            }
+
+            if (should_run && !needs_close && !needs_open) {
+                const BufferProfile active_profile = ActiveProfileLocked();
+                LogProfileTransitionIfNeededLocked(active_profile);
+                if (TotalBufferedMsLocked() > active_profile.soft_total_buffered_ms) {
+                    HandleSoftOverloadLocked(active_profile);
+                    if (!needs_resync &&
+                        wave_out_ != nullptr &&
+                        playback_resync_requested_) {
+                        needs_resync = true;
+                        playback_resync_requested_ = false;
+                    }
                 }
             }
 
+            const BufferProfile active_profile = ActiveProfileLocked();
+            LogProfileTransitionIfNeededLocked(active_profile);
             if (should_run &&
                 !needs_close &&
                 !needs_open &&
                 !pending_pcm_frames_.empty() &&
                 buffers_.size() < kMaxInFlightBuffers &&
-                SubmittedBufferedMsLocked() < kMaxSubmittedBufferedMs) {
+                SubmittedBufferedMsLocked() < active_profile.max_submitted_buffered_ms) {
                 // 累积足够的帧再提交，避免撕裂
                 while (!pending_pcm_frames_.empty()) {
                     const PendingPcmFrame& pending_frame = pending_pcm_frames_.front();
@@ -292,19 +339,31 @@ void AudioPlayer::WorkerMain() {
 
                 const size_t pending_ms = PendingBufferedMsLocked();
                 const size_t submitted_ms = SubmittedBufferedMsLocked();
+                if (pending_ms + submitted_ms < active_profile.target_total_buffered_ms &&
+                    pending_pcm_frames_.size() < active_profile.min_submit_frame_count) {
+                    continue;
+                }
+/*
+                if (pending_ms + submitted_ms < active_profile.target_total_buffered_ms &&
                 
                 // 如果缓冲太少，等待更多数据
-                if (pending_ms + submitted_ms < kTargetTotalBufferedMs &&
-                    pending_pcm_frames_.size() < kMinSubmitFrameCount) {
+                if (pending_ms + submitted_ms < active_profile.target_total_buffered_ms &&
+                    pending_pcm_frames_.size() < active_profile.min_submit_frame_count) {
                     continue;
                 }
                 
+*/
                 frame_to_submit = std::move(pending_pcm_frames_.front().bytes);
                 pending_pcm_frames_.pop_front();
             }
         }
 
         if (needs_close) {
+            CloseWaveOutDevice();
+            continue;
+        }
+
+        if (needs_resync) {
             CloseWaveOutDevice();
             continue;
         }
@@ -320,6 +379,9 @@ void AudioPlayer::WorkerMain() {
     }
 
     CloseWaveOutDevice();
+    if (mmcss_handle != nullptr) {
+        AvRevertMmThreadCharacteristics(mmcss_handle);
+    }
 }
 
 bool AudioPlayer::OpenWaveOutDevice(int sample_rate, int channels) {
@@ -357,9 +419,11 @@ bool AudioPlayer::OpenWaveOutDevice(int sample_rate, int channels) {
             wave_out_ = wave_out;
             sample_rate_ = sample_rate;
             channels_ = channels;
-            submitted_frames_ = 0;
-            played_frames_ = 0;
-            dropped_frames_ = 0;
+            device_played_frames_ = 0;
+            sync_wait_count_ = 0;
+            sync_drop_count_ = 0;
+            playback_started_at_us_ = NowSteadyUs();
+            steady_state_profile_logged_ = false;
             buffers_.clear();
             keep_open = true;
         }
@@ -434,6 +498,8 @@ void AudioPlayer::CloseWaveOutDevice() {
         wave_out_ = nullptr;
         sample_rate_ = 0;
         channels_ = 0;
+        playback_started_at_us_ = 0;
+        steady_state_profile_logged_ = false;
     }
 
     if (wave_out == nullptr) {
@@ -464,6 +530,7 @@ void AudioPlayer::HandleWaveOutMessage(UINT message, WAVEHDR* header) {
             if (&buffer->header == header) {
                 buffer->done = true;
                 ++played_frames_;
+                ++device_played_frames_;
                 break;
             }
         }
@@ -478,6 +545,131 @@ bool AudioPlayer::HasCompletedBuffersLocked() const {
         [](const std::unique_ptr<Buffer>& buffer) {
             return buffer->done || ((buffer->header.dwFlags & WHDR_DONE) != 0);
         });
+}
+
+AudioPlayer::BufferProfile AudioPlayer::ActiveProfileLocked() const {
+    const int64_t now_us = NowSteadyUs();
+    if (recovery_mode_until_us_ > now_us) {
+        return BufferProfile{
+            kRecoveryMaxSubmittedBufferedMs,
+            kRecoveryTargetTotalBufferedMs,
+            kRecoverySoftTotalBufferedMs,
+            kRecoveryMinSubmitFrameCount,
+            false,
+            true};
+    }
+
+    const bool warmed_up_by_time =
+        playback_started_at_us_ > 0 &&
+        now_us > playback_started_at_us_ &&
+        (now_us - playback_started_at_us_) >= kSteadyStateWarmupUs;
+    const bool warmed_up_by_playback = device_played_frames_ >= kSteadyStatePlayedFramesThreshold;
+
+    if (warmed_up_by_time && warmed_up_by_playback) {
+        return BufferProfile{
+            kSteadyMaxSubmittedBufferedMs,
+            kSteadyTargetTotalBufferedMs,
+            kSteadySoftTotalBufferedMs,
+            kSteadyMinSubmitFrameCount,
+            true,
+            false};
+    }
+
+    return BufferProfile{
+        kStartupMaxSubmittedBufferedMs,
+        kStartupTargetTotalBufferedMs,
+        kStartupSoftTotalBufferedMs,
+        kStartupMinSubmitFrameCount,
+        false,
+        false};
+}
+
+void AudioPlayer::LogProfileTransitionIfNeededLocked(const BufferProfile& profile) {
+    if (!profile.steady_state || steady_state_profile_logged_ || log_fn_ == nullptr) {
+        return;
+    }
+
+    steady_state_profile_logged_ = true;
+    std::wostringstream stream;
+    stream << L"\u97f3\u9891\u64ad\u653e: \u5DF2\u5207\u5230\u7A33\u5B9A\u4F4E\u5EF6\u8FDF\u7A33\u6001"
+           << L"\uFF0C\u76EE\u6807\u603B\u7F13\u51B2 " << profile.target_total_buffered_ms
+           << L"ms\uFF0C\u63D0\u4EA4\u7F13\u51B2\u4E0A\u9650 " << profile.max_submitted_buffered_ms
+           << L"ms\u3002";
+    log_fn_(stream.str());
+}
+
+void AudioPlayer::ResetSessionStateLocked() {
+    submitted_frames_ = 0;
+    played_frames_ = 0;
+    dropped_frames_ = 0;
+    device_played_frames_ = 0;
+    resync_count_ = 0;
+    sync_wait_count_ = 0;
+    sync_drop_count_ = 0;
+    soft_overload_event_count_ = 0;
+    playback_started_at_us_ = 0;
+    recovery_mode_until_us_ = 0;
+    last_soft_overload_at_us_ = 0;
+    last_resync_at_us_ = 0;
+    steady_state_profile_logged_ = false;
+    playback_resync_requested_ = false;
+}
+
+void AudioPlayer::EnterRecoveryModeLocked(int64_t now_us, const wchar_t* reason) {
+    const bool already_active = recovery_mode_until_us_ > now_us;
+    recovery_mode_until_us_ = std::max(recovery_mode_until_us_, now_us + kRecoveryHoldUs);
+    if (already_active || log_fn_ == nullptr) {
+        return;
+    }
+
+    std::wostringstream stream;
+    stream << L"\u97f3\u9891\u64ad\u653e: " << reason
+           << L"\uFF0C\u4E34\u65F6\u5207\u5230\u6062\u590D\u7F13\u51B2\u6A21\u5F0F"
+           << L"\uFF0C\u76EE\u6807\u603B\u7F13\u51B2 " << kRecoveryTargetTotalBufferedMs
+           << L"ms\uFF0C\u63D0\u4EA4\u4E0A\u9650 " << kRecoveryMaxSubmittedBufferedMs
+           << L"ms\u3002";
+    log_fn_(stream.str());
+}
+
+void AudioPlayer::HandleSoftOverloadLocked(const BufferProfile& profile) {
+    const int64_t now_us = NowSteadyUs();
+    if (last_soft_overload_at_us_ <= 0 ||
+        (now_us - last_soft_overload_at_us_) > kSoftOverloadWindowUs) {
+        soft_overload_event_count_ = 0;
+    }
+    last_soft_overload_at_us_ = now_us;
+    ++soft_overload_event_count_;
+
+    if (soft_overload_event_count_ >= kSoftOverloadEventsBeforeRecovery) {
+        EnterRecoveryModeLocked(
+            now_us,
+            L"\u68C0\u6D4B\u5230\u63A5\u6536\u7AEF\u64AD\u653E\u79EF\u538B\u53CD\u590D\u51FA\u73B0");
+    }
+
+    if (soft_overload_event_count_ >= kSoftOverloadEventsBeforeResync &&
+        (last_resync_at_us_ <= 0 || (now_us - last_resync_at_us_) >= kResyncCooldownUs)) {
+        TrimTotalBufferedMsLocked(
+            kRecoveryTargetTotalBufferedMs,
+            L"\u97f3\u9891\u961F\u5217\u79EF\u538B\u6301\u7EED\u53CD\u590D\u51FA\u73B0\uFF0C\u5148\u4E22\u5F03\u90E8\u5206\u65E7 PCM \u5E27\u51C6\u5907\u91CD\u540C\u6B65\u3002");
+        playback_resync_requested_ = true;
+        last_resync_at_us_ = now_us;
+        soft_overload_event_count_ = 0;
+        ++resync_count_;
+        if (log_fn_ != nullptr) {
+            std::wostringstream stream;
+            stream << L"\u97f3\u9891\u64ad\u653e: \u5DF2\u89E6\u53D1\u81EA\u52A8\u91CD\u540C\u6B65"
+                   << L"\uFF0Cresyncs=" << resync_count_
+                   << L", totalMs=" << TotalBufferedMsLocked()
+                   << L", pendingMs=" << PendingBufferedMsLocked()
+                   << L", submittedMs=" << SubmittedBufferedMsLocked();
+            log_fn_(stream.str());
+        }
+        return;
+    }
+
+    TrimTotalBufferedMsLocked(
+        profile.recovery_mode ? kRecoveryTargetTotalBufferedMs : profile.target_total_buffered_ms,
+        L"\u97f3\u9891\u64ad\u653e\u79EF\u538B\u8D85\u51FA\u5F53\u524D\u7A33\u5B9A\u533A\u95F4\uFF0C\u4E22\u5F03\u6700\u65E7 PCM \u5E27\u907F\u514D\u58F0\u97F3\u8FDE\u7EED\u88C2\u97F3\u3002");
 }
 
 size_t AudioPlayer::FrameDurationMsLocked(size_t bytes) const {

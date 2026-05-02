@@ -59,6 +59,11 @@
 // ============================================================================
 // 匿名命名空间 - 内部常量和数据结构定义
 // ============================================================================
+#include <WS2tcpip.h>
+#include <iphlpapi.h>
+
+#pragma comment(lib, "Iphlpapi.lib")
+
 namespace {
 
 // ============================================================================
@@ -81,7 +86,7 @@ constexpr wchar_t kVideoWindowTitle[] = L"\u76F4\u64AD\u6295\u5C4F\u52A9\u624B -
 // 实例互斥体名称 - 防止程序多开 (周 6Y LiveCastAssistant 单例)
 constexpr wchar_t kInstanceMutexName[] = L"Zhou6YLiveCastAssistantSingleton";
 // 应用构建标签 - 版本号 + 功能标识 + 日期
-constexpr wchar_t kAppBuildLabel[] = L"0.4.10-2026-04-26";
+constexpr wchar_t kAppBuildLabel[] = L"0.4.21-2026-04-30";
 constexpr wchar_t kVoiceRuntimePackageFolder[] = L"sherpa-onnx-v1.12.36-win-x64-shared-MD-Release-no-tts";
 constexpr wchar_t kVoiceModelFolderName[] = L"sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30";
 // AirPlay 服务器名称 - 显示给 iPhone/iPad 的设备名
@@ -170,13 +175,14 @@ constexpr UINT kVoiceCommandMessage = WM_APP + 4;
 constexpr UINT kVirtualCameraStateMessage = WM_APP + 5;
 constexpr UINT kApplyStreamProfileMessage = WM_APP + 6;
 constexpr UINT kSessionUpdateMessage = WM_APP + 7;
-constexpr int kMaxStreamFps = 60;
+constexpr int kMaxStreamFps = 120;
 constexpr int kAppIconResourceId = 101;
 constexpr UINT kStatsIntervalMs = 250;
 constexpr int64_t kTimeSyncIntervalUs = 1'000'000;
 constexpr int64_t kMaxReasonableLatencyUs = 5'000'000;
-constexpr int64_t kAudioVideoLateDropUs = 25'000;
-constexpr int64_t kVideoLateDropUs = 250'000;
+constexpr int64_t kAudioVideoLateDropUs = 100'000;
+constexpr int64_t kVideoLateDropUs = 90'000;
+constexpr int64_t kVideoKeyframeRequestCooldownUs = 750'000;
 constexpr ULONGLONG kVoiceMediaCommandDebounceMs = 1500;
 constexpr ULONGLONG kVoiceMusicCommandDebounceMs = 1500;
 constexpr DWORD kVoiceCommandRecoverySuppressMs = 1800;
@@ -210,6 +216,17 @@ constexpr int kAutoReplyInputAfterPasteDelayMs = 180;
 constexpr int kAutoReplyAfterSendCheckDelayMs = 420;
 constexpr DWORD kAutoReplySendPointCaptureTimeoutMs = 60'000;
 constexpr ULONGLONG kAutoReplyEchoIgnoreWindowMs = 8'000;
+constexpr int kAutoReplyScheduleIntervalDefault = 90;
+constexpr int kAutoReplyScheduleIntervalMin = 5;
+constexpr int kAutoReplyScheduleIntervalMax = 3600;
+constexpr wchar_t kAutoReplyRuleJobLabel[] = L"\u81EA\u52A8\u56DE\u590D";
+constexpr wchar_t kAutoReplyGiftJobLabel[] = L"\u793C\u7269\u611F\u8C22";
+constexpr wchar_t kAutoReplyScheduleJobLabel[] = L"\u5B9A\u65F6\u5F39\u5E55";
+constexpr wchar_t kAutoReplyScheduleSourceText[] = L"\u5B9A\u65F6\u53D1\u9001";
+constexpr wchar_t kDefaultAutoReplyGiftRepliesText[] =
+    L"\u8c22\u8c22{\u89c2\u4f17}\u9001\u51fa\u7684{\u793c\u7269}\n"
+    L"{\u89c2\u4f17}\uff0c\u8fd9\u4e2a{\u793c\u7269}\u6536\u5230\u4e86\uff0c\u771f\u7684\u5f88\u611f\u8c22\n"
+    L"\u611f\u8c22{\u89c2\u4f17}\u7684{\u793c\u7269}\u652f\u6301";
 
 constexpr COLORREF kColorWindowBackground = RGB(245, 245, 247);
 constexpr COLORREF kColorEmbeddedWindowBackground = RGB(0, 0, 0);
@@ -300,6 +317,7 @@ struct StatusWindowLayout {
 };
 
 struct PendingAutoReplyJob {
+    std::wstring kind_label;
     std::wstring source_text;
     std::wstring speaker;
     std::wstring content;
@@ -352,6 +370,9 @@ struct AppState {
     std::deque<std::wstring> recent_logs;
     std::wstring log_file_path;
     std::wstring status_file_path;
+    std::mutex local_ip_mutex;
+    std::wstring local_ip_address;
+    ULONGLONG local_ip_refresh_tick = 0;
     std::wstring web_ui_folder_path;
     std::wstring web_ui_user_data_path;
     std::wstring profile_cache_path;
@@ -375,15 +396,17 @@ struct AppState {
     std::mutex auto_reply_mutex;
     std::condition_variable auto_reply_match_cv;
     std::condition_variable auto_reply_cv;
+    std::condition_variable auto_reply_schedule_cv;
     std::deque<PendingAutoReplyEvent> auto_reply_match_queue;
     std::deque<PendingAutoReplyJob> auto_reply_queue;
     std::deque<std::wstring> auto_reply_recent_logs;
     std::deque<RecentAutoReplyEcho> auto_reply_recent_echoes;
     std::thread auto_reply_match_thread;
     std::thread auto_reply_thread;
+    std::thread auto_reply_schedule_thread;
     std::thread auto_reply_capture_thread;
     bool auto_reply_enabled = false;
-    bool auto_reply_send_enabled = false;
+    bool auto_reply_send_enabled = true;
     bool auto_reply_stop_requested = false;
     bool auto_reply_capture_running = false;
     bool auto_reply_capture_stop_requested = false;
@@ -396,10 +419,17 @@ struct AppState {
     int auto_reply_send_point_x_permille = kAutoReplySendPointXPermilleDefault;
     int auto_reply_send_point_y_permille = kAutoReplySendPointYPermilleDefault;
     bool auto_reply_send_point_configured = false;
+    bool auto_reply_gift_enabled = false;
+    bool auto_reply_schedule_enabled = false;
     ULONGLONG auto_reply_last_trigger_tick = 0;
+    ULONGLONG auto_reply_last_gift_trigger_tick = 0;
+    ULONGLONG auto_reply_schedule_next_tick = 0;
     std::wstring auto_reply_exact_rules_text;
     std::wstring auto_reply_keyword_rules_text;
     std::wstring auto_reply_fallback_text;
+    std::wstring auto_reply_gift_replies_text = kDefaultAutoReplyGiftRepliesText;
+    std::wstring auto_reply_schedule_replies_text;
+    int auto_reply_schedule_interval_seconds = kAutoReplyScheduleIntervalDefault;
     std::wstring auto_reply_status = L"\u81ea\u52a8\u56de\u590d\u672a\u5f00\u542f";
     std::wstring auto_reply_target_title;
     std::wstring auto_reply_last_match_text;
@@ -543,6 +573,8 @@ void LoadAutoReplyConfig(AppState* state);
 void SaveAutoReplyConfig(AppState* state);
 void ToggleAutoReplyEnabled(AppState* state);
 void ToggleAutoReplySendEnabled(AppState* state);
+void ToggleAutoReplyGiftEnabled(AppState* state);
+void ToggleAutoReplyScheduleEnabled(AppState* state);
 void SaveAutoReplyTextConfig(AppState* state, const std::wstring& rules_text, const std::wstring& fallback_text);
 void SaveAutoReplyTimingConfig(AppState* state, const std::wstring& timing_text);
 void StartAutoReplyInputPointCapture(AppState* state);
@@ -552,6 +584,7 @@ void StopAutoReplySendPointCapture(AppState* state);
 void HandleAutoReplyDanmakuEvent(AppState* state, bool is_gift, const std::wstring& text);
 void AutoReplyMatchWorkerLoop(AppState* state);
 void AutoReplyWorkerLoop(AppState* state);
+void AutoReplyScheduleWorkerLoop(AppState* state);
 void StopAutoReplyWorker(AppState* state);
 bool FileExists(const std::wstring& path);
 std::wstring TrimWhitespace(const std::wstring& text);
@@ -573,6 +606,7 @@ enum class AutoReplyMatchKind {
     kExact,
     kKeyword,
     kFallback,
+    kGift,
 };
 
 struct AutoReplyWindowCandidate {
@@ -764,6 +798,10 @@ int ClampAutoReplyDelay(int delay_ms) {
     return std::clamp(delay_ms, 0, 20'000);
 }
 
+int ClampAutoReplyScheduleInterval(int seconds) {
+    return std::clamp(seconds, kAutoReplyScheduleIntervalMin, kAutoReplyScheduleIntervalMax);
+}
+
 std::vector<std::wstring> SplitAutoReplyLines(const std::wstring& text) {
     std::vector<std::wstring> lines;
     std::wstringstream stream(text);
@@ -824,10 +862,42 @@ std::vector<std::wstring> SplitAutoReplyByDelimiters(const std::wstring& text) {
     return parts;
 }
 
+std::vector<std::wstring> SplitAutoReplyRuleReplyVariants(const std::wstring& text) {
+    std::vector<std::wstring> parts;
+    std::wstring current;
+    for (wchar_t ch : text) {
+        if (ch == L'|' || ch == L'\uFF5C') {
+            const std::wstring trimmed = TrimWhitespace(current);
+            if (!trimmed.empty()) {
+                parts.push_back(trimmed);
+            }
+            current.clear();
+            continue;
+        }
+        current.push_back(ch);
+    }
+
+    const std::wstring trimmed = TrimWhitespace(current);
+    if (!trimmed.empty()) {
+        parts.push_back(trimmed);
+    }
+    return parts;
+}
+
 std::vector<std::wstring> ParseAutoReplyReplyPool(const std::wstring& text) {
     std::vector<std::wstring> replies;
     for (const auto& line : SplitAutoReplyLines(text)) {
-        for (const auto& item : SplitAutoReplyByDelimiters(line)) {
+        if (!line.empty()) {
+            replies.push_back(line);
+        }
+    }
+    return replies;
+}
+
+std::vector<std::wstring> ParseAutoReplyRuleReplyPool(const std::wstring& text) {
+    std::vector<std::wstring> replies;
+    for (const auto& line : SplitAutoReplyLines(text)) {
+        for (const auto& item : SplitAutoReplyRuleReplyVariants(line)) {
             if (!item.empty()) {
                 replies.push_back(item);
             }
@@ -856,7 +926,7 @@ std::vector<AutoReplyRule> ParseAutoReplyRules(const std::wstring& rules_text) {
 
         AutoReplyRule rule;
         rule.label = TrimWhitespace(raw_line.substr(0, split_pos));
-        rule.replies = ParseAutoReplyReplyPool(raw_line.substr(split_pos + 1));
+        rule.replies = ParseAutoReplyRuleReplyPool(raw_line.substr(split_pos + 1));
         if (rule.replies.empty()) {
             continue;
         }
@@ -999,6 +1069,108 @@ bool ParseAutoReplySpeakerContent(
     return false;
 }
 
+bool IsAutoReplyGiftCounterMarker(wchar_t ch) {
+    switch (ch) {
+    case L'x':
+    case L'X':
+    case L'\u00D7':
+    case L'\u2715':
+    case L'\uFF38':
+    case L'\uFF58':
+        return true;
+    default:
+        return false;
+    }
+}
+
+std::wstring StripAutoReplyGiftCounterSuffix(const std::wstring& text) {
+    std::wstring stripped = TrimWhitespace(text);
+    while (!stripped.empty()) {
+        size_t end = stripped.size();
+        while (end > 0 && std::iswspace(stripped[end - 1])) {
+            --end;
+        }
+
+        size_t digits_start = end;
+        while (digits_start > 0 && std::iswdigit(stripped[digits_start - 1])) {
+            --digits_start;
+        }
+        if (digits_start == end) {
+            break;
+        }
+
+        size_t marker_pos = digits_start;
+        while (marker_pos > 0 && std::iswspace(stripped[marker_pos - 1])) {
+            --marker_pos;
+        }
+        if (marker_pos == 0 || !IsAutoReplyGiftCounterMarker(stripped[marker_pos - 1])) {
+            break;
+        }
+
+        stripped = TrimWhitespace(stripped.substr(0, marker_pos - 1));
+    }
+    return stripped;
+}
+
+std::wstring NormalizeAutoReplyGiftSpeaker(const std::wstring& text) {
+    std::wstring cleaned = TrimWhitespace(text);
+    for (const auto& marker : {
+             std::wstring(L"\u7C89\u4E1D\u56E2"),
+             std::wstring(L"\u7C89\u4E1D"),
+             std::wstring(L"\u5B88\u62A4"),
+             std::wstring(L"\u623F\u7BA1"),
+             std::wstring(L"\u7BA1\u7406\u5458"),
+             std::wstring(L"\u5609\u5BBE")}) {
+        const size_t pos = cleaned.rfind(marker);
+        if (pos == std::wstring::npos) {
+            continue;
+        }
+        const std::wstring tail = TrimWhitespace(cleaned.substr(pos + marker.size()));
+        if (!tail.empty()) {
+            cleaned = tail;
+            break;
+        }
+    }
+    return cleaned;
+}
+
+bool ParseAutoReplyGiftMessage(
+    const std::wstring& text,
+    std::wstring* speaker,
+    std::wstring* gift_name) {
+    const std::wstring trimmed = TrimWhitespace(text);
+    for (const auto& separator :
+         {std::wstring(L"\u9001\u51FA"), std::wstring(L"\u9001\u4E86"), std::wstring(L"\u6253\u8D4F\u4E86")}) {
+        const size_t pos = trimmed.find(separator);
+        if (pos == std::wstring::npos) {
+            continue;
+        }
+
+        const std::wstring parsed_speaker = NormalizeAutoReplyGiftSpeaker(trimmed.substr(0, pos));
+        const std::wstring parsed_gift =
+            StripAutoReplyGiftCounterSuffix(trimmed.substr(pos + separator.size()));
+        if (parsed_speaker.empty() || parsed_gift.empty()) {
+            continue;
+        }
+
+        if (speaker != nullptr) {
+            *speaker = parsed_speaker;
+        }
+        if (gift_name != nullptr) {
+            *gift_name = parsed_gift;
+        }
+        return true;
+    }
+
+    if (speaker != nullptr) {
+        speaker->clear();
+    }
+    if (gift_name != nullptr) {
+        gift_name->clear();
+    }
+    return false;
+}
+
 std::wstring PickRandomAutoReply(const std::vector<std::wstring>& values) {
     if (values.empty()) {
         return {};
@@ -1013,14 +1185,44 @@ std::wstring RenderAutoReplyTemplate(
     const std::wstring& reply_template,
     const std::wstring& speaker,
     const std::wstring& content,
-    const std::wstring& source_text) {
+    const std::wstring& source_text,
+    const std::wstring& gift_name = std::wstring{}) {
     std::wstring rendered = reply_template;
     const std::wstring fallback_name = speaker.empty() ? L"\u89c2\u4f17" : speaker;
     const std::wstring fallback_content = content.empty() ? source_text : content;
+    const std::wstring fallback_gift = gift_name;
     rendered = ReplaceAllAutoReply(rendered, L"{name}", fallback_name);
     rendered = ReplaceAllAutoReply(rendered, L"{speaker}", fallback_name);
+    rendered = ReplaceAllAutoReply(rendered, L"{\u89c2\u4f17}", fallback_name);
+    rendered = ReplaceAllAutoReply(rendered, L"{\u6635\u79f0}", fallback_name);
     rendered = ReplaceAllAutoReply(rendered, L"{content}", fallback_content);
+    rendered = ReplaceAllAutoReply(rendered, L"{\u5185\u5bb9}", fallback_content);
+    rendered = ReplaceAllAutoReply(rendered, L"{gift}", fallback_gift);
+    rendered = ReplaceAllAutoReply(rendered, L"{gift_name}", fallback_gift);
+    rendered = ReplaceAllAutoReply(rendered, L"{giftName}", fallback_gift);
+    rendered = ReplaceAllAutoReply(rendered, L"{\u793c\u7269}", fallback_gift);
     return TrimWhitespace(rendered);
+}
+
+bool ContainsAutoReplySpeakerPlaceholder(const std::wstring& text) {
+    for (const auto& token : {
+             std::wstring(L"{name}"),
+             std::wstring(L"{speaker}"),
+             std::wstring(L"{\u89c2\u4f17}"),
+             std::wstring(L"{\u6635\u79f0}")}) {
+        if (text.find(token) != std::wstring::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::wstring BuildAnonymousGiftAutoReply(const std::wstring& gift_name) {
+    const std::wstring trimmed_gift = TrimWhitespace(gift_name);
+    if (!trimmed_gift.empty()) {
+        return std::wstring(L"\u611f\u8c22\u9001\u51fa\u7684") + trimmed_gift;
+    }
+    return L"\u611f\u8c22\u793c\u7269\u652f\u6301";
 }
 
 std::wstring MatchExactAutoReplyText(
@@ -1189,6 +1391,8 @@ std::wstring BuildAutoReplyMatchKindText(AutoReplyMatchKind match_kind) {
         return L"\u5173\u952e\u8bcd";
     case AutoReplyMatchKind::kFallback:
         return L"\u9ed8\u8ba4";
+    case AutoReplyMatchKind::kGift:
+        return L"\u793c\u7269";
     default:
         return L"\u672a\u5339\u914d";
     }
@@ -1488,6 +1692,28 @@ std::vector<winrt::com_ptr<IUIAutomationElement>> CollectAutoReplyElements(
     return elements;
 }
 
+bool ReadAutoReplyElementBounds(IUIAutomationElement* element, RECT* bounds) {
+    if (element == nullptr || bounds == nullptr) {
+        return false;
+    }
+    RECT current_bounds{};
+    if (FAILED(element->get_CurrentBoundingRectangle(&current_bounds))) {
+        return false;
+    }
+    if (current_bounds.right <= current_bounds.left || current_bounds.bottom <= current_bounds.top) {
+        return false;
+    }
+    *bounds = current_bounds;
+    return true;
+}
+
+POINT BuildAutoReplyRectCenterPoint(const RECT& rect) {
+    POINT point{};
+    point.x = rect.left + ((rect.right - rect.left) / 2);
+    point.y = rect.top + ((rect.bottom - rect.top) / 2);
+    return point;
+}
+
 bool AutoReplyElementHasValuePattern(IUIAutomationElement* element) {
     if (element == nullptr) {
         return false;
@@ -1695,6 +1921,39 @@ bool TryInvokeAutoReplyElement(IUIAutomationElement* element) {
     return false;
 }
 
+std::wstring ReadAutoReplyElementValue(IUIAutomationElement* element) {
+    if (element == nullptr) {
+        return {};
+    }
+
+    winrt::com_ptr<IUIAutomationValuePattern> value_pattern;
+    if (SUCCEEDED(element->GetCurrentPatternAs(UIA_ValuePatternId, IID_PPV_ARGS(value_pattern.put()))) &&
+        value_pattern) {
+        BSTR value = nullptr;
+        if (SUCCEEDED(value_pattern->get_CurrentValue(&value)) && value != nullptr) {
+            return TakeAutoReplyBstrAndFree(value);
+        }
+    }
+
+    UIA_HWND native_hwnd = nullptr;
+    if (SUCCEEDED(element->get_CurrentNativeWindowHandle(&native_hwnd))) {
+        const HWND hwnd = reinterpret_cast<HWND>(native_hwnd);
+        if (hwnd != nullptr && IsWindow(hwnd)) {
+            const int length = GetWindowTextLengthW(hwnd);
+            if (length > 0) {
+                std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+                const int copied = GetWindowTextW(hwnd, text.data(), length + 1);
+                if (copied > 0) {
+                    text.resize(static_cast<size_t>(copied));
+                    return TrimWhitespace(text);
+                }
+            }
+        }
+    }
+
+    return {};
+}
+
 void SendAutoReplyKey(WORD virtual_key) {
     INPUT inputs[2]{};
     inputs[0].type = INPUT_KEYBOARD;
@@ -1896,6 +2155,31 @@ void ClickAutoReplyAnchorPoint(const POINT& point) {
     }
 }
 
+struct AutoReplyClipboardSnapshot {
+    bool has_unicode_text = false;
+    std::wstring unicode_text;
+};
+
+AutoReplyClipboardSnapshot CaptureAutoReplyClipboardSnapshot() {
+    AutoReplyClipboardSnapshot snapshot;
+    if (!OpenClipboard(nullptr)) {
+        return snapshot;
+    }
+
+    HANDLE handle = GetClipboardData(CF_UNICODETEXT);
+    if (handle != nullptr) {
+        auto* data = static_cast<const wchar_t*>(GlobalLock(handle));
+        if (data != nullptr) {
+            snapshot.unicode_text.assign(data);
+            snapshot.has_unicode_text = true;
+            GlobalUnlock(handle);
+        }
+    }
+
+    CloseClipboard();
+    return snapshot;
+}
+
 bool WriteAutoReplyClipboardText(const std::wstring& text) {
     if (!OpenClipboard(nullptr)) {
         return false;
@@ -1956,28 +2240,106 @@ std::wstring ReadAutoReplyClipboardText() {
     return TrimWhitespace(text);
 }
 
-void RestoreAutoReplyClipboard(IDataObject* original_clipboard, bool restore_available) {
-    if (!restore_available) {
+void RestoreAutoReplyClipboard(const AutoReplyClipboardSnapshot& snapshot) {
+    if (!snapshot.has_unicode_text) {
         return;
     }
-    if (original_clipboard != nullptr) {
-        if (SUCCEEDED(OleSetClipboard(original_clipboard))) {
-            OleFlushClipboard();
-        }
-        return;
+    WriteAutoReplyClipboardText(snapshot.unicode_text);
+}
+
+bool TryResolveAutoReplyUiElements(
+    HWND target_window,
+    const RECT& window_rect,
+    winrt::com_ptr<IUIAutomationElement>* input_element,
+    winrt::com_ptr<IUIAutomationElement>* send_element,
+    RECT* input_bounds,
+    RECT* send_bounds) {
+    if (target_window == nullptr || !IsWindow(target_window)) {
+        return false;
     }
 
-    if (OpenClipboard(nullptr)) {
-        EmptyClipboard();
-        CloseClipboard();
+    winrt::com_ptr<IUIAutomation> automation;
+    if (FAILED(CoCreateInstance(
+            CLSID_CUIAutomation,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(automation.put()))) ||
+        !automation) {
+        return false;
     }
+
+    winrt::com_ptr<IUIAutomationElement> root;
+    if (FAILED(automation->ElementFromHandle(target_window, root.put())) || !root) {
+        return false;
+    }
+
+    auto elements = CollectAutoReplyElements(automation.get(), root.get());
+    if (elements.empty()) {
+        return false;
+    }
+
+    winrt::com_ptr<IUIAutomationElement> best_input;
+    winrt::com_ptr<IUIAutomationElement> best_send;
+    RECT best_input_bounds{};
+    RECT best_send_bounds{};
+    int best_input_score = -10'000;
+    int best_send_score = -10'000;
+
+    for (const auto& element : elements) {
+        RECT bounds{};
+        if (!ReadAutoReplyElementBounds(element.get(), &bounds)) {
+            continue;
+        }
+
+        const int input_score = ScoreAutoReplyInputElement(element.get(), window_rect);
+        if (input_score > best_input_score) {
+            best_input_score = input_score;
+            best_input = element;
+            best_input_bounds = bounds;
+        }
+    }
+
+    if (!best_input || best_input_score < 120) {
+        return false;
+    }
+
+    for (const auto& element : elements) {
+        RECT bounds{};
+        if (!ReadAutoReplyElementBounds(element.get(), &bounds)) {
+            continue;
+        }
+
+        const int send_score = ScoreAutoReplySendButtonElement(element.get(), window_rect, best_input_bounds);
+        if (send_score > best_send_score) {
+            best_send_score = send_score;
+            best_send = element;
+            best_send_bounds = bounds;
+        }
+    }
+
+    if (!best_send || best_send_score < 120) {
+        return false;
+    }
+
+    if (input_element != nullptr) {
+        *input_element = std::move(best_input);
+    }
+    if (send_element != nullptr) {
+        *send_element = std::move(best_send);
+    }
+    if (input_bounds != nullptr) {
+        *input_bounds = best_input_bounds;
+    }
+    if (send_bounds != nullptr) {
+        *send_bounds = best_send_bounds;
+    }
+    return true;
 }
 
 std::wstring ReadAutoReplyInputTextByClipboard(
     AppState* state,
     const RECT& window_rect,
-    IDataObject* original_clipboard,
-    bool restore_available) {
+    const AutoReplyClipboardSnapshot& clipboard_snapshot) {
     const POINT anchor = BuildAutoReplyInputAnchorPoint(window_rect, state);
     ClickAutoReplyAnchorPoint(anchor);
     Sleep(120);
@@ -1986,8 +2348,69 @@ std::wstring ReadAutoReplyInputTextByClipboard(
     SendAutoReplyCtrlChord(static_cast<WORD>('C'));
     Sleep(150);
     const std::wstring copied_text = ReadAutoReplyClipboardText();
-    RestoreAutoReplyClipboard(original_clipboard, restore_available);
+    RestoreAutoReplyClipboard(clipboard_snapshot);
     return copied_text;
+}
+
+bool SendAutoReplyByUiAutomation(
+    AppState* state,
+    HWND target_window,
+    const RECT& window_rect,
+    const std::wstring& reply_text,
+    std::wstring* error_text) {
+    winrt::com_ptr<IUIAutomationElement> input_element;
+    winrt::com_ptr<IUIAutomationElement> send_element;
+    RECT input_bounds{};
+    RECT send_bounds{};
+    if (!TryResolveAutoReplyUiElements(
+            target_window,
+            window_rect,
+            &input_element,
+            &send_element,
+            &input_bounds,
+            &send_bounds)) {
+        if (error_text != nullptr) {
+            *error_text = L"UIA 未识别到输入框或发送按钮";
+        }
+        return false;
+    }
+
+    ClickAutoReplyAnchorPoint(BuildAutoReplyRectCenterPoint(input_bounds));
+    Sleep(kAutoReplyInputFocusDelayMs);
+
+    if (!TrySetAutoReplyElementValue(input_element.get(), reply_text)) {
+        if (error_text != nullptr) {
+            *error_text = L"UIA 无法写入输入框，已回退坐标点击";
+        }
+        return false;
+    }
+
+    Sleep(kAutoReplyInputAfterPasteDelayMs);
+    if (!ReadAutoReplyElementBounds(send_element.get(), &send_bounds)) {
+        send_bounds = input_bounds;
+    }
+
+    bool send_triggered = TryInvokeAutoReplyElement(send_element.get());
+    if (!send_triggered) {
+        ClickAutoReplyAnchorPoint(BuildAutoReplyRectCenterPoint(send_bounds));
+        send_triggered = true;
+    }
+    if (!send_triggered) {
+        if (error_text != nullptr) {
+            *error_text = L"UIA 无法触发发送按钮";
+        }
+        return false;
+    }
+
+    Sleep(kAutoReplyAfterSendCheckDelayMs);
+    const std::wstring read_back_text = ReadAutoReplyElementValue(input_element.get());
+    if (!read_back_text.empty() && TrimWhitespace(read_back_text) == TrimWhitespace(reply_text)) {
+        if (error_text != nullptr) {
+            *error_text = L"UIA 已写入输入框，但发送按钮未真正触发";
+        }
+        return false;
+    }
+    return true;
 }
 
 bool SendAutoReplyByAnchor(
@@ -2003,9 +2426,7 @@ bool SendAutoReplyByAnchor(
         return false;
     }
 
-    winrt::com_ptr<IDataObject> original_clipboard;
-    const bool restore_clipboard =
-        SUCCEEDED(OleGetClipboard(original_clipboard.put())) || original_clipboard != nullptr;
+    const AutoReplyClipboardSnapshot clipboard_snapshot = CaptureAutoReplyClipboardSnapshot();
 
     const POINT anchor = BuildAutoReplyInputAnchorPoint(window_rect, state);
     ClickAutoReplyAnchorPoint(anchor);
@@ -2017,7 +2438,7 @@ bool SendAutoReplyByAnchor(
     Sleep(kAutoReplyInputAfterClearDelayMs);
 
     if (!WriteAutoReplyClipboardText(reply_text)) {
-        RestoreAutoReplyClipboard(original_clipboard.get(), restore_clipboard);
+        RestoreAutoReplyClipboard(clipboard_snapshot);
         if (error_text != nullptr) {
             *error_text = L"\u65e0\u6cd5\u5199\u5165\u81ea\u52a8\u56de\u590d\u526a\u8d34\u677f";
         }
@@ -2026,7 +2447,7 @@ bool SendAutoReplyByAnchor(
 
     SendAutoReplyCtrlChord(static_cast<WORD>('V'));
     Sleep(kAutoReplyInputAfterPasteDelayMs);
-    RestoreAutoReplyClipboard(original_clipboard.get(), restore_clipboard);
+    RestoreAutoReplyClipboard(clipboard_snapshot);
     Sleep(kAutoReplyInputAfterClearDelayMs);
 
     const POINT send_button = BuildAutoReplySendButtonPoint(window_rect, state);
@@ -2034,7 +2455,7 @@ bool SendAutoReplyByAnchor(
     Sleep(kAutoReplyAfterSendCheckDelayMs);
 
     const std::wstring read_back_text =
-        ReadAutoReplyInputTextByClipboard(state, window_rect, original_clipboard.get(), restore_clipboard);
+        ReadAutoReplyInputTextByClipboard(state, window_rect, clipboard_snapshot);
     if (TrimWhitespace(read_back_text) == TrimWhitespace(reply_text)) {
         if (error_text != nullptr) {
             *error_text = L"\u53d1\u9001\u6309\u94ae\u70b9\u4f4d\u672a\u547d\u4e2d\uff0c\u8bf7\u5148\u8bb0\u5f55\u53d1\u9001\u6309\u94ae";
@@ -2086,18 +2507,30 @@ bool SendAutoReplyText(
             L"\u53d1\u9001\u524d\u672a\u80fd\u5207\u5230\u4e92\u52a8\u6d88\u606f\u60ac\u6d6e\u7a97\uff0c\u6539\u7528\u5750\u6807\u70b9\u51fb\u7ee7\u7eed\u53d1\u9001");
     }
 
-    const HRESULT ole_result = OleInitialize(nullptr);
-    if (FAILED(ole_result) && ole_result != RPC_E_CHANGED_MODE) {
+    const HRESULT com_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(com_result) && com_result != RPC_E_CHANGED_MODE) {
         if (error_text != nullptr) {
-            *error_text = L"\u81ea\u52a8\u56de\u590d OLE \u521d\u59cb\u5316\u5931\u8d25";
+            *error_text = L"\u81ea\u52a8\u56de\u590d COM \u521d\u59cb\u5316\u5931\u8d25";
         }
         return false;
     }
 
-    const bool succeeded = SendAutoReplyByAnchor(state, target.hwnd, window_rect, reply_text, error_text);
+    std::wstring uia_error;
+    bool succeeded = SendAutoReplyByUiAutomation(state, target.hwnd, window_rect, reply_text, &uia_error);
+    if (!succeeded) {
+        if (!uia_error.empty()) {
+            AppendAutoReplyRecentLog(
+                state,
+                std::wstring(L"UIA 发送未命中，回退坐标点击：") + uia_error);
+        }
+        succeeded = SendAutoReplyByAnchor(state, target.hwnd, window_rect, reply_text, error_text);
+        if (!succeeded && error_text != nullptr && error_text->empty() && !uia_error.empty()) {
+            *error_text = uia_error;
+        }
+    }
 
-    if (SUCCEEDED(ole_result)) {
-        OleUninitialize();
+    if (SUCCEEDED(com_result)) {
+        CoUninitialize();
     }
     return succeeded;
 }
@@ -2118,10 +2551,13 @@ void EnsureAutoReplyScaffold(AppState* state) {
             L"========================\r\n"
             L"1. \u7cbe\u786e\u5339\u914d\uff1a\u6bcf\u884c\u4e00\u6761\uff0c\u5199\u6210 \u5b8c\u6574\u5f39\u5e55=\u56de\u590d1|\u56de\u590d2\r\n"
             L"2. \u5173\u952e\u8bcd\u5339\u914d\uff1a\u6bcf\u884c\u4e00\u6761\uff0c\u5199\u6210 \u5173\u952e\u8bcd1|\u5173\u952e\u8bcd2=\u56de\u590d1|\u56de\u590d2\r\n"
-            L"3. \u5173\u952e\u8bcd\u547d\u4e2d\u591a\u6761\u65f6\uff0c\u4f1a\u4f18\u5148\u9009\u66f4\u957f\u3001\u66f4\u5177\u4f53\u7684\u5173\u952e\u8bcd\r\n"
-            L"4. \u9ed8\u8ba4\u56de\u590d\u652f\u6301\u6309\u884c\u6216 | \u968f\u673a\u62bd\u53d6\uff0c\u5728\u4e24\u79cd\u89c4\u5219\u90fd\u6ca1\u547d\u4e2d\u65f6\u4f7f\u7528\r\n"
-            L"5. \u53ef\u7528\u5360\u4f4d\u7b26\uff1a{name} {speaker} {content}\r\n"
-            L"6. \u201c\u53d1\u9001\u6d88\u606f\u201d\u5173\u95ed\u65f6\uff0c\u53ea\u505a\u89c4\u5219\u9884\u89c8\uff0c\u4e0d\u4f1a\u771f\u6b63\u53d1\u9001\r\n");
+            L"3. \u89c4\u5219\u91cc\u7684\u591a\u6761\u5907\u9009\u56de\u590d\u53ea\u7528 | \u5206\u9694\uff0c\u9017\u53f7\u4f1a\u6309\u6b63\u5e38\u6587\u6848\u4fdd\u7559\r\n"
+            L"4. \u5173\u952e\u8bcd\u547d\u4e2d\u591a\u6761\u65f6\uff0c\u4f1a\u4f18\u5148\u9009\u66f4\u957f\u3001\u66f4\u5177\u4f53\u7684\u5173\u952e\u8bcd\r\n"
+            L"5. \u9ed8\u8ba4\u56de\u590d\u3001\u793c\u7269\u611f\u8c22\u3001\u5b9a\u65f6\u53d1\u9001\u8bdd\u672f\u90fd\u662f\u6309\u6362\u884c\u5206\u53e5\uff0c\u4e00\u884c\u4e00\u6761\uff0c\u4e0d\u8981\u7528\u9017\u53f7\u5206\u9694\r\n"
+            L"6. \u53ef\u7528\u5360\u4f4d\u7b26\uff1a{\u89c2\u4f17} {\u5185\u5bb9} {\u793c\u7269}\uff08\u517c\u5bb9\u65e7\u5199\u6cd5 {name} {speaker} {content} {gift}\uff09\r\n"
+            L"7. \u793c\u7269\u81ea\u52a8\u611f\u8c22\u5355\u72ec\u4f7f\u7528\u4e0b\u65b9\u201c\u793c\u7269\u611f\u8c22\u8bdd\u672f\u201d\uff0c\u5982\u679c\u8bc6\u522b\u5230\u201c***\u9001\u51fa***\u201d\u4f1a\u81ea\u52a8\u62c6\u51fa\u89c2\u4f17\u6635\u79f0\u548c\u793c\u7269\u540d\uff1b\u62ff\u4e0d\u5230\u6635\u79f0\u65f6\u4f1a\u81ea\u52a8\u6539\u6210\u4e0d\u5e26\u79f0\u547c\u7684\u611f\u8c22\uff0c\u4f8b\u5982\u201c\u611f\u8c22\u9001\u51fa\u7684{\u793c\u7269}\u201d\r\n"
+            L"8. \u5b9a\u65f6\u53d1\u9001\u5f39\u5e55\u4f1a\u4ece\u201c\u5b9a\u65f6\u53d1\u9001\u8bdd\u672f\u201d\u91cc\u968f\u673a\u62bd\u53d6\uff0c\u6309\u95f4\u9694\u8f6e\u64ad\r\n"
+            L"9. \u201c\u53d1\u9001\u6d88\u606f\u201d\u5173\u95ed\u65f6\uff0c\u53ea\u505a\u89c4\u5219\u9884\u89c8\uff0c\u4e0d\u4f1a\u771f\u6b63\u53d1\u9001\r\n");
         WriteUtf8File(note_path, note_text);
     }
 
@@ -2144,10 +2580,9 @@ void LoadAutoReplyConfig(AppState* state) {
 
     const std::wstring json_text = WideFromUtf8(json_utf8);
     bool enabled = ExtractAutoReplyJsonBool(json_text, L"enabled", false);
-    bool send_enabled = ExtractAutoReplyJsonBool(json_text, L"sendEnabled", false);
-    if (!enabled) {
-        send_enabled = false;
-    }
+    bool send_enabled = true;
+    const bool gift_enabled = ExtractAutoReplyJsonBool(json_text, L"giftEnabled", false);
+    const bool schedule_enabled = ExtractAutoReplyJsonBool(json_text, L"scheduleEnabled", false);
 
     {
         std::lock_guard<std::mutex> lock(state->auto_reply_mutex);
@@ -2169,6 +2604,11 @@ void LoadAutoReplyConfig(AppState* state) {
             ExtractAutoReplyJsonInt(json_text, L"sendPointXPermille", kAutoReplySendPointXPermilleDefault));
         state->auto_reply_send_point_y_permille = ClampAutoReplyPermille(
             ExtractAutoReplyJsonInt(json_text, L"sendPointYPermille", kAutoReplySendPointYPermilleDefault));
+        state->auto_reply_gift_enabled = gift_enabled;
+        state->auto_reply_schedule_enabled = schedule_enabled;
+        state->auto_reply_schedule_interval_seconds = ClampAutoReplyScheduleInterval(
+            ExtractAutoReplyJsonInt(json_text, L"scheduleIntervalSeconds", kAutoReplyScheduleIntervalDefault));
+        state->auto_reply_schedule_next_tick = 0;
         state->auto_reply_exact_rules_text = ExtractAutoReplyJsonString(json_text, L"exactRulesText");
         size_t keyword_rules_value_pos = 0;
         if (LocateAutoReplyJsonValue(json_text, L"keywordRulesText", &keyword_rules_value_pos)) {
@@ -2177,11 +2617,17 @@ void LoadAutoReplyConfig(AppState* state) {
             state->auto_reply_keyword_rules_text = ExtractAutoReplyJsonString(json_text, L"rulesText");
         }
         state->auto_reply_fallback_text = ExtractAutoReplyJsonString(json_text, L"fallbackRepliesText");
+        state->auto_reply_gift_replies_text = ExtractAutoReplyJsonString(json_text, L"giftRepliesText");
+        if (TrimWhitespace(state->auto_reply_gift_replies_text).empty()) {
+            state->auto_reply_gift_replies_text = kDefaultAutoReplyGiftRepliesText;
+        }
+        state->auto_reply_schedule_replies_text = ExtractAutoReplyJsonString(json_text, L"scheduleRepliesText");
         state->auto_reply_status = BuildAutoReplyModeText(
             state->auto_reply_enabled,
             state->auto_reply_send_enabled);
     }
 
+    state->auto_reply_schedule_cv.notify_all();
     RequestAutoReplySnapshotRefresh(state);
 }
 
@@ -2202,13 +2648,18 @@ void SaveAutoReplyConfig(AppState* state) {
     bool send_point_configured = false;
     int send_point_x_permille = kAutoReplySendPointXPermilleDefault;
     int send_point_y_permille = kAutoReplySendPointYPermilleDefault;
+    bool gift_enabled = false;
+    bool schedule_enabled = false;
+    int schedule_interval_seconds = kAutoReplyScheduleIntervalDefault;
     std::wstring exact_rules_text;
     std::wstring keyword_rules_text;
     std::wstring fallback_text;
+    std::wstring gift_replies_text;
+    std::wstring schedule_replies_text;
     {
         std::lock_guard<std::mutex> lock(state->auto_reply_mutex);
         enabled = state->auto_reply_enabled;
-        send_enabled = state->auto_reply_send_enabled;
+        send_enabled = true;
         cooldown_seconds = ClampAutoReplyCooldown(state->auto_reply_cooldown_seconds);
         delay_ms = ClampAutoReplyDelay(state->auto_reply_delay_ms);
         input_point_configured = state->auto_reply_input_point_configured;
@@ -2217,9 +2668,14 @@ void SaveAutoReplyConfig(AppState* state) {
         send_point_configured = state->auto_reply_send_point_configured;
         send_point_x_permille = ClampAutoReplyPermille(state->auto_reply_send_point_x_permille);
         send_point_y_permille = ClampAutoReplyPermille(state->auto_reply_send_point_y_permille);
+        gift_enabled = state->auto_reply_gift_enabled;
+        schedule_enabled = state->auto_reply_schedule_enabled;
+        schedule_interval_seconds = ClampAutoReplyScheduleInterval(state->auto_reply_schedule_interval_seconds);
         exact_rules_text = state->auto_reply_exact_rules_text;
         keyword_rules_text = state->auto_reply_keyword_rules_text;
         fallback_text = state->auto_reply_fallback_text;
+        gift_replies_text = state->auto_reply_gift_replies_text;
+        schedule_replies_text = state->auto_reply_schedule_replies_text;
     }
 
     std::ostringstream json;
@@ -2234,10 +2690,15 @@ void SaveAutoReplyConfig(AppState* state) {
     json << "  \"sendPointConfigured\": " << (send_point_configured ? "true" : "false") << ",\n";
     json << "  \"sendPointXPermille\": " << send_point_x_permille << ",\n";
     json << "  \"sendPointYPermille\": " << send_point_y_permille << ",\n";
+    json << "  \"giftEnabled\": " << (gift_enabled ? "true" : "false") << ",\n";
+    json << "  \"scheduleEnabled\": " << (schedule_enabled ? "true" : "false") << ",\n";
+    json << "  \"scheduleIntervalSeconds\": " << schedule_interval_seconds << ",\n";
     json << "  \"exactRulesText\": " << QuoteJsonWide(exact_rules_text) << ",\n";
     json << "  \"keywordRulesText\": " << QuoteJsonWide(keyword_rules_text) << ",\n";
     json << "  \"rulesText\": " << QuoteJsonWide(keyword_rules_text) << ",\n";
-    json << "  \"fallbackRepliesText\": " << QuoteJsonWide(fallback_text) << "\n";
+    json << "  \"fallbackRepliesText\": " << QuoteJsonWide(fallback_text) << ",\n";
+    json << "  \"giftRepliesText\": " << QuoteJsonWide(gift_replies_text) << ",\n";
+    json << "  \"scheduleRepliesText\": " << QuoteJsonWide(schedule_replies_text) << "\n";
     json << "}\n";
     WriteUtf8File(state->auto_reply_config_path, json.str());
 }
@@ -2464,10 +2925,13 @@ void ToggleAutoReplyEnabled(AppState* state) {
         state->auto_reply_enabled = !state->auto_reply_enabled;
         if (!state->auto_reply_enabled) {
             state->auto_reply_match_queue.clear();
-            state->auto_reply_send_enabled = false;
             state->auto_reply_queue.clear();
             state->auto_reply_recent_echoes.clear();
+            state->auto_reply_last_trigger_tick = 0;
+            state->auto_reply_last_gift_trigger_tick = 0;
+            state->auto_reply_schedule_next_tick = 0;
         }
+        state->auto_reply_send_enabled = true;
         enabled = state->auto_reply_enabled;
         send_enabled = state->auto_reply_send_enabled;
         state->auto_reply_status = BuildAutoReplyModeText(enabled, send_enabled);
@@ -2479,6 +2943,7 @@ void ToggleAutoReplyEnabled(AppState* state) {
         state->auto_reply_match_cv.notify_all();
         state->auto_reply_cv.notify_all();
     }
+    state->auto_reply_schedule_cv.notify_all();
 
     SaveAutoReplyConfig(state);
     AppendAutoReplyRecentLog(
@@ -2495,17 +2960,10 @@ void ToggleAutoReplySendEnabled(AppState* state) {
 
     bool enabled = false;
     bool send_enabled = false;
-    bool cleared_send_queue = false;
     {
         std::lock_guard<std::mutex> lock(state->auto_reply_mutex);
-        state->auto_reply_send_enabled = !state->auto_reply_send_enabled;
-        if (state->auto_reply_send_enabled) {
-            state->auto_reply_enabled = true;
-        } else {
-            state->auto_reply_queue.clear();
-            state->auto_reply_recent_echoes.clear();
-            cleared_send_queue = true;
-        }
+        state->auto_reply_send_enabled = true;
+        state->auto_reply_enabled = true;
         enabled = state->auto_reply_enabled;
         send_enabled = state->auto_reply_send_enabled;
         state->auto_reply_status = BuildAutoReplyModeText(enabled, send_enabled);
@@ -2513,20 +2971,102 @@ void ToggleAutoReplySendEnabled(AppState* state) {
 
     if (enabled) {
         EnsureDanmakuReadyForAutoReply(state);
-    } else {
-        state->auto_reply_match_cv.notify_all();
-        state->auto_reply_cv.notify_all();
     }
-    if (cleared_send_queue) {
+    state->auto_reply_schedule_cv.notify_all();
+
+    SaveAutoReplyConfig(state);
+    AppendAutoReplyRecentLog(
+        state,
+        L"\u81ea\u52a8\u56de\u590d\u53d1\u9001\u9ed8\u8ba4\u4fdd\u6301\u5f00\u542f");
+}
+
+void ToggleAutoReplyGiftEnabled(AppState* state) {
+    if (state == nullptr) {
+        return;
+    }
+
+    bool enabled = false;
+    bool gift_enabled = false;
+    bool send_enabled = false;
+    {
+        std::lock_guard<std::mutex> lock(state->auto_reply_mutex);
+        state->auto_reply_gift_enabled = !state->auto_reply_gift_enabled;
+        if (state->auto_reply_gift_enabled) {
+            state->auto_reply_enabled = true;
+        } else {
+            state->auto_reply_last_gift_trigger_tick = 0;
+        }
+        enabled = state->auto_reply_enabled;
+        gift_enabled = state->auto_reply_gift_enabled;
+        send_enabled = state->auto_reply_send_enabled;
+        state->auto_reply_status = BuildAutoReplyModeText(enabled, send_enabled);
+    }
+
+    if (enabled) {
+        EnsureDanmakuReadyForAutoReply(state);
+    }
+    state->auto_reply_schedule_cv.notify_all();
+
+    SaveAutoReplyConfig(state);
+    AppendAutoReplyRecentLog(
+        state,
+        gift_enabled
+            ? L"\u793c\u7269\u81ea\u52a8\u611f\u8c22\u5df2\u5f00\u542f"
+            : L"\u793c\u7269\u81ea\u52a8\u611f\u8c22\u5df2\u5173\u95ed");
+}
+
+void ToggleAutoReplyScheduleEnabled(AppState* state) {
+    if (state == nullptr) {
+        return;
+    }
+
+    bool enabled = false;
+    bool schedule_enabled = false;
+    bool send_enabled = false;
+    bool removed_scheduled_jobs = false;
+    int schedule_interval_seconds = kAutoReplyScheduleIntervalDefault;
+    {
+        std::lock_guard<std::mutex> lock(state->auto_reply_mutex);
+        state->auto_reply_schedule_enabled = !state->auto_reply_schedule_enabled;
+        if (state->auto_reply_schedule_enabled) {
+            state->auto_reply_enabled = true;
+            state->auto_reply_schedule_next_tick = 0;
+        } else {
+            state->auto_reply_schedule_next_tick = 0;
+            const size_t before_size = state->auto_reply_queue.size();
+            state->auto_reply_queue.erase(
+                std::remove_if(
+                    state->auto_reply_queue.begin(),
+                    state->auto_reply_queue.end(),
+                    [](const PendingAutoReplyJob& job) {
+                        return job.kind_label == kAutoReplyScheduleJobLabel;
+                    }),
+                state->auto_reply_queue.end());
+            removed_scheduled_jobs = state->auto_reply_queue.size() != before_size;
+        }
+        enabled = state->auto_reply_enabled;
+        schedule_enabled = state->auto_reply_schedule_enabled;
+        send_enabled = state->auto_reply_send_enabled;
+        schedule_interval_seconds = state->auto_reply_schedule_interval_seconds;
+        state->auto_reply_status = BuildAutoReplyModeText(enabled, send_enabled);
+    }
+
+    if (enabled) {
+        EnsureDanmakuReadyForAutoReply(state);
+    }
+    state->auto_reply_schedule_cv.notify_all();
+    if (removed_scheduled_jobs) {
         state->auto_reply_cv.notify_all();
     }
 
     SaveAutoReplyConfig(state);
     AppendAutoReplyRecentLog(
         state,
-        send_enabled
-            ? L"\u81ea\u52a8\u56de\u590d\u53d1\u9001\u5df2\u5f00\u542f"
-            : L"\u81ea\u52a8\u56de\u590d\u53d1\u9001\u5df2\u5173\u95ed\uff0c\u5df2\u5207\u56de\u4ec5\u9884\u89c8");
+        schedule_enabled
+            ? std::wstring(L"\u5b9a\u65f6\u53d1\u9001\u5f39\u5e55\u5df2\u5f00\u542f\uff0c\u95f4\u9694 ") +
+                  std::to_wstring(schedule_interval_seconds) +
+                  L" \u79d2"
+            : L"\u5b9a\u65f6\u53d1\u9001\u5f39\u5e55\u5df2\u5173\u95ed");
 }
 
 void SaveAutoReplyTextConfig(
@@ -2540,6 +3080,17 @@ void SaveAutoReplyTextConfig(
     std::wstring exact_rules_text;
     std::wstring keyword_rules_text;
     std::wstring resolved_fallback_text = fallback_text;
+    bool gift_enabled = false;
+    std::wstring gift_replies_text;
+    std::wstring schedule_replies_text;
+    bool schedule_enabled = false;
+    {
+        std::lock_guard<std::mutex> lock(state->auto_reply_mutex);
+        gift_enabled = state->auto_reply_gift_enabled;
+        gift_replies_text = state->auto_reply_gift_replies_text;
+        schedule_replies_text = state->auto_reply_schedule_replies_text;
+        schedule_enabled = state->auto_reply_schedule_enabled;
+    }
     if (!rules_payload.empty() && rules_payload.front() == L'{') {
         exact_rules_text = ExtractAutoReplyJsonString(rules_payload, L"exactRulesText");
         size_t keyword_rules_value_pos = 0;
@@ -2549,6 +3100,15 @@ void SaveAutoReplyTextConfig(
             keyword_rules_text = ExtractAutoReplyJsonString(rules_payload, L"rulesText");
         }
         resolved_fallback_text = ExtractAutoReplyJsonString(rules_payload, L"fallbackRepliesText");
+        gift_enabled = ExtractAutoReplyJsonBool(rules_payload, L"giftEnabled", gift_enabled);
+        size_t gift_replies_value_pos = 0;
+        if (LocateAutoReplyJsonValue(rules_payload, L"giftRepliesText", &gift_replies_value_pos)) {
+            gift_replies_text = ExtractAutoReplyJsonString(rules_payload, L"giftRepliesText");
+        }
+        size_t schedule_replies_value_pos = 0;
+        if (LocateAutoReplyJsonValue(rules_payload, L"scheduleRepliesText", &schedule_replies_value_pos)) {
+            schedule_replies_text = ExtractAutoReplyJsonString(rules_payload, L"scheduleRepliesText");
+        }
     } else {
         keyword_rules_text = rules_payload;
     }
@@ -2558,6 +3118,12 @@ void SaveAutoReplyTextConfig(
         state->auto_reply_exact_rules_text = exact_rules_text;
         state->auto_reply_keyword_rules_text = keyword_rules_text;
         state->auto_reply_fallback_text = resolved_fallback_text;
+        state->auto_reply_gift_enabled = gift_enabled;
+        state->auto_reply_gift_replies_text = gift_replies_text;
+        state->auto_reply_schedule_replies_text = schedule_replies_text;
+        if (schedule_enabled) {
+            state->auto_reply_schedule_next_tick = 0;
+        }
         state->auto_reply_status = BuildAutoReplyModeText(
             state->auto_reply_enabled,
             state->auto_reply_send_enabled);
@@ -2567,6 +3133,9 @@ void SaveAutoReplyTextConfig(
     const size_t exact_rule_count = ParseAutoReplyRules(exact_rules_text).size();
     const size_t keyword_rule_count = ParseAutoReplyRules(keyword_rules_text).size();
     const size_t fallback_reply_count = ParseAutoReplyReplyPool(resolved_fallback_text).size();
+    const size_t gift_reply_count = ParseAutoReplyReplyPool(gift_replies_text).size();
+    const size_t schedule_reply_count = ParseAutoReplyReplyPool(schedule_replies_text).size();
+    state->auto_reply_schedule_cv.notify_all();
     AppendAutoReplyRecentLog(
         state,
         std::wstring(L"\u5df2\u4fdd\u5b58\u81ea\u52a8\u56de\u590d\u89c4\u5219\uff0c\u7cbe\u786e ") +
@@ -2575,6 +3144,10 @@ void SaveAutoReplyTextConfig(
             std::to_wstring(keyword_rule_count) +
             L" \u6761\uff0c\u9ed8\u8ba4 " +
             std::to_wstring(fallback_reply_count) +
+            L" \u6761\uff0c\u793c\u7269\u611f\u8c22 " +
+            std::to_wstring(gift_reply_count) +
+            L" \u6761\uff0c\u5b9a\u65f6\u53d1\u9001 " +
+            std::to_wstring(schedule_reply_count) +
             L" \u6761");
 }
 
@@ -2585,10 +3158,12 @@ void SaveAutoReplyTimingConfig(AppState* state, const std::wstring& timing_text)
 
     int cooldown_seconds = 12;
     int delay_ms = 1600;
+    int schedule_interval_seconds = kAutoReplyScheduleIntervalDefault;
     {
         std::lock_guard<std::mutex> lock(state->auto_reply_mutex);
         cooldown_seconds = state->auto_reply_cooldown_seconds;
         delay_ms = state->auto_reply_delay_ms;
+        schedule_interval_seconds = state->auto_reply_schedule_interval_seconds;
     }
 
     const auto parts = SplitAutoReplyByDelimiters(timing_text);
@@ -2604,26 +3179,38 @@ void SaveAutoReplyTimingConfig(AppState* state, const std::wstring& timing_text)
         } catch (...) {
         }
     }
+    if (parts.size() >= 3) {
+        try {
+            schedule_interval_seconds = std::stoi(parts[2]);
+        } catch (...) {
+        }
+    }
 
     cooldown_seconds = ClampAutoReplyCooldown(cooldown_seconds);
     delay_ms = ClampAutoReplyDelay(delay_ms);
+    schedule_interval_seconds = ClampAutoReplyScheduleInterval(schedule_interval_seconds);
     {
         std::lock_guard<std::mutex> lock(state->auto_reply_mutex);
         state->auto_reply_cooldown_seconds = cooldown_seconds;
         state->auto_reply_delay_ms = delay_ms;
+        state->auto_reply_schedule_interval_seconds = schedule_interval_seconds;
+        state->auto_reply_schedule_next_tick = 0;
         state->auto_reply_status = BuildAutoReplyModeText(
             state->auto_reply_enabled,
             state->auto_reply_send_enabled);
     }
 
     SaveAutoReplyConfig(state);
+    state->auto_reply_schedule_cv.notify_all();
     AppendAutoReplyRecentLog(
         state,
         std::wstring(L"\u5df2\u4fdd\u5b58\u65f6\u95f4\u8bbe\u7f6e\uff0c\u51b7\u5374 ") +
             std::to_wstring(cooldown_seconds) +
             L" \u79d2\uff0c\u5ef6\u65f6 " +
             std::to_wstring(delay_ms) +
-            L" ms");
+            L" ms\uff0c\u5b9a\u65f6\u95f4\u9694 " +
+            std::to_wstring(schedule_interval_seconds) +
+            L" \u79d2");
 }
 
 void HandleAutoReplyDanmakuEvent(AppState* state, bool is_gift, const std::wstring& text) {
@@ -2632,7 +3219,7 @@ void HandleAutoReplyDanmakuEvent(AppState* state, bool is_gift, const std::wstri
     }
 
     const std::wstring source_text = TrimWhitespace(text);
-    if (source_text.empty() || is_gift) {
+    if (source_text.empty()) {
         return;
     }
 
@@ -2648,17 +3235,24 @@ void HandleAutoReplyDanmakuEvent(AppState* state, bool is_gift, const std::wstri
             dropped_old = true;
         }
         state->auto_reply_match_queue.push_back(PendingAutoReplyEvent{
-            false,
+            is_gift,
             source_text,
             GetTickCount64(),
         });
         state->auto_reply_last_match_text = source_text;
-        state->auto_reply_status = L"\u6536\u5230\u65b0\u5f39\u5e55\uff0c\u6b63\u5728\u5339\u914d\u81ea\u52a8\u56de\u590d\u89c4\u5219";
+        state->auto_reply_status =
+            is_gift
+                ? L"\u6536\u5230\u65b0\u793c\u7269\uff0c\u6b63\u5728\u5339\u914d\u81ea\u52a8\u611f\u8c22\u8bdd\u672f"
+                : L"\u6536\u5230\u65b0\u5f39\u5e55\uff0c\u6b63\u5728\u5339\u914d\u81ea\u52a8\u56de\u590d\u89c4\u5219";
         should_queue = true;
     }
 
     if (dropped_old) {
-        AppendAutoReplyRecentLog(state, L"\u5339\u914d\u961f\u5217\u5df2\u6ee1\uff0c\u5df2\u4e22\u5f03\u6700\u65e9\u4e00\u6761\u5f85\u5339\u914d\u5f39\u5e55");
+        AppendAutoReplyRecentLog(
+            state,
+            is_gift
+                ? L"\u5339\u914d\u961f\u5217\u5df2\u6ee1\uff0c\u5df2\u4e22\u5f03\u6700\u65e9\u4e00\u6761\u5f85\u5339\u914d\u793c\u7269"
+                : L"\u5339\u914d\u961f\u5217\u5df2\u6ee1\uff0c\u5df2\u4e22\u5f03\u6700\u65e9\u4e00\u6761\u5f85\u5339\u914d\u5f39\u5e55");
     } else if (should_queue) {
         RequestAutoReplySnapshotRefresh(state);
     }
@@ -2685,20 +3279,24 @@ void AutoReplyMatchWorkerLoop(AppState* state) {
         }
 
         const std::wstring source_text = TrimWhitespace(pending_event.text);
-        if (source_text.empty() || pending_event.is_gift) {
+        if (source_text.empty()) {
             continue;
         }
 
         bool enabled = false;
+        bool gift_enabled = false;
         std::wstring exact_rules_text;
         std::wstring keyword_rules_text;
         std::wstring fallback_text;
+        std::wstring gift_replies_text;
         {
             std::lock_guard<std::mutex> lock(state->auto_reply_mutex);
             enabled = state->auto_reply_enabled;
+            gift_enabled = state->auto_reply_gift_enabled;
             exact_rules_text = state->auto_reply_exact_rules_text;
             keyword_rules_text = state->auto_reply_keyword_rules_text;
             fallback_text = state->auto_reply_fallback_text;
+            gift_replies_text = state->auto_reply_gift_replies_text;
         }
         if (!enabled) {
             continue;
@@ -2706,8 +3304,126 @@ void AutoReplyMatchWorkerLoop(AppState* state) {
 
         std::wstring speaker;
         std::wstring content;
-        ParseAutoReplySpeakerContent(source_text, &speaker, &content);
+        std::wstring gift_name;
+        if (pending_event.is_gift) {
+            if (ParseAutoReplyGiftMessage(source_text, &speaker, &gift_name)) {
+                content = gift_name;
+            } else {
+                ParseAutoReplySpeakerContent(source_text, &speaker, &content);
+                gift_name = StripAutoReplyGiftCounterSuffix(content.empty() ? source_text : content);
+                content = gift_name;
+            }
+        } else {
+            ParseAutoReplySpeakerContent(source_text, &speaker, &content);
+        }
         const ULONGLONG event_tick = pending_event.received_tick != 0 ? pending_event.received_tick : GetTickCount64();
+
+        if (pending_event.is_gift) {
+            if (!gift_enabled) {
+                {
+                    std::lock_guard<std::mutex> lock(state->auto_reply_mutex);
+                    state->auto_reply_last_match_text = source_text;
+                    state->auto_reply_status = L"\u6536\u5230\u793c\u7269\uff0c\u4f46\u793c\u7269\u81ea\u52a8\u611f\u8c22\u672a\u5f00\u542f";
+                }
+                RequestAutoReplySnapshotRefresh(state);
+                continue;
+            }
+
+            const auto gift_replies = ParseAutoReplyReplyPool(gift_replies_text);
+            std::wstring reply_template = PickRandomAutoReply(gift_replies);
+            std::wstring reply_text;
+            if (speaker.empty() && ContainsAutoReplySpeakerPlaceholder(reply_template)) {
+                reply_text = BuildAnonymousGiftAutoReply(gift_name);
+            } else {
+                reply_text = RenderAutoReplyTemplate(reply_template, speaker, content, source_text, gift_name);
+                if (reply_text.empty() && speaker.empty()) {
+                    reply_text = BuildAnonymousGiftAutoReply(gift_name);
+                }
+            }
+            if (reply_text.empty()) {
+                {
+                    std::lock_guard<std::mutex> lock(state->auto_reply_mutex);
+                    state->auto_reply_last_match_text = source_text;
+                    state->auto_reply_status = L"\u793c\u7269\u81ea\u52a8\u611f\u8c22\u5df2\u5f00\u542f\uff0c\u4f46\u8fd8\u6ca1\u6709\u914d\u7f6e\u611f\u8c22\u8bdd\u672f";
+                }
+                RequestAutoReplySnapshotRefresh(state);
+                continue;
+            }
+
+            std::wstring target_title;
+            if (state->danmaku_controller != nullptr) {
+                const auto snapshot = state->danmaku_controller->GetSnapshot();
+                target_title = snapshot.ui_probe_target_title;
+            }
+
+            bool should_queue_send = false;
+            bool dropped_old = false;
+            bool used_send_enabled = false;
+            {
+                std::lock_guard<std::mutex> lock(state->auto_reply_mutex);
+                if (!state->auto_reply_enabled || !state->auto_reply_gift_enabled) {
+                    continue;
+                }
+
+                const ULONGLONG cooldown_ms =
+                    static_cast<ULONGLONG>(std::max(0, state->auto_reply_cooldown_seconds)) * 1000ULL;
+                if (cooldown_ms > 0 &&
+                    state->auto_reply_last_gift_trigger_tick != 0 &&
+                    event_tick - state->auto_reply_last_gift_trigger_tick < cooldown_ms) {
+                    state->auto_reply_last_match_text = source_text;
+                    state->auto_reply_status = L"\u793c\u7269\u81ea\u52a8\u611f\u8c22\u51b7\u5374\u4e2d\uff0c\u5f53\u524d\u5ffd\u7565\u65b0\u793c\u7269";
+                    RequestAutoReplySnapshotRefresh(state);
+                    continue;
+                }
+
+                state->auto_reply_last_gift_trigger_tick = event_tick;
+                state->auto_reply_last_match_text = source_text;
+                state->auto_reply_last_reply_text = reply_text;
+                if (!target_title.empty()) {
+                    state->auto_reply_target_title = target_title;
+                }
+
+                used_send_enabled = state->auto_reply_send_enabled;
+                if (used_send_enabled) {
+                    if (state->auto_reply_queue.size() >= kMaxAutoReplyQueueSize) {
+                        state->auto_reply_queue.pop_front();
+                        dropped_old = true;
+                    }
+                    PendingAutoReplyJob job;
+                    job.kind_label = kAutoReplyGiftJobLabel;
+                    job.source_text = source_text;
+                    job.speaker = speaker;
+                    job.content = content;
+                    job.reply_text = reply_text;
+                    job.due_tick = event_tick + static_cast<ULONGLONG>(std::max(0, state->auto_reply_delay_ms));
+                    state->auto_reply_queue.push_back(std::move(job));
+                    state->auto_reply_status = L"\u5df2\u5339\u914d\u793c\u7269\u81ea\u52a8\u611f\u8c22\uff0c\u7b49\u5f85\u53d1\u9001";
+                    should_queue_send = true;
+                } else {
+                    state->auto_reply_status = L"\u5df2\u5339\u914d\u793c\u7269\u81ea\u52a8\u611f\u8c22\uff0c\u5f53\u524d\u4ec5\u9884\u89c8";
+                }
+            }
+
+            if (dropped_old) {
+                AppendAutoReplyRecentLog(state, L"\u961f\u5217\u5df2\u6ee1\uff0c\u5df2\u4e22\u5f03\u6700\u65e9\u4e00\u6761\u5f85\u53d1\u9001\u56de\u590d");
+            }
+
+            const std::wstring log_line =
+                std::wstring(L"\u547d\u4e2d[") +
+                BuildAutoReplyMatchKindText(AutoReplyMatchKind::kGift) +
+                L"] \u2192 " +
+                reply_text;
+
+            if (should_queue_send) {
+                state->auto_reply_cv.notify_one();
+                AppendAutoReplyRecentLog(state, log_line + L"\uff0c\u5df2\u5165\u961f");
+            } else if (used_send_enabled) {
+                RequestAutoReplySnapshotRefresh(state);
+            } else {
+                AppendAutoReplyRecentLog(state, log_line + L"\uff0c\u4ec5\u9884\u89c8");
+            }
+            continue;
+        }
 
         bool ignore_recent_echo = false;
         {
@@ -2789,6 +3505,7 @@ void AutoReplyMatchWorkerLoop(AppState* state) {
                     dropped_old = true;
                 }
                 PendingAutoReplyJob job;
+                job.kind_label = kAutoReplyRuleJobLabel;
                 job.source_text = source_text;
                 job.speaker = speaker;
                 job.content = content;
@@ -2810,6 +3527,139 @@ void AutoReplyMatchWorkerLoop(AppState* state) {
             std::wstring(L"\u547d\u4e2d[") +
             BuildAutoReplyMatchKindText(match_kind) +
             (matched_label.empty() ? std::wstring{} : std::wstring(L":") + matched_label) +
+            L"] \u2192 " +
+            reply_text;
+
+        if (should_queue_send) {
+            state->auto_reply_cv.notify_one();
+            AppendAutoReplyRecentLog(state, log_line + L"\uff0c\u5df2\u5165\u961f");
+        } else if (used_send_enabled) {
+            RequestAutoReplySnapshotRefresh(state);
+        } else {
+            AppendAutoReplyRecentLog(state, log_line + L"\uff0c\u4ec5\u9884\u89c8");
+        }
+    }
+}
+
+void AutoReplyScheduleWorkerLoop(AppState* state) {
+    if (state == nullptr) {
+        return;
+    }
+
+    for (;;) {
+        bool enabled = false;
+        bool schedule_enabled = false;
+        int schedule_interval_seconds = kAutoReplyScheduleIntervalDefault;
+        ULONGLONG schedule_next_tick = 0;
+        std::wstring schedule_replies_text;
+        {
+            std::unique_lock<std::mutex> lock(state->auto_reply_mutex);
+            for (;;) {
+                if (state->auto_reply_stop_requested) {
+                    return;
+                }
+
+                enabled = state->auto_reply_enabled;
+                schedule_enabled = state->auto_reply_schedule_enabled;
+                schedule_interval_seconds = ClampAutoReplyScheduleInterval(state->auto_reply_schedule_interval_seconds);
+                schedule_replies_text = state->auto_reply_schedule_replies_text;
+
+                if (!enabled || !schedule_enabled) {
+                    state->auto_reply_schedule_cv.wait(lock, [state] {
+                        return state->auto_reply_stop_requested ||
+                               (state->auto_reply_enabled && state->auto_reply_schedule_enabled);
+                    });
+                    continue;
+                }
+
+                if (state->auto_reply_schedule_next_tick == 0) {
+                    state->auto_reply_schedule_next_tick =
+                        GetTickCount64() + static_cast<ULONGLONG>(schedule_interval_seconds) * 1000ULL;
+                }
+
+                schedule_next_tick = state->auto_reply_schedule_next_tick;
+                const ULONGLONG now_tick = GetTickCount64();
+                if (schedule_next_tick > now_tick) {
+                    state->auto_reply_schedule_cv.wait_for(
+                        lock,
+                        std::chrono::milliseconds(static_cast<long long>(schedule_next_tick - now_tick)));
+                    continue;
+                }
+                break;
+            }
+        }
+
+        const auto schedule_replies = ParseAutoReplyReplyPool(schedule_replies_text);
+        std::wstring reply_text = PickRandomAutoReply(schedule_replies);
+        reply_text = RenderAutoReplyTemplate(
+            reply_text,
+            std::wstring{},
+            kAutoReplyScheduleSourceText,
+            kAutoReplyScheduleSourceText);
+
+        std::wstring target_title;
+        if (state->danmaku_controller != nullptr) {
+            const auto snapshot = state->danmaku_controller->GetSnapshot();
+            target_title = snapshot.ui_probe_target_title;
+        }
+
+        const ULONGLONG now_tick = GetTickCount64();
+        bool should_queue_send = false;
+        bool dropped_old = false;
+        bool used_send_enabled = false;
+        {
+            std::lock_guard<std::mutex> lock(state->auto_reply_mutex);
+            if (state->auto_reply_stop_requested) {
+                return;
+            }
+            if (!state->auto_reply_enabled || !state->auto_reply_schedule_enabled) {
+                continue;
+            }
+
+            state->auto_reply_schedule_next_tick =
+                now_tick + static_cast<ULONGLONG>(ClampAutoReplyScheduleInterval(state->auto_reply_schedule_interval_seconds)) * 1000ULL;
+            state->auto_reply_last_match_text = kAutoReplyScheduleSourceText;
+            if (!target_title.empty()) {
+                state->auto_reply_target_title = target_title;
+            }
+
+            if (reply_text.empty()) {
+                state->auto_reply_status = L"\u5b9a\u65f6\u53d1\u9001\u5df2\u5f00\u542f\uff0c\u4f46\u8fd8\u6ca1\u6709\u914d\u7f6e\u53ef\u7528\u8bdd\u672f";
+            } else {
+                state->auto_reply_last_reply_text = reply_text;
+                used_send_enabled = state->auto_reply_send_enabled;
+                if (used_send_enabled) {
+                    if (state->auto_reply_queue.size() >= kMaxAutoReplyQueueSize) {
+                        state->auto_reply_queue.pop_front();
+                        dropped_old = true;
+                    }
+                    PendingAutoReplyJob job;
+                    job.kind_label = kAutoReplyScheduleJobLabel;
+                    job.source_text = kAutoReplyScheduleSourceText;
+                    job.content = kAutoReplyScheduleSourceText;
+                    job.reply_text = reply_text;
+                    job.due_tick = now_tick + static_cast<ULONGLONG>(std::max(0, state->auto_reply_delay_ms));
+                    state->auto_reply_queue.push_back(std::move(job));
+                    state->auto_reply_status = L"\u5df2\u751f\u6210\u5b9a\u65f6\u5f39\u5e55\uff0c\u7b49\u5f85\u53d1\u9001";
+                    should_queue_send = true;
+                } else {
+                    state->auto_reply_status = L"\u5df2\u751f\u6210\u5b9a\u65f6\u5f39\u5e55\uff0c\u5f53\u524d\u4ec5\u9884\u89c8";
+                }
+            }
+        }
+
+        if (dropped_old) {
+            AppendAutoReplyRecentLog(state, L"\u961f\u5217\u5df2\u6ee1\uff0c\u5df2\u4e22\u5f03\u6700\u65e9\u4e00\u6761\u5f85\u53d1\u9001\u56de\u590d");
+        }
+
+        if (reply_text.empty()) {
+            RequestAutoReplySnapshotRefresh(state);
+            continue;
+        }
+
+        const std::wstring log_line =
+            std::wstring(L"\u547d\u4e2d[") +
+            kAutoReplyScheduleJobLabel +
             L"] \u2192 " +
             reply_text;
 
@@ -2856,7 +3706,10 @@ void AutoReplyWorkerLoop(AppState* state) {
 
                 job = std::move(state->auto_reply_queue.front());
                 state->auto_reply_queue.pop_front();
-                state->auto_reply_status = L"\u6b63\u5728\u53d1\u9001\u81ea\u52a8\u56de\u590d";
+                if (job.kind_label.empty()) {
+                    job.kind_label = kAutoReplyRuleJobLabel;
+                }
+                state->auto_reply_status = std::wstring(L"\u6b63\u5728\u53d1\u9001") + job.kind_label;
                 break;
             }
         }
@@ -2876,22 +3729,24 @@ void AutoReplyWorkerLoop(AppState* state) {
             }
             state->auto_reply_status =
                 send_ok
-                    ? L"\u81ea\u52a8\u56de\u590d\u5df2\u53d1\u9001"
-                    : (std::wstring(L"\u81ea\u52a8\u56de\u590d\u53d1\u9001\u5931\u8d25\uff1a") +
+                    ? (job.kind_label + std::wstring(L"\u5df2\u53d1\u9001"))
+                    : (job.kind_label + std::wstring(L"\u53d1\u9001\u5931\u8d25\uff1a") +
                        (error_text.empty() ? L"\u672a\u77e5\u539f\u56e0" : error_text));
         }
 
         if (send_ok) {
             AppendAutoReplyRecentLog(
                 state,
-                std::wstring(L"\u5df2\u53d1\u9001\u5230\u300a") +
+                job.kind_label +
+                    L"\uff1a\u5df2\u53d1\u9001\u5230\u300a" +
                     (!target_title.empty() ? target_title : L"\u76ee\u6807\u7a97\u53e3") +
                     L"\u300b\uff1a" +
                     job.reply_text);
         } else {
             AppendAutoReplyRecentLog(
                 state,
-                std::wstring(L"\u53d1\u9001\u5931\u8d25\uff1a") +
+                job.kind_label +
+                    L"\uff1a\u53d1\u9001\u5931\u8d25\uff1a" +
                     (error_text.empty() ? L"\u672a\u77e5\u539f\u56e0" : error_text));
         }
     }
@@ -2911,6 +3766,10 @@ void StopAutoReplyWorker(AppState* state) {
     }
     state->auto_reply_match_cv.notify_all();
     state->auto_reply_cv.notify_all();
+    state->auto_reply_schedule_cv.notify_all();
+    if (state->auto_reply_schedule_thread.joinable()) {
+        state->auto_reply_schedule_thread.join();
+    }
     if (state->auto_reply_match_thread.joinable()) {
         state->auto_reply_match_thread.join();
     }
@@ -3061,6 +3920,178 @@ std::wstring BuildAudioRuntimeText(
            << L"\uFF0C\u4E22\u5F03 "
            << stats.dropped_frames;
     return stream.str();
+}
+
+bool AdapterHasIpv4Gateway(const IP_ADAPTER_ADDRESSES* adapter) {
+    if (adapter == nullptr) {
+        return false;
+    }
+
+    for (const IP_ADAPTER_GATEWAY_ADDRESS_LH* gateway = adapter->FirstGatewayAddress;
+         gateway != nullptr;
+         gateway = gateway->Next) {
+        if (gateway->Address.lpSockaddr != nullptr && gateway->Address.lpSockaddr->sa_family == AF_INET) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool ShouldUseAdapterForLocalIpv4(const IP_ADAPTER_ADDRESSES* adapter, bool require_gateway) {
+    if (adapter == nullptr || adapter->OperStatus != IfOperStatusUp) {
+        return false;
+    }
+    if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK) {
+        return false;
+    }
+    if ((adapter->Flags & IP_ADAPTER_RECEIVE_ONLY) != 0) {
+        return false;
+    }
+    if (require_gateway && !AdapterHasIpv4Gateway(adapter)) {
+        return false;
+    }
+    return true;
+}
+
+bool IsUsableLocalIpv4(const SOCKADDR_IN* address) {
+    if (address == nullptr) {
+        return false;
+    }
+
+    const ULONG host_order = ntohl(address->sin_addr.S_un.S_addr);
+    const unsigned first = (host_order >> 24) & 0xFFu;
+    const unsigned second = (host_order >> 16) & 0xFFu;
+
+    if (first == 0 || first == 127) {
+        return false;
+    }
+    if (first == 169 && second == 254) {
+        return false;
+    }
+    if (first >= 224) {
+        return false;
+    }
+    return true;
+}
+
+bool IsPrivateLanIpv4(const SOCKADDR_IN* address) {
+    if (address == nullptr) {
+        return false;
+    }
+
+    const ULONG host_order = ntohl(address->sin_addr.S_un.S_addr);
+    const unsigned first = (host_order >> 24) & 0xFFu;
+    const unsigned second = (host_order >> 16) & 0xFFu;
+
+    if (first == 10 || first == 192 && second == 168) {
+        return true;
+    }
+    return first == 172 && second >= 16 && second <= 31;
+}
+
+std::vector<std::wstring> CollectLocalIpv4Addresses(bool require_gateway, bool private_only) {
+    ULONG buffer_length = 15 * 1024;
+    std::vector<BYTE> buffer(buffer_length);
+    IP_ADAPTER_ADDRESSES* adapters =
+        reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+    const ULONG flags =
+        GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+
+    ULONG result = GetAdaptersAddresses(AF_INET, flags, nullptr, adapters, &buffer_length);
+    if (result == ERROR_BUFFER_OVERFLOW) {
+        buffer.resize(buffer_length);
+        adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+        result = GetAdaptersAddresses(AF_INET, flags, nullptr, adapters, &buffer_length);
+    }
+    if (result != NO_ERROR) {
+        return {};
+    }
+
+    std::vector<std::wstring> addresses;
+    std::unordered_set<std::wstring> seen;
+    for (const IP_ADAPTER_ADDRESSES* adapter = adapters; adapter != nullptr; adapter = adapter->Next) {
+        if (!ShouldUseAdapterForLocalIpv4(adapter, require_gateway)) {
+            continue;
+        }
+
+        for (const IP_ADAPTER_UNICAST_ADDRESS* unicast = adapter->FirstUnicastAddress;
+             unicast != nullptr;
+             unicast = unicast->Next) {
+            const SOCKADDR* raw_address = unicast->Address.lpSockaddr;
+            if (raw_address == nullptr || raw_address->sa_family != AF_INET) {
+                continue;
+            }
+
+            const SOCKADDR_IN* ipv4 = reinterpret_cast<const SOCKADDR_IN*>(raw_address);
+            if (!IsUsableLocalIpv4(ipv4)) {
+                continue;
+            }
+            if (private_only && !IsPrivateLanIpv4(ipv4)) {
+                continue;
+            }
+
+            wchar_t buffer_text[INET_ADDRSTRLEN] = {};
+            if (InetNtopW(AF_INET,
+                          const_cast<IN_ADDR*>(&ipv4->sin_addr),
+                          buffer_text,
+                          static_cast<DWORD>(std::size(buffer_text))) == nullptr) {
+                continue;
+            }
+
+            std::wstring text(buffer_text);
+            if (!text.empty() && seen.insert(text).second) {
+                addresses.push_back(std::move(text));
+            }
+        }
+    }
+
+    return addresses;
+}
+
+std::wstring JoinLocalIpv4Addresses(const std::vector<std::wstring>& addresses) {
+    if (addresses.empty()) {
+        return {};
+    }
+
+    std::wostringstream stream;
+    for (size_t index = 0; index < addresses.size(); ++index) {
+        if (index > 0) {
+            stream << L" / ";
+        }
+        stream << addresses[index];
+    }
+    return stream.str();
+}
+
+std::wstring QueryLocalIpAddressText() {
+    std::vector<std::wstring> addresses = CollectLocalIpv4Addresses(true, true);
+    if (addresses.empty()) {
+        addresses = CollectLocalIpv4Addresses(false, true);
+    }
+    if (addresses.empty()) {
+        addresses = CollectLocalIpv4Addresses(true, false);
+    }
+    if (addresses.empty()) {
+        addresses = CollectLocalIpv4Addresses(false, false);
+    }
+    return JoinLocalIpv4Addresses(addresses);
+}
+
+std::wstring GetCachedLocalIpAddressText(AppState* state) {
+    if (state == nullptr) {
+        return QueryLocalIpAddressText();
+    }
+
+    const ULONGLONG now = GetTickCount64();
+    std::lock_guard<std::mutex> lock(state->local_ip_mutex);
+    if (state->local_ip_address.empty() ||
+        now < state->local_ip_refresh_tick ||
+        now - state->local_ip_refresh_tick >= 5000) {
+        state->local_ip_address = QueryLocalIpAddressText();
+        state->local_ip_refresh_tick = now;
+    }
+    return state->local_ip_address;
 }
 
 std::wstring FormatDataSize(uint64_t bytes) {
@@ -3650,8 +4681,6 @@ void ApplyPresentationMode(AppState* state, VideoRenderer::PresentationMode mode
         return;
     }
 
-    mode = VideoRenderer::PresentationMode::kLowLatency;
-
     if (state->presentation_mode == mode) {
         UpdateActionButtons(state);
         return;
@@ -3660,7 +4689,7 @@ void ApplyPresentationMode(AppState* state, VideoRenderer::PresentationMode mode
     state->presentation_mode = mode;
     state->renderer.SetPresentationMode(mode);
     if (state->decoder != nullptr) {
-        state->decoder->SetSmoothMode(false);
+        state->decoder->SetSmoothMode(mode == VideoRenderer::PresentationMode::kSmooth);
     }
     UpdateActionButtons(state);
 
@@ -3751,7 +4780,7 @@ void UpdateSessionSnapshot(
     }
 }
 
-protocol::StreamProfile CapStreamProfileTo60Fps(const protocol::StreamProfile& profile) {
+protocol::StreamProfile CapStreamProfileToMaxFps(const protocol::StreamProfile& profile) {
     protocol::StreamProfile normalized = profile;
     if (normalized.fps > kMaxStreamFps) {
         normalized.fps = kMaxStreamFps;
@@ -3774,7 +4803,7 @@ void PostApplyStreamProfileMessage(
         return;
     }
 
-    const protocol::StreamProfile capped_profile = CapStreamProfileTo60Fps(profile);
+    const protocol::StreamProfile capped_profile = CapStreamProfileToMaxFps(profile);
 
     auto* message = new PendingStreamProfileMessage{
         capped_profile,
@@ -4393,6 +5422,16 @@ void ExecuteEmbeddedWebUiAction(
         UpdateStatusLabel(state);
         return;
     }
+    if (action == L"toggleAutoReplyGiftEnabled") {
+        ToggleAutoReplyGiftEnabled(state);
+        UpdateStatusLabel(state);
+        return;
+    }
+    if (action == L"toggleAutoReplyScheduleEnabled") {
+        ToggleAutoReplyScheduleEnabled(state);
+        UpdateStatusLabel(state);
+        return;
+    }
     if (action == L"saveAutoReplyTextConfig") {
         SaveAutoReplyTextConfig(state, value, extra);
         UpdateStatusLabel(state);
@@ -4437,6 +5476,26 @@ void RequestKeyframe(AppState* state) {
 
     if (!state->control_server->RequestIdr()) {
         QueueLog(state, L"\u63A7\u5236\u670D\u52A1: \u5F53\u524D\u6CA1\u6709\u6D3B\u8DC3\u4F1A\u8BDD\uFF0C\u65E0\u6CD5\u8BF7\u6C42\u5173\u952E\u5E27\u3002");
+    }
+}
+
+void RequestVideoRecoveryKeyframeIfDue(AppState* state, int64_t now_us) {
+    if (state == nullptr || now_us <= 0) {
+        return;
+    }
+
+    bool should_request = false;
+    {
+        std::lock_guard<std::mutex> lock(state->metrics_mutex);
+        if (state->last_stale_video_drop_request_us == 0 ||
+            (now_us - state->last_stale_video_drop_request_us) >= kVideoKeyframeRequestCooldownUs) {
+            state->last_stale_video_drop_request_us = now_us;
+            should_request = true;
+        }
+    }
+
+    if (should_request) {
+        RequestKeyframe(state);
     }
 }
 
@@ -6961,12 +8020,12 @@ bool LoadCachedSelectedProfile(const std::wstring& path, protocol::StreamProfile
         return false;
     }
 
-    *out = CapStreamProfileTo60Fps(profile);
+    *out = CapStreamProfileToMaxFps(profile);
     return true;
 }
 
 std::string BuildProfileCacheJson(const protocol::StreamProfile& profile) {
-    const protocol::StreamProfile capped_profile = CapStreamProfileTo60Fps(profile);
+    const protocol::StreamProfile capped_profile = CapStreamProfileToMaxFps(profile);
     std::ostringstream json;
     json << "{"
          << "\"codec\":\"" << protocol::CodecToWireName(capped_profile.codec) << "\","
@@ -7402,7 +8461,7 @@ void ApplyStreamProfile(AppState* state, const protocol::StreamProfile& profile,
         return;
     }
 
-    const protocol::StreamProfile capped_profile = CapStreamProfileTo60Fps(profile);
+    const protocol::StreamProfile capped_profile = CapStreamProfileToMaxFps(profile);
     state->selected_profile = capped_profile;
     state->has_selected_profile = true;
     state->auto_resumed_profile = auto_resumed;
@@ -7503,8 +8562,12 @@ void WriteStatusSnapshot(
         state->danmaku_controller != nullptr ? state->danmaku_controller->GetSnapshot() : DanmakuController::Snapshot{};
     bool auto_reply_enabled = false;
     bool auto_reply_send_enabled = false;
+    bool auto_reply_gift_enabled = false;
+    bool auto_reply_schedule_enabled = false;
     int auto_reply_cooldown_seconds = 0;
     int auto_reply_delay_ms = 0;
+    int auto_reply_schedule_interval_seconds = kAutoReplyScheduleIntervalDefault;
+    int auto_reply_schedule_next_in_seconds = 0;
     size_t auto_reply_pending_count = 0;
     std::wstring auto_reply_status;
     std::wstring auto_reply_target_title;
@@ -7523,13 +8586,18 @@ void WriteStatusSnapshot(
     std::wstring auto_reply_exact_rules_text;
     std::wstring auto_reply_keyword_rules_text;
     std::wstring auto_reply_fallback_text;
+    std::wstring auto_reply_gift_replies_text;
+    std::wstring auto_reply_schedule_replies_text;
     std::deque<std::wstring> auto_reply_recent_logs;
     {
         std::lock_guard<std::mutex> lock(state->auto_reply_mutex);
         auto_reply_enabled = state->auto_reply_enabled;
         auto_reply_send_enabled = state->auto_reply_send_enabled;
+        auto_reply_gift_enabled = state->auto_reply_gift_enabled;
+        auto_reply_schedule_enabled = state->auto_reply_schedule_enabled;
         auto_reply_cooldown_seconds = state->auto_reply_cooldown_seconds;
         auto_reply_delay_ms = state->auto_reply_delay_ms;
+        auto_reply_schedule_interval_seconds = state->auto_reply_schedule_interval_seconds;
         auto_reply_pending_count = state->auto_reply_match_queue.size() + state->auto_reply_queue.size();
         auto_reply_status = state->auto_reply_status;
         auto_reply_target_title = state->auto_reply_target_title;
@@ -7546,6 +8614,16 @@ void WriteStatusSnapshot(
         auto_reply_exact_rules_text = state->auto_reply_exact_rules_text;
         auto_reply_keyword_rules_text = state->auto_reply_keyword_rules_text;
         auto_reply_fallback_text = state->auto_reply_fallback_text;
+        auto_reply_gift_replies_text = state->auto_reply_gift_replies_text;
+        auto_reply_schedule_replies_text = state->auto_reply_schedule_replies_text;
+        if (state->auto_reply_schedule_enabled && state->auto_reply_schedule_next_tick != 0) {
+            const ULONGLONG now_tick = GetTickCount64();
+            if (state->auto_reply_schedule_next_tick > now_tick) {
+                const ULONGLONG remaining_ms = state->auto_reply_schedule_next_tick - now_tick;
+                auto_reply_schedule_next_in_seconds =
+                    static_cast<int>((remaining_ms + 999ULL) / 1000ULL);
+            }
+        }
         auto_reply_recent_logs = state->auto_reply_recent_logs;
     }
     auto_reply_input_point_text = BuildAutoReplyPointText(
@@ -7582,8 +8660,12 @@ void WriteStatusSnapshot(
     json << "  \"audioPlaybackSubmitted\": " << audio_playback_stats.submitted_frames << ",\n";
     json << "  \"audioPlaybackPlayed\": " << audio_playback_stats.played_frames << ",\n";
     json << "  \"audioPlaybackDropped\": " << audio_playback_stats.dropped_frames << ",\n";
+    json << "  \"audioPlaybackResyncs\": " << audio_playback_stats.resync_count << ",\n";
+    json << "  \"audioPlaybackRecoveryMode\": " << (audio_playback_stats.recovery_mode ? "true" : "false") << ",\n";
     json << "  \"audioPlaybackBuffered\": " << audio_playback_stats.buffered_frames << ",\n";
     json << "  \"audioPlaybackBufferedMs\": " << audio_playback_stats.buffered_ms << ",\n";
+    json << "  \"audioPlaybackPendingMs\": " << audio_playback_stats.pending_buffered_ms << ",\n";
+    json << "  \"audioPlaybackSubmittedMs\": " << audio_playback_stats.submitted_buffered_ms << ",\n";
     json << "  \"completedFrames\": " << stats.completed_frames << ",\n";
     json << "  \"decodedFrames\": " << decoded_frame_count << ",\n";
     json << "  \"displayedFrames\": " << displayed_frame_count << ",\n";
@@ -7608,6 +8690,7 @@ void WriteStatusSnapshot(
     json << "  \"decodeFps\": " << format_number(decode_fps) << ",\n";
     json << "  \"displayFps\": " << format_number(display_fps) << ",\n";
     json << "  \"presentationMode\": " << QuoteJsonWide(PresentationModeLabel(state->presentation_mode)) << ",\n";
+    json << "  \"localIpAddress\": " << QuoteJsonWide(GetCachedLocalIpAddressText(state)) << ",\n";
     json << "  \"gpuName\": " << QuoteJsonWide(state->renderer.gpu_name()) << ",\n";
     json << "  \"nvdecCudaReady\": " << (state->nvdec_probe.cuda_driver_ready ? "true" : "false") << ",\n";
     json << "  \"nvdecCuvidReady\": " << (state->nvdec_probe.cuvid_library_ready ? "true" : "false") << ",\n";
@@ -7654,8 +8737,12 @@ void WriteStatusSnapshot(
     json << "  \"danmakuCaptureRootPath\": " << QuoteJsonWide(state->danmaku_capture_root_path) << ",\n";
     json << "  \"autoReplyEnabled\": " << (auto_reply_enabled ? "true" : "false") << ",\n";
     json << "  \"autoReplySendEnabled\": " << (auto_reply_send_enabled ? "true" : "false") << ",\n";
+    json << "  \"autoReplyGiftEnabled\": " << (auto_reply_gift_enabled ? "true" : "false") << ",\n";
+    json << "  \"autoReplyScheduleEnabled\": " << (auto_reply_schedule_enabled ? "true" : "false") << ",\n";
     json << "  \"autoReplyCooldownSeconds\": " << auto_reply_cooldown_seconds << ",\n";
     json << "  \"autoReplyDelayMs\": " << auto_reply_delay_ms << ",\n";
+    json << "  \"autoReplyScheduleIntervalSeconds\": " << auto_reply_schedule_interval_seconds << ",\n";
+    json << "  \"autoReplyScheduleNextInSeconds\": " << auto_reply_schedule_next_in_seconds << ",\n";
     json << "  \"autoReplyPendingCount\": " << auto_reply_pending_count << ",\n";
     json << "  \"autoReplyStatus\": " << QuoteJsonWide(auto_reply_status) << ",\n";
     json << "  \"autoReplyConfigPath\": " << QuoteJsonWide(state->auto_reply_config_path) << ",\n";
@@ -7673,6 +8760,8 @@ void WriteStatusSnapshot(
     json << "  \"autoReplyKeywordRulesText\": " << QuoteJsonWide(auto_reply_keyword_rules_text) << ",\n";
     json << "  \"autoReplyRulesText\": " << QuoteJsonWide(auto_reply_keyword_rules_text) << ",\n";
     json << "  \"autoReplyFallbackRepliesText\": " << QuoteJsonWide(auto_reply_fallback_text) << ",\n";
+    json << "  \"autoReplyGiftRepliesText\": " << QuoteJsonWide(auto_reply_gift_replies_text) << ",\n";
+    json << "  \"autoReplyScheduleRepliesText\": " << QuoteJsonWide(auto_reply_schedule_replies_text) << ",\n";
     json << "  \"localMusicPlaying\": "
          << ((state->local_music_player != nullptr && state->local_music_player->running()) ? "true" : "false")
          << ",\n";
@@ -8337,7 +9426,11 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
         });
         new_state->auto_reply_match_thread = std::thread(AutoReplyMatchWorkerLoop, new_state);
         new_state->auto_reply_thread = std::thread(AutoReplyWorkerLoop, new_state);
-        if (new_state->auto_reply_enabled || new_state->auto_reply_send_enabled) {
+        new_state->auto_reply_schedule_thread = std::thread(AutoReplyScheduleWorkerLoop, new_state);
+        if (new_state->auto_reply_enabled ||
+            new_state->auto_reply_send_enabled ||
+            new_state->auto_reply_gift_enabled ||
+            new_state->auto_reply_schedule_enabled) {
             EnsureDanmakuReadyForAutoReply(new_state);
         }
 
@@ -8349,8 +9442,9 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
                     new_state->decoded_frame_count += 1;
                 }
                 bool drop_stale_frame = false;
+                int64_t receiver_now_us = 0;
                 if (frame.pts_us > 0) {
-                    const int64_t receiver_now_us = NowSteadyUs();
+                    receiver_now_us = NowSteadyUs();
                     std::lock_guard<std::mutex> lock(new_state->metrics_mutex);
                     if (new_state->has_clock_sync) {
                         const int64_t estimated_latency_us =
@@ -8361,6 +9455,7 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
                     }
                 }
                 if (drop_stale_frame) {
+                    RequestVideoRecoveryKeyframeIfDue(new_state, receiver_now_us);
                     return;
                 }
                 if (new_state->virtual_camera_bridge.running() &&
@@ -8398,7 +9493,7 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
                 }
             });
         new_state->decoder->SetD3DDevice(new_state->renderer.d3d_device());
-        new_state->decoder->SetSmoothMode(false);
+        new_state->decoder->SetSmoothMode(new_state->presentation_mode == VideoRenderer::PresentationMode::kSmooth);
         new_state->decoder->Start();
         new_state->audio_player = std::make_unique<AudioPlayer>(
             [new_state](const std::wstring& line) { QueueLog(new_state, line); });
@@ -8465,6 +9560,25 @@ LRESULT CALLBACK StatusWindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARA
                     }
                 }
                 if (new_state->decoder != nullptr) {
+                    if (!is_codec_config && unit.pts_us > 0) {
+                        bool drop_stale_unit = false;
+                        const int64_t receiver_now_us = NowSteadyUs();
+                        {
+                            std::lock_guard<std::mutex> lock(new_state->metrics_mutex);
+                            if (new_state->has_clock_sync) {
+                                const int64_t estimated_latency_us =
+                                    receiver_now_us + new_state->sender_clock_offset_us -
+                                    static_cast<int64_t>(unit.pts_us);
+                                if (estimated_latency_us > kVideoLateDropUs) {
+                                    drop_stale_unit = true;
+                                }
+                            }
+                        }
+                        if (drop_stale_unit) {
+                            RequestVideoRecoveryKeyframeIfDue(new_state, receiver_now_us);
+                            return;
+                        }
+                    }
                     new_state->decoder->SubmitAccessUnit(unit);
                 }
             });

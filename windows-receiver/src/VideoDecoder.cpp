@@ -23,8 +23,8 @@ extern "C" {
 
 namespace {
 
-constexpr size_t kMaxQueuedAccessUnits = 96;
-constexpr size_t kQueueTrimTargetAccessUnits = 32;
+constexpr size_t kMaxQueuedAccessUnits = 10;
+constexpr size_t kQueueTrimTargetAccessUnits = 4;
 
 std::wstring HrToString(DWORD value) {
     std::wostringstream stream;

@@ -24,22 +24,26 @@ class StreamSettingsStore(context: Context) {
         val defaultSettings = defaultSettings(availableProfiles)
         val savedWidth = preferences.getInt(KEY_WIDTH, defaultSettings.width)
         val savedHeight = preferences.getInt(KEY_HEIGHT, defaultSettings.height)
-        val resolutionProfiles =
+        val exactResolutionProfiles =
             availableProfiles.filter {
-                it.width == savedWidth &&
-                    it.height == savedHeight
+                it.width == savedWidth && it.height == savedHeight
             }
         val matchedResolutionProfiles =
-            if (resolutionProfiles.isNotEmpty()) {
-                resolutionProfiles
+            if (exactResolutionProfiles.isNotEmpty()) {
+                exactResolutionProfiles
             } else {
                 availableProfiles.filter {
-                    it.width == defaultSettings.width &&
-                        it.height == defaultSettings.height
+                    isSameResolutionClass(it, savedWidth, savedHeight)
                 }
             }
         val matchedProfile =
-            matchedResolutionProfiles.maxByOrNull { it.fps }
+            chooseBestProfile(matchedResolutionProfiles)
+                ?: chooseBestProfile(
+                    availableProfiles.filter {
+                        isSameResolutionClass(it, defaultSettings.width, defaultSettings.height)
+                    },
+                )
+                ?: chooseBestProfile(availableProfiles)
                 ?: availableProfiles.first()
 
         val savedBitrateMbps =
@@ -90,13 +94,20 @@ class StreamSettingsStore(context: Context) {
     fun resolveSelectedProfile(supportedProfiles: List<StreamProfile>): StreamProfile {
         val availableProfiles = supportedProfiles.map(::capProfileFps)
         val settings = load(availableProfiles)
-        val resolutionProfiles =
+        val exactResolutionProfiles =
             availableProfiles.filter {
-                it.width == settings.width &&
-                    it.height == settings.height
+                it.width == settings.width && it.height == settings.height
+            }
+        val matchedResolutionProfiles =
+            if (exactResolutionProfiles.isNotEmpty()) {
+                exactResolutionProfiles
+            } else {
+                availableProfiles.filter {
+                    isSameResolutionClass(it, settings.width, settings.height)
+                }
             }
         val matchedProfile =
-            resolutionProfiles.maxByOrNull { it.fps }
+            chooseBestProfile(matchedResolutionProfiles)
                 ?: defaultProfile(availableProfiles)
 
         return capProfileFps(
@@ -109,12 +120,7 @@ class StreamSettingsStore(context: Context) {
     }
 
     private fun defaultProfile(supportedProfiles: List<StreamProfile>): StreamProfile =
-        supportedProfiles
-            .map(::capProfileFps)
-            .maxWithOrNull(
-                compareBy<StreamProfile> { it.width * it.height }
-                    .thenBy { it.fps },
-            )
+        chooseBestProfile(supportedProfiles.map(::capProfileFps))
             ?: capProfileFps(supportedProfiles.first())
 
     private fun defaultSettings(supportedProfiles: List<StreamProfile>): SenderStreamSettings {
@@ -132,7 +138,7 @@ class StreamSettingsStore(context: Context) {
     companion object {
         const val MIN_BITRATE_MBPS = 4
         const val MAX_BITRATE_MBPS = 80
-        private const val MAX_STREAM_FPS = 60
+        private const val MAX_STREAM_FPS = 120
         private const val QUALITY_MIGRATION_LEVEL = 1
 
         private const val PREFERENCE_NAME = "stream_settings"
@@ -147,6 +153,25 @@ class StreamSettingsStore(context: Context) {
 
     private fun recommendedBitrateMbps(profile: StreamProfile): Int =
         (profile.bitrate / 1_000_000).coerceIn(MIN_BITRATE_MBPS, MAX_BITRATE_MBPS)
+
+    private fun isSameResolutionClass(
+        profile: StreamProfile,
+        width: Int,
+        height: Int,
+    ): Boolean =
+        maxOf(profile.width, profile.height) == maxOf(width, height) &&
+            minOf(profile.width, profile.height) == minOf(width, height)
+
+    private fun chooseBestProfile(profiles: List<StreamProfile>): StreamProfile? =
+        profiles.maxWithOrNull(
+            compareBy<StreamProfile> {
+                it.width * it.height
+            }.thenBy {
+                it.fps
+            }.thenBy {
+                if (it.width >= it.height) 1 else 0
+            },
+        )
 
     private fun capProfileFps(profile: StreamProfile): StreamProfile =
         if (profile.fps > MAX_STREAM_FPS) {

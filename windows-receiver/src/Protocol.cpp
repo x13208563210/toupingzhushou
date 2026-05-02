@@ -9,7 +9,7 @@
 namespace protocol {
 namespace {
 
-constexpr int kMaxStreamFps = 60;
+constexpr int kMaxStreamFps = 120;
 
 std::wstring Utf8ToWide(const std::string& value) {
     if (value.empty()) {

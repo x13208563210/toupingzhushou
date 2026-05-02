@@ -231,7 +231,7 @@ void VideoRenderer::SetNominalFrameRate(int fps, bool adaptive_fps) {
             std::wostringstream stream;
             stream.setf(std::ios::fixed);
             stream.precision(1);
-            stream << L"\u89c6\u9891\u6e32\u67d3: \u5df2\u542f\u7528 60Hz \u7a33\u5b9a\u663e\u793a\u8282\u594f\uff0c\u4f18\u5148\u51cf\u5c11\u6295\u5c4f\u679c\u51bb\u611f\u3002";
+            stream << L"\u89c6\u9891\u6e32\u67d3: \u5df2\u8bb0\u5f55 60Hz \u7a33\u5b9a\u663e\u793a\u8282\u594f\u5019\u9009\uff0c\u4ec5\u5728\u987a\u6ed1\u6a21\u5f0f\u4e0b\u542f\u7528\u3002";
             log_fn_(stream.str());
         } else {
             log_fn_(L"\u89c6\u9891\u6e32\u67d3: \u5df2\u5173\u95ed\u56fa\u5b9a\u663e\u793a\u8282\u594f\uff0c\u56de\u5230\u6309\u5e27\u76f4\u63a5\u63d0\u4ea4\u3002");
@@ -244,7 +244,6 @@ void VideoRenderer::SetNominalFrameRate(int fps, bool adaptive_fps) {
 }
 
 void VideoRenderer::SetPresentationMode(PresentationMode mode) {
-    mode = PresentationMode::kLowLatency;
     bool changed = false;
     {
         std::lock_guard<std::mutex> lock(render_mutex_);
@@ -483,6 +482,7 @@ void VideoRenderer::RenderThreadMain() {
                     smooth_pacing_enabled_ &&
                     smooth_pacing_interval_us_ > 0;
                 const bool nominal_pacing =
+                    presentation_mode_ != PresentationMode::kLowLatency &&
                     nominal_present_interval_us_ > 0 &&
                     last_frame_arrival_deadline_ != std::chrono::steady_clock::time_point{} &&
                     now - last_frame_arrival_deadline_ <= std::chrono::milliseconds(120);
@@ -543,6 +543,7 @@ void VideoRenderer::RenderThreadMain() {
                 smooth_pacing_enabled_ &&
                 smooth_pacing_interval_us_ > 0;
             const bool nominal_pacing =
+                presentation_mode_ != PresentationMode::kLowLatency &&
                 nominal_present_interval_us_ > 0 &&
                 last_frame_arrival_deadline_ != std::chrono::steady_clock::time_point{} &&
                 now - last_frame_arrival_deadline_ <= std::chrono::milliseconds(120);
@@ -661,9 +662,7 @@ bool VideoRenderer::InitializeDeviceResources() {
 
         if (SUCCEEDED(factory1->QueryInterface(IID_PPV_ARGS(&dxgi_factory5_)))) {
             tearing_supported_ = CheckTearingSupport();
-            // Prefer stable scan-out over ultra-low-latency tearing; the user
-            // reported visible "jelly" artifacts after the 60fps clamp.
-            allow_tearing_ = false;
+            allow_tearing_ = tearing_supported_;
         }
     }
 
@@ -757,10 +756,10 @@ bool VideoRenderer::InitializeDeviceResources() {
                << L"，特性级别=0x"
                << std::hex << std::uppercase << static_cast<unsigned int>(created_level)
                << L"，flip model=" << L"已启用"
-               << L"，tearing=" << (allow_tearing_ ? L"已启用" : L"不可用");
+               << L"，tearing=" << (allow_tearing_ ? L"低延迟可用" : L"不可用");
         log_fn_(stream.str());
-        if (tearing_supported_ && !allow_tearing_) {
-            log_fn_(L"\u89c6\u9891\u6e32\u67d3: \u5f53\u524d\u7248\u672c\u5df2\u9ed8\u8ba4\u5173\u95ed tearing \u63d0\u4ea4\uff0c\u4f18\u5148\u907f\u514d\u679c\u51bb\u5c4f\u548c\u64d5\u88c2\u611f\u3002");
+        if (allow_tearing_) {
+            log_fn_(L"\u89c6\u9891\u6e32\u67d3: \u4F4E\u5EF6\u8FDF\u6A21\u5F0F\u4F1A\u5728\u652F\u6301\u7684\u8BBE\u5907\u4E0A\u4F7F\u7528 tearing \u63D0\u4EA4\uFF0C\u4F18\u5148\u538B\u7F29\u663E\u793A\u7B49\u5F85\u3002");
         }
     }
 
@@ -1477,6 +1476,7 @@ void VideoRenderer::Render() {
             smooth_pacing_enabled_ &&
             smooth_pacing_interval_us_ > 0;
         const bool nominal_pacing_active =
+            presentation_mode_ != PresentationMode::kLowLatency &&
             nominal_present_interval_us_ > 0 &&
             last_frame_arrival_deadline_ != std::chrono::steady_clock::time_point{} &&
             std::chrono::steady_clock::now() - last_frame_arrival_deadline_ <= std::chrono::milliseconds(120);

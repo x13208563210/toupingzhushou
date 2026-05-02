@@ -4,6 +4,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
+import android.media.AudioTimestamp
 import android.media.projection.MediaProjection
 import android.os.Process
 import android.os.SystemClock
@@ -20,9 +21,14 @@ class ProjectionAudioStreamer(
 ) {
     private val running = AtomicBoolean(false)
     private val frameCounter = AtomicInteger(1)
+    private val audioTimestamp = AudioTimestamp()
 
     private var audioRecord: AudioRecord? = null
     private var captureThread: Thread? = null
+    private var lastRecorderTimestampNs = Long.MIN_VALUE
+    private var nextFallbackPtsUs = 0L
+    private var lastSentPtsUs = 0L
+    private var lastMonoToElapsedOffsetUs = Long.MIN_VALUE
 
     fun start() {
         val audioFormat =
@@ -47,10 +53,14 @@ class ProjectionAudioStreamer(
             AudioRecord.Builder()
                 .setAudioPlaybackCaptureConfig(captureConfig)
                 .setAudioFormat(audioFormat)
-                .setBufferSizeInBytes(max(minBufferSize, AudioStreamConfig.FRAME_BYTES * 3))
+                .setBufferSizeInBytes(max(minBufferSize, AudioStreamConfig.FRAME_BYTES * 2))
                 .build()
         require(audioRecord.state == AudioRecord.STATE_INITIALIZED) { "系统声音采集初始化失败" }
 
+        lastRecorderTimestampNs = Long.MIN_VALUE
+        nextFallbackPtsUs = 0L
+        lastSentPtsUs = 0L
+        lastMonoToElapsedOffsetUs = Long.MIN_VALUE
         this.audioRecord = audioRecord
         audioRecord.startRecording()
         running.set(true)
@@ -100,10 +110,11 @@ class ProjectionAudioStreamer(
                     val peakLevel = computePeakPcm16(buffer, read)
                     val looksSilent = peakLevel <= SILENT_PCM_PEAK_THRESHOLD
                     silentFrameStreak = if (looksSilent) silentFrameStreak + 1 else 0
+                    val ptsUs = resolveFramePtsUs(record, read)
 
                     audioSender.sendPcmFrame(
                         frameId = frameCounter.getAndIncrement(),
-                        ptsUs = SystemClock.elapsedRealtimeNanos() / 1_000L,
+                        ptsUs = ptsUs,
                         payload =
                             if (read == buffer.size) {
                                 buffer.clone()
@@ -153,6 +164,54 @@ class ProjectionAudioStreamer(
         running.set(false)
     }
 
+    private fun resolveFramePtsUs(record: AudioRecord, readBytes: Int): Long {
+        val durationUs =
+            readBytes.toLong() * 1_000_000L /
+                (AudioStreamConfig.SAMPLE_RATE * AudioStreamConfig.CHANNEL_COUNT * AudioStreamConfig.BYTES_PER_SAMPLE)
+
+        var ptsUs: Long? = null
+        val timestampResult = record.getTimestamp(audioTimestamp, AudioTimestamp.TIMEBASE_MONOTONIC)
+        if (timestampResult == AudioRecord.SUCCESS && audioTimestamp.nanoTime != lastRecorderTimestampNs) {
+            val sampledOffsetUs = sampleMonoToElapsedOffsetUs()
+            val stableOffsetUs =
+                if (lastMonoToElapsedOffsetUs == Long.MIN_VALUE) {
+                    sampledOffsetUs
+                } else {
+                    // Keep the transport clock on the same elapsedRealtime base as TIME_SYNC,
+                    // but ignore occasional sampling noise between the two monotonic clocks.
+                    val driftUs = kotlin.math.abs(sampledOffsetUs - lastMonoToElapsedOffsetUs)
+                    if (driftUs <= AUDIO_TIMESTAMP_OFFSET_JITTER_TOLERANCE_US) {
+                        lastMonoToElapsedOffsetUs
+                    } else {
+                        sampledOffsetUs
+                    }
+                }
+            lastMonoToElapsedOffsetUs = stableOffsetUs
+            ptsUs = audioTimestamp.nanoTime / 1_000L + stableOffsetUs
+            lastRecorderTimestampNs = audioTimestamp.nanoTime
+        } else if (nextFallbackPtsUs == 0L) {
+            nextFallbackPtsUs = SystemClock.elapsedRealtimeNanos() / 1_000L
+        }
+
+        val resolvedPtsUs = ptsUs ?: nextFallbackPtsUs
+        nextFallbackPtsUs = resolvedPtsUs + durationUs
+
+        val monotonicPtsUs =
+            if (lastSentPtsUs != 0L && resolvedPtsUs <= lastSentPtsUs) {
+                lastSentPtsUs + 1L
+            } else {
+                resolvedPtsUs
+            }
+        lastSentPtsUs = monotonicPtsUs
+        return monotonicPtsUs
+    }
+
+    private fun sampleMonoToElapsedOffsetUs(): Long {
+        val monoUs = System.nanoTime() / 1_000L
+        val elapsedUs = SystemClock.elapsedRealtimeNanos() / 1_000L
+        return elapsedUs - monoUs
+    }
+
     private fun computePeakPcm16(buffer: ByteArray, size: Int): Int {
         var peak = 0
         var index = 0
@@ -176,6 +235,7 @@ class ProjectionAudioStreamer(
         private const val ZERO_READ_WARN_INTERVAL = 25
         private const val SILENT_FRAME_WARN_THRESHOLD = 50
         private const val SILENT_PCM_PEAK_THRESHOLD = 8
+        private const val AUDIO_TIMESTAMP_OFFSET_JITTER_TOLERANCE_US = 5_000L
         private val CAPTURE_USAGES =
             intArrayOf(
                 AudioAttributes.USAGE_MEDIA,

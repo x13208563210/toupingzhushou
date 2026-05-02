@@ -10,6 +10,7 @@ local.properties
 # Windows / Visual Studio / CMake build outputs
 build/
 cmake-build-*/
+windows-receiver/build-v*/
 *.obj
 *.pdb
 *.lib
@@ -29,6 +30,8 @@ cmake-build-*/
 *.cache
 __pycache__/
 *.pyc
+tmp-*
+tmp-*/
 
 # Debug captures / local artifacts
 /build/*.png

@@ -12,6 +12,7 @@ namespace {
 constexpr SOCKET kInvalidSocket = INVALID_SOCKET;
 constexpr size_t kPacketHeaderSize = 32;
 constexpr uint32_t kMaxPayloadSize = 4u * 1024u * 1024u;
+constexpr int kVideoTcpReceiveBufferBytes = 1 << 20;
 
 std::wstring SocketErrorText(const wchar_t* action) {
     std::wostringstream stream;
@@ -147,6 +148,12 @@ void UdpVideoReceiver::ThreadMain(uint16_t video_port) {
 
         const int nodelay = 1;
         setsockopt(client_socket, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
+        setsockopt(
+            client_socket,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            reinterpret_cast<const char*>(&kVideoTcpReceiveBufferBytes),
+            sizeof(kVideoTcpReceiveBufferBytes));
         client_socket_ = static_cast<uintptr_t>(client_socket);
         last_completed_frame_id_ = 0;
         last_observed_dropped_frames_ = dropped_frames_.load();

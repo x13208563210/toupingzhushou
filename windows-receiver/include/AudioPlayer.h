@@ -17,8 +17,12 @@ struct AudioPlaybackStats {
     uint64_t submitted_frames = 0;
     uint64_t played_frames = 0;
     uint64_t dropped_frames = 0;
+    uint64_t resync_count = 0;
+    bool recovery_mode = false;
     size_t buffered_frames = 0;
     size_t buffered_ms = 0;
+    size_t pending_buffered_ms = 0;
+    size_t submitted_buffered_ms = 0;
 };
 
 class AudioPlayer {
@@ -52,6 +56,15 @@ private:
         int64_t target_submit_us = 0;
     };
 
+    struct BufferProfile {
+        size_t max_submitted_buffered_ms = 0;
+        size_t target_total_buffered_ms = 0;
+        size_t soft_total_buffered_ms = 0;
+        size_t min_submit_frame_count = 0;
+        bool steady_state = false;
+        bool recovery_mode = false;
+    };
+
     static void CALLBACK WaveOutCallback(
         HWAVEOUT wave_out,
         UINT message,
@@ -67,6 +80,11 @@ private:
     bool SubmitQueuedFrame(std::vector<uint8_t> bytes);
     bool HasCompletedBuffersLocked() const;
     void DropOldestPendingFramesLocked(size_t frames_to_drop, const wchar_t* reason);
+    BufferProfile ActiveProfileLocked() const;
+    void LogProfileTransitionIfNeededLocked(const BufferProfile& profile);
+    void ResetSessionStateLocked();
+    void EnterRecoveryModeLocked(int64_t now_us, const wchar_t* reason);
+    void HandleSoftOverloadLocked(const BufferProfile& profile);
     size_t FrameDurationMsLocked(size_t bytes) const;
     size_t FrameDurationMsLocked(const PendingPcmFrame& frame) const;
     size_t PendingBufferedMsLocked() const;
@@ -90,8 +108,17 @@ private:
     uint64_t submitted_frames_ = 0;
     uint64_t played_frames_ = 0;
     uint64_t dropped_frames_ = 0;
+    uint64_t device_played_frames_ = 0;
+    uint64_t resync_count_ = 0;
     uint64_t sync_wait_count_ = 0;
     uint64_t sync_drop_count_ = 0;
+    uint64_t soft_overload_event_count_ = 0;
+    int64_t playback_started_at_us_ = 0;
+    int64_t recovery_mode_until_us_ = 0;
+    int64_t last_soft_overload_at_us_ = 0;
+    int64_t last_resync_at_us_ = 0;
+    bool steady_state_profile_logged_ = false;
+    bool playback_resync_requested_ = false;
     std::deque<PendingPcmFrame> pending_pcm_frames_;
     std::deque<std::unique_ptr<Buffer>> buffers_;
 };
